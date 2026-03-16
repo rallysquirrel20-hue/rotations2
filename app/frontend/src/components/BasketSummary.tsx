@@ -325,6 +325,8 @@ function ReturnsChart({ data, quarterDateRange }: { data: CumulativeReturnsData;
   const [hoveredTicker, setHoveredTicker] = useState<string | null>(null)
   const [dims, setDims] = useState({ w: 800, h: 400 })
   const [presetMode, setPresetMode] = useState<'Q' | 'Y'>('Q')
+  const [retSortCol, setRetSortCol] = useState<'ticker' | 'date' | 'change'>('change')
+  const [retSortAsc, setRetSortAsc] = useState(false)
 
   // Date range state — default to quarter range if active, else 1Y lookback
   const allDates = data.dates
@@ -429,17 +431,33 @@ function ReturnsChart({ data, quarterDateRange }: { data: CumulativeReturnsData;
   }, [allDates, data.series, startDate, endDate])
 
   // Sort series by latest return value in the windowed range
-  const sortedSeries = useMemo(() => {
-    const withLatest = windowedData.series.map((s, origIndex) => {
+  const seriesWithLatest = useMemo(() => {
+    return windowedData.series.map((s, origIndex) => {
       let lastVal = 0
       for (let i = s.values.length - 1; i >= 0; i--) {
         if (s.values[i] !== null) { lastVal = s.values[i]!; break }
       }
       return { ...s, origIndex, lastVal }
     })
-    withLatest.sort((a, b) => b.lastVal - a.lastVal)
-    return withLatest
   }, [windowedData.series])
+
+  // Color rank always by return (best=blue, worst=pink)
+  const retColorMap = useMemo(() => {
+    const byReturn = [...seriesWithLatest].sort((a, b) => b.lastVal - a.lastVal)
+    return new Map(byReturn.map((s, rank) => [s.ticker, rankColor(rank, byReturn.length)]))
+  }, [seriesWithLatest])
+
+  const sortedSeries = useMemo(() => {
+    const arr = [...seriesWithLatest]
+    arr.sort((a, b) => {
+      let cmp = 0
+      if (retSortCol === 'ticker') cmp = a.ticker.localeCompare(b.ticker)
+      else if (retSortCol === 'date') cmp = (a.join_date ?? '').localeCompare(b.join_date ?? '')
+      else cmp = a.lastVal - b.lastVal
+      return retSortAsc ? cmp : -cmp
+    })
+    return arr
+  }, [seriesWithLatest, retSortCol, retSortAsc])
 
   useEffect(() => {
     const el = containerRef.current
@@ -509,12 +527,11 @@ function ReturnsChart({ data, quarterDateRange }: { data: CumulativeReturnsData;
       ctx.fillText(windowedData.dates[i].slice(0, 7), x, dims.h - pad.bottom + 15)
     }
 
-    // Draw lines — blue (best) → grey → pink (worst) by rank
-    const totalSeries = sortedSeries.length
-    sortedSeries.forEach((s, rank) => {
+    // Draw lines — color by return rank (independent of sort order)
+    sortedSeries.forEach((s) => {
       const isHovered = hoveredTicker === s.ticker
       const isOther = hoveredTicker !== null && !isHovered
-      ctx.strokeStyle = isOther ? '#dee2e6' : rankColor(rank, totalSeries)
+      ctx.strokeStyle = isOther ? '#dee2e6' : (retColorMap.get(s.ticker) ?? '#586e75')
       ctx.lineWidth = isHovered ? 2.5 : 1.2
       ctx.globalAlpha = isOther ? 0.3 : 1
       ctx.beginPath()
@@ -528,7 +545,7 @@ function ReturnsChart({ data, quarterDateRange }: { data: CumulativeReturnsData;
       ctx.stroke()
       ctx.globalAlpha = 1
     })
-  }, [windowedData, dims, hoveredTicker, sortedSeries])
+  }, [windowedData, dims, hoveredTicker, sortedSeries, retColorMap])
 
   return (
     <div className="returns-container">
@@ -563,13 +580,26 @@ function ReturnsChart({ data, quarterDateRange }: { data: CumulativeReturnsData;
         </div>
       </div>
       <div className="returns-legend-right">
-        {sortedSeries.map((s, rank) => (
+        <div className="path-legend-header">
+          <span className="path-legend-col ticker" onClick={() => { if (retSortCol === 'ticker') setRetSortAsc(v => !v); else { setRetSortCol('ticker'); setRetSortAsc(true) } }}>
+            Ticker{retSortCol === 'ticker' ? (retSortAsc ? ' \u25B2' : ' \u25BC') : ''}
+          </span>
+          <span className="path-legend-col date" onClick={() => { if (retSortCol === 'date') setRetSortAsc(v => !v); else { setRetSortCol('date'); setRetSortAsc(true) } }}>
+            Entry{retSortCol === 'date' ? (retSortAsc ? ' \u25B2' : ' \u25BC') : ''}
+          </span>
+          <span className="path-legend-col change" onClick={() => { if (retSortCol === 'change') setRetSortAsc(v => !v); else { setRetSortCol('change'); setRetSortAsc(false) } }}>
+            Chg{retSortCol === 'change' ? (retSortAsc ? ' \u25B2' : ' \u25BC') : ''}
+          </span>
+        </div>
+        {sortedSeries.map((s) => (
           <div key={s.ticker}
-               className={`returns-legend-item ${hoveredTicker === s.ticker ? 'highlighted' : ''}`}
-               style={{ color: rankColor(rank, sortedSeries.length) }}
+               className={`path-legend-row ${hoveredTicker === s.ticker ? 'highlighted' : ''}`}
+               style={{ color: retColorMap.get(s.ticker) }}
                onMouseEnter={() => setHoveredTicker(s.ticker)}
                onMouseLeave={() => setHoveredTicker(null)}>
-            {s.ticker} <span className="returns-legend-val">{(s.lastVal * 100).toFixed(1)}%</span>
+            <span className="path-legend-col ticker">{s.ticker}</span>
+            <span className="path-legend-col date">{s.join_date ? s.join_date.slice(2) : ''}</span>
+            <span className="path-legend-col change">{(s.lastVal * 100).toFixed(1)}%</span>
           </div>
         ))}
       </div>

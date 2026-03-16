@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { createChart, ColorType, CrosshairMode, LineType, IChartApi, ISeriesApi } from 'lightweight-charts';
 import axios from 'axios';
+import { RangeScrollbar } from './RangeScrollbar';
 
 interface RangeTrigger {
   from?: string;
@@ -17,6 +18,7 @@ interface TVChartProps {
   showBreadth?: boolean;
   showBreakout?: boolean;
   showCorrelation?: boolean;
+  showRV?: boolean;
   rangeUpdateTrigger?: RangeTrigger | null;
   exportTrigger?: number;
   symbolName?: string;
@@ -42,7 +44,7 @@ const SOLAR_BASE3 = '#fdf6e3';
 const SOLAR_BASE01 = '#586e75';
 const SOLAR_BASE1 = '#93a1a1';
 
-type PaneId = 'volume' | 'breadth' | 'breakout' | 'correlation';
+type PaneId = 'volume' | 'breadth' | 'breakout' | 'correlation' | 'rv';
 
 const DEFAULT_PANE_HEIGHT = 80;
 const MIN_PANE_HEIGHT = 40;
@@ -61,13 +63,14 @@ interface CandleDetail {
 }
 
 export const TVChart: React.FC<TVChartProps> = (props) => {
-  const { data, showPivots, showTargets, showVolume, showBreadth, showBreakout, showCorrelation } = props;
+  const { data, showPivots, showTargets, showVolume, showBreadth, showBreakout, showCorrelation, showRV } = props;
 
   const pRef  = useRef<HTMLDivElement>(null);
   const vRef  = useRef<HTMLDivElement>(null);
   const bRef  = useRef<HTMLDivElement>(null);
   const boRef = useRef<HTMLDivElement>(null);
   const cRef  = useRef<HTMLDivElement>(null);
+  const rvRef = useRef<HTMLDivElement>(null);
 
   const charts = useRef<Record<string, IChartApi | null>>({});
   const seriesRefs = useRef<Record<string, ISeriesApi<any> | null>>({});
@@ -75,11 +78,16 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
   const timesRef = useRef<any[]>([]);
   const savedRangeRef = useRef<{ from: number; to: number } | null>(null);
 
+  // Scrollbar state
+  const [scrollRange, setScrollRange] = useState({ start: 0, end: 0 });
+  const scrollbarSyncing = useRef(false);
+
   const [paneHeights, setPaneHeights] = useState<Record<PaneId, number>>({
     volume:      DEFAULT_PANE_HEIGHT,
     breadth:     DEFAULT_PANE_HEIGHT,
     breakout:    DEFAULT_PANE_HEIGHT,
     correlation: DEFAULT_PANE_HEIGHT,
+    rv:          DEFAULT_PANE_HEIGHT,
   });
 
   const wrapperRef = useRef<HTMLDivElement>(null);
@@ -238,7 +246,8 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     const bc  = createChart(bRef.current!,  chartOptions);
     const boc = createChart(boRef.current!, chartOptions);
     const cc  = createChart(cRef.current!,  chartOptions);
-    charts.current = { price: pc, volume: vc, breadth: bc, breakout: boc, correlation: cc };
+    const rvc = createChart(rvRef.current!, chartOptions);
+    charts.current = { price: pc, volume: vc, breadth: bc, breakout: boc, correlation: cc, rv: rvc };
 
     // Price pane
     const candleS = pc.addCandlestickSeries({
@@ -290,10 +299,15 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     corrSeries.setData(sortedData.filter(d => d.Correlation_Pct != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Correlation_Pct) })));
     seriesRefs.current.correlation = corrSeries;
 
+    const ANNUALIZE = Math.sqrt(252);
+    const rvSeries = rvc.addLineSeries({ color: '#b58900', lineWidth: 2, title: 'RV %', priceFormat: { type: 'custom', formatter: (v: number) => v.toFixed(1) + '%' } });
+    rvSeries.setData(sortedData.filter(d => d.RV_EMA != null).map(d => ({ time: parseTime(d.Date), value: Number(d.RV_EMA) * ANNUALIZE * 100 })));
+    seriesRefs.current.rv = rvSeries;
+
     // Invisible alignment series: gives every indicator chart the full price-chart time scale
     // so setVisibleRange works even when the indicator has no (or fewer) data points.
     const alignData = ohlc.map(d => ({ time: d.time, value: d.close }));
-    [vc, bc, boc, cc].forEach(ic => {
+    [vc, bc, boc, cc, rvc].forEach(ic => {
       ic.addLineSeries({ color: 'rgba(0,0,0,0)', priceLineVisible: false, crosshairMarkerVisible: false, lastValueVisible: false, priceScaleId: '__align__' })
         .setData(alignData);
       ic.priceScale('__align__').applyOptions({ visible: false });
@@ -321,13 +335,23 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     const corrMap = new Map<any, number>();
     sortedData.forEach((d, i) => { if (d.Correlation_Pct != null) corrMap.set(times[i], Number(d.Correlation_Pct)); });
     seriesDataMaps['correlation'] = corrMap;
+    // RV
+    const rvMap = new Map<any, number>();
+    sortedData.forEach((d, i) => { if (d.RV_EMA != null) rvMap.set(times[i], Number(d.RV_EMA) * ANNUALIZE * 100); });
+    seriesDataMaps['rv'] = rvMap;
 
     // Sync time scales and crosshairs across all charts
     const chartEntries: [string, IChartApi][] = [
-      ['price', pc], ['volume', vc], ['breadth', bc], ['breakout', boc], ['correlation', cc],
+      ['price', pc], ['volume', vc], ['breadth', bc], ['breakout', boc], ['correlation', cc], ['rv', rvc],
     ];
     let rangeSyncing = false;
     let crosshairSyncing = false;
+    // Scrollbar: track price chart visible range
+    pc.timeScale().subscribeVisibleLogicalRangeChange(r => {
+      if (!r || scrollbarSyncing.current) return;
+      setScrollRange({ start: Math.max(0, Math.round(r.from)), end: Math.min(dataLengthRef.current - 1, Math.round(r.to)) });
+    });
+
     chartEntries.forEach(([, source]) => {
       source.timeScale().subscribeVisibleLogicalRangeChange(r => {
         if (rangeSyncing || !r) return;
@@ -342,7 +366,7 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
           chartEntries.forEach(([otherId, target]) => {
             if (target === source) return;
             // Skip charts whose container is hidden (e.g. volume in basket view)
-            const container = { price: pRef, volume: vRef, breadth: bRef, breakout: boRef, correlation: cRef }[otherId];
+            const container = { price: pRef, volume: vRef, breadth: bRef, breakout: boRef, correlation: cRef, rv: rvRef }[otherId];
             if (container?.current && container.current.clientHeight === 0) return;
             const s = seriesRefs.current[otherId];
             if (!s) return;
@@ -418,10 +442,10 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
   // Resize charts whenever pane heights or visibility changes
   useEffect(() => {
     const refMap: Record<string, React.RefObject<HTMLDivElement>> = {
-      price: pRef, volume: vRef, breadth: bRef, breakout: boRef, correlation: cRef,
+      price: pRef, volume: vRef, breadth: bRef, breakout: boRef, correlation: cRef, rv: rvRef,
     };
     const visMap: Record<string, boolean> = {
-      price: true, volume: !!showVolume, breadth: !!showBreadth, breakout: !!showBreakout, correlation: !!showCorrelation,
+      price: true, volume: !!showVolume, breadth: !!showBreadth, breakout: !!showBreakout, correlation: !!showCorrelation, rv: !!showRV,
     };
 
     const resize = () => {
@@ -442,7 +466,7 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     resize();
     window.addEventListener('resize', resize);
     return () => window.removeEventListener('resize', resize);
-  }, [paneHeights, showVolume, showBreadth, showBreakout, showCorrelation, props.layoutHeight]);
+  }, [paneHeights, showVolume, showBreadth, showBreakout, showCorrelation, showRV, props.layoutHeight]);
 
   // Handle rangeUpdateTrigger (Reset 1Y button and date range picker)
   useEffect(() => {
@@ -486,12 +510,20 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     }
     prevExportTrigger.current = props.exportTrigger;
 
-    const paneOrder: { id: string; visible: boolean }[] = [
+    const paneOrder: { id: string; visible: boolean }[] = props.isBasketView ? [
       { id: 'price',       visible: true },
-      { id: 'volume',      visible: !!showVolume },
       { id: 'breadth',     visible: !!showBreadth },
       { id: 'breakout',    visible: !!showBreakout },
       { id: 'correlation', visible: !!showCorrelation },
+      { id: 'volume',      visible: !!showVolume },
+      { id: 'rv',          visible: !!showRV },
+    ] : [
+      { id: 'price',       visible: true },
+      { id: 'breadth',     visible: !!showBreadth },
+      { id: 'breakout',    visible: !!showBreakout },
+      { id: 'correlation', visible: !!showCorrelation },
+      { id: 'rv',          visible: !!showRV },
+      { id: 'volume',      visible: !!showVolume },
     ];
 
     const RESIZER_HEIGHT = 6;
@@ -582,12 +614,30 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     }, 'image/png');
   }, [props.exportTrigger]);
 
-  // Ordered indicator pane definitions
-  const allPanes: { id: PaneId; ref: React.RefObject<HTMLDivElement>; visible: boolean }[] = [
-    { id: 'volume',      ref: vRef,  visible: !!showVolume },
+  // Scrollbar onChange: set visible range on all synced charts
+  const handleScrollbarChange = useCallback((start: number, end: number) => {
+    scrollbarSyncing.current = true;
+    const range = { from: start, to: end };
+    Object.values(charts.current).forEach(c => {
+      if (c) c.timeScale().setVisibleLogicalRange(range);
+    });
+    setScrollRange({ start, end });
+    scrollbarSyncing.current = false;
+  }, []);
+
+  // Ordered indicator pane definitions — RV above volume for tickers, bottom for baskets
+  const allPanes: { id: PaneId; ref: React.RefObject<HTMLDivElement>; visible: boolean }[] = props.isBasketView ? [
     { id: 'breadth',     ref: bRef,  visible: !!showBreadth },
     { id: 'breakout',    ref: boRef, visible: !!showBreakout },
     { id: 'correlation', ref: cRef,  visible: !!showCorrelation },
+    { id: 'volume',      ref: vRef,  visible: !!showVolume },
+    { id: 'rv',          ref: rvRef, visible: !!showRV },
+  ] : [
+    { id: 'breadth',     ref: bRef,  visible: !!showBreadth },
+    { id: 'breakout',    ref: boRef, visible: !!showBreakout },
+    { id: 'correlation', ref: cRef,  visible: !!showCorrelation },
+    { id: 'rv',          ref: rvRef, visible: !!showRV },
+    { id: 'volume',      ref: vRef,  visible: !!showVolume },
   ];
   const activePanes = allPanes.filter(p => p.visible);
 
@@ -680,6 +730,12 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
         );
       })}
 
+      <RangeScrollbar
+        total={dataLengthRef.current || data.length}
+        start={scrollRange.start}
+        end={scrollRange.end}
+        onChange={handleScrollbarChange}
+      />
     </div>
   );
 };

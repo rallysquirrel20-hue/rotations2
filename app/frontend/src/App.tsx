@@ -3,6 +3,7 @@ import axios from 'axios'
 import { TVChart } from './components/TVChart'
 import { BasketSummary } from './components/BasketSummary'
 import { BacktestPanel } from './components/BacktestPanel'
+import { MultiBacktestPanel } from './components/MultiBacktestPanel'
 
 // DYNAMIC API BASE:
 // Automatically uses the hostname of the machine you are browsing from.
@@ -129,6 +130,7 @@ function App() {
   const [showBreadth, setShowBreadth] = useState(true)
   const [showBreakout, setShowBreakout] = useState(true)
   const [showCorrelation, setShowCorrelation] = useState(true)
+  const [showRV, setShowRV] = useState(true)
   const [showCandleDetail, setShowCandleDetail] = useState(true)
   const [startDate, setStartDate] = useState('')
   const [endDate, setEndDate] = useState('')
@@ -138,6 +140,7 @@ function App() {
   const [summaryData, setSummaryData] = useState<BasketSummaryData | null>(null)
   const [summaryLoading, setSummaryLoading] = useState(false)
   const [showBacktest, setShowBacktest] = useState(false)
+  const [showMultiBacktest, setShowMultiBacktest] = useState(false)
   const [backtestBaskets, setBacktestBaskets] = useState<string[]>([])
   const contentStackRef = useRef<HTMLDivElement>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
@@ -479,16 +482,14 @@ function App() {
 
   const handleBasketSelect = (item: string, view: ViewType) => {
     if (selectedItem === item && viewType === view && !activeTicker) {
-      setExpandedBasket(prev => prev === item ? null : item)
-    } else {
-      setViewType(view)
-      setSelectedItem(item)
-      setActiveTicker(null)
-      setShowSummary(false)
-      setSummaryData(null)
-      setShowBacktest(false)
-      setExpandedBasket(item)
+      return
     }
+    setViewType(view)
+    setSelectedItem(item)
+    setActiveTicker(null)
+    setShowSummary(false)
+    setSummaryData(null)
+    setShowBacktest(false)
   }
 
   const handleItemSelect = (item: string, view: ViewType) => {
@@ -815,7 +816,10 @@ function App() {
                       className={`accordion-basket-header ${selectedItem === item && viewType === view && !activeTicker ? 'active' : ''}`}
                       onClick={() => handleBasketSelect(item, view)}
                     >
-                      <span className={`accordion-chevron ${expandedBasket === item && viewType === view ? 'expanded' : ''}`}>{'>'}</span>
+                      <span
+                        className={`accordion-chevron ${expandedBasket === item && viewType === view ? 'expanded' : ''}`}
+                        onClick={(e) => { e.stopPropagation(); setExpandedBasket(prev => prev === item ? null : item) }}
+                      >{'>'}</span>
                       <span className="basket-name-text">{item.replace(/_/g, ' ')}</span>
                       {basketBreadth[item] && (
                         <>
@@ -962,6 +966,7 @@ function App() {
                   <label className="overlay-checkbox"><input type="checkbox" checked={showCandleDetail} onChange={e => setShowCandleDetail(e.target.checked)} /> Constituents</label>
                 </>
               )}
+              <label className="overlay-checkbox"><input type="checkbox" checked={showRV} onChange={e => setShowRV(e.target.checked)} /> RV</label>
             </div>
             <div className={`header-actions ${isBasketView ? 'header-actions-grid' : ''}`}>
               {canShowSummary && (
@@ -978,12 +983,19 @@ function App() {
                 <button
                   className={`control-btn ${showBacktest ? 'primary' : ''}`}
                   style={{ order: 3 }}
-                  onClick={() => { setShowBacktest(prev => !prev); setShowSummary(false) }}
+                  onClick={() => { setShowBacktest(prev => !prev); setShowSummary(false); setShowMultiBacktest(false) }}
                 >
                   Backtest
                 </button>
               )}
-              <button className="control-btn" style={{ order: 4 }} onClick={() => setRangeUpdateTrigger({ reset1Y: true })}>Reset 1Y</button>
+              <button
+                className={`control-btn ${showMultiBacktest ? 'primary' : ''}`}
+                style={{ order: 4 }}
+                onClick={() => { setShowMultiBacktest(prev => !prev); setShowBacktest(false); setShowSummary(false) }}
+              >
+                Multi-Backtest
+              </button>
+              <button className="control-btn" style={{ order: 5 }} onClick={() => setRangeUpdateTrigger({ reset1Y: true })}>Reset 1Y</button>
             </div>
             <div className="header-right-stack">
               {quarterKeys.length > 0 && (
@@ -1035,18 +1047,17 @@ function App() {
             </div>
           </div>
           <div className="content-stack" ref={contentStackRef}>
-            {showBacktest ? (
+            {showMultiBacktest ? (
+              <MultiBacktestPanel
+                apiBase={API_BASE}
+                onClose={() => setShowMultiBacktest(false)}
+              />
+            ) : showBacktest ? (
               <BacktestPanel
                 target={activeTicker || selectedItem}
                 targetType={activeTicker || isTicker ? 'ticker' : 'basket'}
                 apiBase={API_BASE}
                 availableBaskets={backtestBaskets}
-                showPivots={showPivots}
-                showTargets={showTargets}
-                showVolume={showVolume && !isBasketView}
-                showBreadth={showBreadth && isBasketView}
-                showBreakout={showBreakout && isBasketView}
-                showCorrelation={showCorrelation && isBasketView}
                 exportTrigger={exportTrigger}
               />
             ) : showSummary ? (
@@ -1064,6 +1075,7 @@ function App() {
                 showBreadth={showBreadth && isBasketView}
                 showBreakout={showBreakout && isBasketView}
                 showCorrelation={showCorrelation && isBasketView}
+                showRV={showRV}
                 rangeUpdateTrigger={rangeUpdateTrigger}
                 exportTrigger={exportTrigger}
                 symbolName={activeTicker || selectedItem}

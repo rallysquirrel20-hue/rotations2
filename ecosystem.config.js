@@ -20,5 +20,13 @@ module.exports = {
         PYTHONPATH: path.join(__dirname, "app", "backend"),
       },
     },
+    {
+      name: "live-signals",
+      cwd: path.join(__dirname, "signals"),
+      script: "live_loop.py",
+      interpreter: "python",
+      restart_delay: 5000,
+      max_restarts: 10,
+    },
   ],
 };
