@@ -1,7 +1,7 @@
 # Dependency Tree
-Updated: 2026-03-16 21:30
-Files scanned: 12
-Functions indexed: 208
+Updated: 2026-03-16
+Files scanned: 13
+Functions indexed: 211
 
 ---
 
@@ -27,7 +27,7 @@ Functions indexed: 208
 | signals/rotations.py | 5805 | 136 | Main pipeline: universe, signals, baskets, live, reports |
 | signals/rotations_old_outputs.py | 2177 | 35 | Extracted Group B report cells (Excel, correlations, charts, PDFs) |
 | signals/databento_test.py | 624 | 16 | Databento API connectivity tests |
-| app/backend/main.py | 2262 | 38 | FastAPI REST endpoints + WebSocket |
+| app/backend/main.py | 2939 | 40 | FastAPI REST endpoints + WebSocket |
 | app/backend/signals_engine.py | 534 | 2 | Live signal computation (parallel impl) |
 | app/backend/audit_basket.py | 327 | 7 | Diagnostic: equity curve audit tool |
 | app/backend/verify_backtest.py | 1016 | 22 | Standalone CLI backtest verification (replays trades/equity from raw data, compares vs API) |
@@ -764,7 +764,7 @@ This file imports everything from rotations.py via `from rotations import *` plu
 
 ---
 
-### app/backend/main.py (2257 lines)
+### app/backend/main.py (2939 lines)
 
 #### `_read_live_parquet` (L80-90)
 - **Called by:** `get_basket_data`, `get_basket_breadth`, `list_live_signal_tickers`, `get_ticker_signals`, `get_ticker_data`, `get_basket_summary`, `_compute_live_breadth`
@@ -861,12 +861,27 @@ This file imports everything from rotations.py via `from rotations import *` plu
 - **Fields:** `target`, `target_type`, `entry_signal`, `filters`, `start_date`, `end_date`, `position_size`, `initial_equity`, `max_leverage`, `benchmarks_only` (default False), `include_positions` (default False)
 - **New field:** `include_positions: bool = False` — when true, response includes `daily_positions` and `skipped_entries`
 
-#### `get_date_range` (L1593-1608) — GET /api/date-range/{target_type}/{target}
+#### `MultiBasketLeg` (L1592-1598) — Pydantic model
+- **Fields:** `target`, `target_type`, `entry_signal`, `allocation_pct`, `position_size` (default 0.25), `filters`
+- **Used by:** `MultiBacktestRequest`
+
+#### `MultiBacktestRequest` (L1600-1605) — Pydantic model
+- **Fields:** `legs: List[MultiBasketLeg]`, `start_date`, `end_date`, `initial_equity` (default 100000), `max_leverage` (default 2.5)
+- **Used by:** `run_multi_backtest`
+
+#### `get_date_range` (L1607-1623) — GET /api/date-range/{target_type}/{target}
 - **Calls:** `_find_basket_parquet`
 - **Data I/O:** reads `signals_500.parquet` (columns: Ticker, Date), basket parquets (column: Date)
 
-#### `run_backtest` (L1611-2193) — POST /api/backtest
-- **Calls:** `_find_basket_parquet`, `_get_universe_history`, `get_latest_universe_tickers`, `get_meta_file_tickers`, `_quarter_str_to_date`, `safe_float`
+#### `_build_leg_data` (L1625-1908) — reusable trade-building helper
+- **Called by:** `run_backtest`, `run_multi_backtest`
+- **Calls:** `_find_basket_parquet`, `_get_universe_history`, `get_latest_universe_tickers`, `get_meta_file_tickers`, `_quarter_str_to_date`
+- **Data I/O:** reads `signals_500.parquet`, basket parquets, thematic/gics JSON (via `_get_universe_history`)
+- **Returns:** dict with `trades`, `trade_paths`, `ticker_closes`, `all_dates`, `direction`, `is_long`, `is_multi_ticker`, `quarter_membership`, `df`, `date_range`; or None if filtered DataFrame is empty
+- **Note:** Extracted from `run_backtest` to enable code reuse by `run_multi_backtest`
+
+#### `run_backtest` (L1910-2493) — POST /api/backtest
+- **Calls:** `_build_leg_data`, `safe_float`
 - **Nested functions:**
   - `mtm_equity` (L1923-1942) — mark-to-market equity computation
   - `compute_stats` (L2132-2167) — trade statistics (win rate, EV, PF, max DD, avg bars); filters out `skipped` trades before computing
@@ -883,6 +898,21 @@ This file imports everything from rotations.py via `from rotations import *` plu
   - **Daily position snapshots** (L2052-2094): when `include_positions=True`, builds per-day constituent breakdown with mark-to-market weights, daily returns, and contributions keyed by equity curve index
   - **Response additions:** `daily_positions` dict (keyed by date index -> `{exposure_pct, equity, positions}`) and `skipped_entries` list (each with `ticker, entry_date, entry_price, reason, exposure_at_skip, equity_at_skip`)
 - **Frontend callers:** BacktestPanel.tsx `runBacktest` (fires main + 6 benchmark calls in parallel)
+
+#### `run_multi_backtest` (L2496-2869) — POST /api/backtest/multi
+- **Calls:** `_build_leg_data`, `safe_float`
+- **Data I/O:** reads same sources as `_build_leg_data` (per leg)
+- **Key behaviors:**
+  - Per-leg capital pools: each leg gets `allocation_pct` fraction of `initial_equity`
+  - Shared leverage limit across all legs (`max_leverage`)
+  - Quarterly-rebalanced buy-and-hold benchmark per leg
+  - Combined equity curve sums per-leg equity; combined stats computed across all legs
+  - `daily_positions` across legs (same format as single-leg backtest)
+  - Response includes per-leg `trades`, `stats`, `equity_curve`, plus combined `equity_curve` and `stats`
+- **Frontend callers:** MultiBacktestPanel.tsx
+
+#### `uvicorn.run` (L2935-2939) — entry point
+- Uses string import `"main:app"` instead of `app` object for Windows multi-worker support
 
 ---
 
@@ -1014,6 +1044,10 @@ app/backend/audit_basket.py
 app/frontend/src/components/BacktestPanel.tsx
   └── imports: react, axios, lightweight-charts, RangeScrollbar (local)
   └── consumes: app/backend/main.py REST endpoints (backtest API)
+
+app/frontend/src/components/MultiBacktestPanel.tsx
+  └── imports: react, axios, lightweight-charts (likely)
+  └── consumes: app/backend/main.py POST /api/backtest/multi endpoint
 
 app/frontend/src/index.css
   └── standalone (global stylesheet, no imports)
@@ -1153,6 +1187,23 @@ app/frontend/src/index.css
 #### Max Leverage presets
 - Uses `.backtest-preset-label` for "Lev:" label
 - Uses `.backtest-pos-preset` for each LEV_PRESETS button
+
+---
+
+## app/frontend/src/components/MultiBacktestPanel.tsx (950 lines)
+
+Multi-basket backtest UI — configures and displays results for multi-leg backtests with per-leg capital pools.
+
+### Key Features
+- **Leg configuration:** add/remove legs, each with target basket, signal, allocation %, position size, optional filters
+- **Equity curve:** canvas-drawn combined + per-leg equity curves with zoom/pan and constituents overlay
+- **Stats table:** combined and per-leg statistics (trades, win rate, EV, PF, max DD, avg bars)
+- **Trades table:** all trades across legs with leg identifier column
+
+### API Integration
+- **Endpoint:** POST `/api/backtest/multi` (`run_multi_backtest` in main.py L2496)
+- **Request model:** `MultiBacktestRequest` (legs, start_date, end_date, initial_equity, max_leverage)
+- **Response:** per-leg results + combined equity curve + combined stats
 
 ---
 

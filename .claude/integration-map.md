@@ -268,12 +268,82 @@ Both fields are `null` when `include_positions` is `false` (the default) or when
 
 ---
 
+### `POST /api/backtest/multi` — multi-leg basket backtest (2026-03-16)
+
+**Request model** — `MultiBacktestRequest` (`app/backend/main.py:1600`):
+```
+{
+  legs: MultiBasketLeg[],     // at least 2
+  start_date: str | null,
+  end_date: str | null,
+  initial_equity: float,      // default 100000
+  max_leverage: float,        // default 2.5
+}
+```
+
+**`MultiBasketLeg`** (`app/backend/main.py:1592`):
+```
+{
+  target: str,                // basket name or ticker
+  target_type: str,           // "basket" | "basket_tickers" | "ticker"
+  entry_signal: str,          // signal from SIGNAL_TYPES
+  allocation_pct: float,      // 0.0-1.0, fraction of total equity (all legs must sum to 1.0)
+  position_size: float,       // default 0.25, per-leg (NOT shared across legs)
+  filters: BacktestFilter[],  // default []
+}
+```
+
+**Key design detail**: `position_size` is per-leg — each leg sizes positions as a fraction of its own allocated equity. Leverage checking is global across all legs (shared `max_leverage`).
+
+**Response shape** (`app/backend/main.py:2852`):
+```
+{
+  legs: [                         // one per input leg
+    {
+      target, target_type, entry_signal, allocation_pct, direction,
+      trades: [...],              // per-leg trade list
+      stats: { trades, win_rate, avg_winner, avg_loser, ev, profit_factor, max_dd, avg_bars }
+    },
+    ...
+  ],
+  combined: {
+    equity_curve: {
+      dates: ["YYYY-MM-DD", ...],
+      combined: [float, ...],     // summed equity across all legs
+      per_leg: [[float, ...], ...], // per-leg equity series
+      buy_hold: [float, ...],     // quarterly-rebalanced buy-and-hold benchmark
+    },
+    stats: { ... },               // stats computed on all trades merged
+  },
+  date_range: { min, max },
+  skipped_entries: [...] | null,  // includes leg_index and leg_target fields
+  daily_positions: { ... } | null // same schema as single backtest, positions include leg_target field
+}
+```
+
+**Buy-and-hold benchmark**: Quarterly-rebalanced combined buy-and-hold — each leg's B&H uses the basket/ticker Close series, rebalanced to `allocation_pct` target weights at the start of each calendar quarter (`app/backend/main.py:2799–2824`).
+
+**Helper function** — `_build_leg_data()` (`app/backend/main.py:1625`):
+- Extracts the shared trade-building logic (data loading, signal detection, membership filtering, trade construction, trade path computation) into a reusable function.
+- Currently called only by `run_multi_backtest()` (line 2515). The single `POST /api/backtest` endpoint still has its own inline implementation — not yet refactored to call `_build_leg_data()`.
+- Returns: `{ trades, trade_paths, ticker_closes, all_dates, direction, is_long, is_multi_ticker, quarter_membership, df, date_range }` or `None` if the filtered DataFrame is empty.
+
+**Frontend consumer**: `app/frontend/src/components/MultiBacktestPanel.tsx` — dedicated panel that constructs a `MultiBacktestRequest` and renders per-leg trades/stats plus the combined equity curve.
+
+---
+
 ## Frontend Component Integration Notes
 
 ### BacktestPanel — Overlay Toggle Props Removed (2026-03-16)
 - **Previous behavior**: `App.tsx` passed overlay toggle props to `BacktestPanel` via its interface: `showPivots`, `showTargets`, `showVolume`, `showBreadth`, `showBreakout`, `showCorrelation`.
 - **Current behavior**: All six props have been removed from `BacktestPanel`'s interface. `BacktestPanel` now manages its own toggle state internally. `App.tsx` no longer passes these props.
 - **Impact**: No backend/data contract change. Pure frontend prop interface change.
+
+### MultiBacktestPanel — Multi-leg backtest UI (2026-03-16)
+- **Component**: `app/frontend/src/components/MultiBacktestPanel.tsx`
+- **Backend endpoint**: `POST /api/backtest/multi` (see endpoint section above for full request/response schema)
+- **Renders**: Per-leg trade tables and stats, combined equity curve chart with per-leg overlay and quarterly-rebalanced buy-and-hold, daily position snapshots across all legs.
+- **Also referenced in**: `app/frontend/src/App.tsx` (imported and routed)
 
 ### BacktestPanel — Leverage Preset Buttons & Uniform Sizing (2026-03-16)
 - **Added**: `LEV_PRESETS = [100, 110, 125, 150, 200, 250]` constant and a row of leverage preset buttons (`.backtest-pos-preset`) in the Position Sizing config section. Clicking a button sets `maxLeverage` state, which is sent as `max_leverage: maxLeverage / 100` to `POST /api/backtest` (unchanged contract).
