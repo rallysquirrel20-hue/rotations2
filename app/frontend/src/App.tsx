@@ -3,7 +3,6 @@ import axios from 'axios'
 import { TVChart } from './components/TVChart'
 import { BasketSummary } from './components/BasketSummary'
 import { BacktestPanel } from './components/BacktestPanel'
-import { MultiBacktestPanel } from './components/MultiBacktestPanel'
 
 // DYNAMIC API BASE:
 // Automatically uses the hostname of the machine you are browsing from.
@@ -130,17 +129,16 @@ function App() {
   const [showBreadth, setShowBreadth] = useState(true)
   const [showBreakout, setShowBreakout] = useState(true)
   const [showCorrelation, setShowCorrelation] = useState(true)
-  const [showRV, setShowRV] = useState(true)
   const [showCandleDetail, setShowCandleDetail] = useState(true)
   const [startDate, setStartDate] = useState('')
   const [endDate, setEndDate] = useState('')
   const [rangeUpdateTrigger, setRangeUpdateTrigger] = useState<{from?: string, to?: string, reset1Y?: boolean} | null>(null)
   const [exportTrigger, setExportTrigger] = useState<number>(0)
-  const [showSummary, setShowSummary] = useState(false)
+  const [showSummary, setShowSummary] = useState<'intra' | 'cross' | false>(false)
+  const [intraBasketTarget, setIntraBasketTarget] = useState<string>('')
   const [summaryData, setSummaryData] = useState<BasketSummaryData | null>(null)
   const [summaryLoading, setSummaryLoading] = useState(false)
   const [showBacktest, setShowBacktest] = useState(false)
-  const [showMultiBacktest, setShowMultiBacktest] = useState(false)
   const [backtestBaskets, setBacktestBaskets] = useState<string[]>([])
   const contentStackRef = useRef<HTMLDivElement>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
@@ -420,13 +418,13 @@ function App() {
   }, [chartData, isQuarterMode, quarterStart, quarterEnd])
 
   useEffect(() => {
-    if (!canShowSummary) {
-      setShowSummary(false)
-      setSummaryData(null)
-      setSummaryLoading(false)
+    if (showSummary !== 'intra' || !intraBasketTarget) {
+      if (showSummary !== 'intra') {
+        setSummaryData(null)
+        setSummaryLoading(false)
+      }
       return
     }
-    if (!showSummary || !selectedItem) return
 
     let cancelled = false
     setSummaryData(null)
@@ -438,7 +436,7 @@ function App() {
       params.set('end', to)
     }
     const qs = params.toString()
-    axios.get(`${API_BASE}/baskets/${encodeURIComponent(selectedItem)}/summary${qs ? '?' + qs : ''}`)
+    axios.get(`${API_BASE}/baskets/${encodeURIComponent(intraBasketTarget)}/summary${qs ? '?' + qs : ''}`)
       .then(res => {
         if (!cancelled) setSummaryData(res.data)
       })
@@ -452,7 +450,7 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [canShowSummary, selectedItem, showSummary, isQuarterMode, quarterStart, quarterEnd])
+  }, [intraBasketTarget, showSummary, isQuarterMode, quarterStart, quarterEnd])
 
   // Fetch baskets containing this ticker for backtest regime filter source dropdown
   useEffect(() => {
@@ -482,14 +480,16 @@ function App() {
 
   const handleBasketSelect = (item: string, view: ViewType) => {
     if (selectedItem === item && viewType === view && !activeTicker) {
-      return
+      setExpandedBasket(prev => prev === item ? null : item)
+    } else {
+      setViewType(view)
+      setSelectedItem(item)
+      setActiveTicker(null)
+      setShowSummary(false)
+      setSummaryData(null)
+      setShowBacktest(false)
+      setIntraBasketTarget(item)
     }
-    setViewType(view)
-    setSelectedItem(item)
-    setActiveTicker(null)
-    setShowSummary(false)
-    setSummaryData(null)
-    setShowBacktest(false)
   }
 
   const handleItemSelect = (item: string, view: ViewType) => {
@@ -500,6 +500,7 @@ function App() {
     setSummaryData(null)
     setShowBacktest(false)
     setExpandedBasket(null)
+    setIntraBasketTarget('')
   }
 
   const doSort = (col: SignalSortCol, curCol: SignalSortCol, curDir: 1|-1,
@@ -816,10 +817,7 @@ function App() {
                       className={`accordion-basket-header ${selectedItem === item && viewType === view && !activeTicker ? 'active' : ''}`}
                       onClick={() => handleBasketSelect(item, view)}
                     >
-                      <span
-                        className={`accordion-chevron ${expandedBasket === item && viewType === view ? 'expanded' : ''}`}
-                        onClick={(e) => { e.stopPropagation(); setExpandedBasket(prev => prev === item ? null : item) }}
-                      >{'>'}</span>
+                      <span className={`accordion-chevron ${expandedBasket === item && viewType === view ? 'expanded' : ''}`}>{'>'}</span>
                       <span className="basket-name-text">{item.replace(/_/g, ' ')}</span>
                       {basketBreadth[item] && (
                         <>
@@ -966,36 +964,37 @@ function App() {
                   <label className="overlay-checkbox"><input type="checkbox" checked={showCandleDetail} onChange={e => setShowCandleDetail(e.target.checked)} /> Constituents</label>
                 </>
               )}
-              <label className="overlay-checkbox"><input type="checkbox" checked={showRV} onChange={e => setShowRV(e.target.checked)} /> RV</label>
             </div>
-            <div className={`header-actions ${isBasketView ? 'header-actions-grid' : ''}`}>
-              {canShowSummary && (
-                <button
-                  className={`control-btn ${showSummary ? 'primary' : ''}`}
-                  style={{ order: 1 }}
-                  onClick={() => { setShowSummary(prev => !prev); setShowBacktest(false) }}
-                >
-                  Basket Analysis
-                </button>
-              )}
-              <button className="control-btn" style={{ order: 2 }} onClick={() => setExportTrigger(p => p + 1)}>Export</button>
-              {selectedItem && (
-                <button
-                  className={`control-btn ${showBacktest ? 'primary' : ''}`}
-                  style={{ order: 3 }}
-                  onClick={() => { setShowBacktest(prev => !prev); setShowSummary(false); setShowMultiBacktest(false) }}
-                >
-                  Backtest
-                </button>
-              )}
+            <div className="header-actions header-actions-grid">
               <button
-                className={`control-btn ${showMultiBacktest ? 'primary' : ''}`}
-                style={{ order: 4 }}
-                onClick={() => { setShowMultiBacktest(prev => !prev); setShowBacktest(false); setShowSummary(false) }}
+                className={`control-btn ${showSummary === 'intra' ? 'primary' : ''}`}
+                style={{ order: 1 }}
+                onClick={() => {
+                  if (showSummary === 'intra') { setShowSummary(false) }
+                  else {
+                    if (isBasketView && selectedItem) setIntraBasketTarget(selectedItem)
+                    else setIntraBasketTarget('')
+                    setShowSummary('intra'); setShowBacktest(false)
+                  }
+                }}
               >
-                Multi-Backtest
+                Intrabasket
               </button>
-              <button className="control-btn" style={{ order: 5 }} onClick={() => setRangeUpdateTrigger({ reset1Y: true })}>Reset 1Y</button>
+              <button
+                className={`control-btn ${showSummary === 'cross' ? 'primary' : ''}`}
+                style={{ order: 2 }}
+                onClick={() => { setShowSummary(prev => prev === 'cross' ? false : 'cross'); setShowBacktest(false) }}
+              >
+                Cross-Basket
+              </button>
+              <button
+                className={`control-btn ${showBacktest ? 'primary' : ''}`}
+                style={{ order: 3 }}
+                onClick={() => { setShowBacktest(prev => !prev); setShowSummary(false) }}
+              >
+                Backtest
+              </button>
+              <button className="control-btn" style={{ order: 4 }} onClick={() => setExportTrigger(p => p + 1)}>Export</button>
             </div>
             <div className="header-right-stack">
               {quarterKeys.length > 0 && (
@@ -1047,21 +1046,22 @@ function App() {
             </div>
           </div>
           <div className="content-stack" ref={contentStackRef}>
-            {showMultiBacktest ? (
-              <MultiBacktestPanel
-                apiBase={API_BASE}
-                onClose={() => setShowMultiBacktest(false)}
-              />
-            ) : showBacktest ? (
+            {showBacktest ? (
               <BacktestPanel
                 target={activeTicker || selectedItem}
                 targetType={activeTicker || isTicker ? 'ticker' : 'basket'}
                 apiBase={API_BASE}
                 availableBaskets={backtestBaskets}
+                showPivots={showPivots}
+                showTargets={showTargets}
+                showVolume={showVolume && !isBasketView}
+                showBreadth={showBreadth && isBasketView}
+                showBreakout={showBreakout && isBasketView}
+                showCorrelation={showCorrelation && isBasketView}
                 exportTrigger={exportTrigger}
               />
             ) : showSummary ? (
-              <BasketSummary data={summaryData} loading={summaryLoading} basketName={selectedItem} apiBase={API_BASE} quarterDateRange={isQuarterMode ? quarterToDateRange(quarterStart, quarterEnd) : null} />
+              <BasketSummary data={summaryData} loading={summaryLoading} basketName={intraBasketTarget} apiBase={API_BASE} quarterDateRange={isQuarterMode ? quarterToDateRange(quarterStart, quarterEnd) : null} exportTrigger={exportTrigger} analysisMode={showSummary as 'intra' | 'cross'} allBaskets={baskets} onBasketSelect={setIntraBasketTarget} />
             ) : (
             <div className="chart-container">
             {chartData && chartData.length > 0 ? (
@@ -1075,7 +1075,6 @@ function App() {
                 showBreadth={showBreadth && isBasketView}
                 showBreakout={showBreakout && isBasketView}
                 showCorrelation={showCorrelation && isBasketView}
-                showRV={showRV}
                 rangeUpdateTrigger={rangeUpdateTrigger}
                 exportTrigger={exportTrigger}
                 symbolName={activeTicker || selectedItem}

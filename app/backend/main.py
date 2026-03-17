@@ -203,25 +203,17 @@ def _get_universe_tickers_for_range(basket_name, start_date, end_date):
 
 
 def _get_ticker_join_dates(basket_name, tickers):
-    """Return dict of ticker -> pd.Timestamp for the most recent quarter each ticker joined the basket.
-
-    A ticker 'joins' in a quarter if it is present but was NOT present in the previous quarter
-    (or if it's the first quarter in the data). If a ticker leaves and re-enters, the most recent
-    re-entry date is used.
-    """
+    """Return dict of ticker -> pd.Timestamp for when each ticker first appeared in the basket."""
     quarter_data = _get_universe_history(basket_name)
     if not quarter_data:
         return {}
     ticker_set = set(tickers)
     join_dates = {}
-    sorted_quarters = sorted(quarter_data.keys())
-    prev_tickers: set = set()
-    for q in sorted_quarters:
+    for q in sorted(quarter_data.keys()):
         q_tickers = set(quarter_data[q])
         for t in ticker_set:
-            if t in q_tickers and t not in prev_tickers:
+            if t in q_tickers and t not in join_dates:
                 join_dates[t] = _quarter_str_to_date(q)
-        prev_tickers = q_tickers
     return join_dates
 
 
@@ -547,6 +539,424 @@ def get_basket_breadth():
 logger.info(f"BASE_DIR: {BASE_DIR} (exists={BASE_DIR.exists()})")
 logger.info(f"DATA_STORAGE: {DATA_STORAGE} (exists={DATA_STORAGE.exists()})")
 logger.info(f"INDIVIDUAL_SIGNALS_FILE: {INDIVIDUAL_SIGNALS_FILE} (exists={INDIVIDUAL_SIGNALS_FILE.exists()})")
+
+@app.get("/api/baskets/returns")
+def get_basket_returns(start: str = None, end: str = None, mode: str = "period", basket: str = None, group: str = "all", top_n: int = 10):
+    """Cross-basket period returns or single-basket daily returns time series."""
+    t_names = list(THEMATIC_CONFIG.keys())
+    s_names = ["Communication_Services", "Consumer_Discretionary", "Consumer_Staples", "Energy", "Financials", "Health_Care", "Industrials", "Information_Technology", "Materials", "Real_Estate", "Utilities"]
+
+    # Discover all basket slugs
+    all_slugs = set()
+    for folder in BASKET_CACHE_FOLDERS:
+        if not folder.exists():
+            continue
+        for f in folder.glob("*_of_*_signals.parquet"):
+            slug = re.sub(r'(_\d+)?_of_\d+_signals$', '', f.stem)
+            all_slugs.add(slug)
+
+    def _categorize(slug):
+        if slug in t_names:
+            return "theme"
+        elif slug in s_names:
+            return "sector"
+        else:
+            return "industry"
+
+    # Find global date range from any basket
+    global_min, global_max = None, None
+    for slug in all_slugs:
+        pf = _find_basket_parquet(slug)
+        if not pf:
+            continue
+        try:
+            df = pd.read_parquet(pf, columns=['Date'])
+            if df.empty:
+                continue
+            df['Date'] = pd.to_datetime(df['Date'])
+            dmin, dmax = df['Date'].min(), df['Date'].max()
+            if global_min is None or dmin < global_min:
+                global_min = dmin
+            if global_max is None or dmax > global_max:
+                global_max = dmax
+        except Exception:
+            continue
+
+    # Read live basket closes for today overlay
+    live_closes = {}  # slug -> (date, close)
+    try:
+        live_basket_df = _read_live_parquet(LIVE_BASKET_SIGNALS_FILE)
+        if live_basket_df is not None:
+            name_col = 'BasketName' if 'BasketName' in live_basket_df.columns else 'Basket'
+            for _, row in live_basket_df.iterrows():
+                bname = row[name_col]
+                # "Theme: High Beta" -> "High_Beta", "Sector: Financials" -> "Financials"
+                slug_candidate = bname.split(': ', 1)[-1].replace(' ', '_') if ': ' in bname else bname.replace(' ', '_')
+                live_closes[slug_candidate] = (pd.to_datetime(row['Date']), float(row['Close']))
+    except Exception:
+        pass
+
+    # Update global_max to include live date if present
+    if live_closes:
+        live_max = max(d for d, _ in live_closes.values())
+        if global_max is None or live_max > global_max:
+            global_max = live_max
+
+    date_range = {
+        "min": global_min.strftime('%Y-%m-%d') if global_min else None,
+        "max": global_max.strftime('%Y-%m-%d') if global_max else None,
+    }
+
+    if mode == "daily":
+        # Single basket daily returns
+        if not basket:
+            raise HTTPException(status_code=400, detail="basket param required for mode=daily")
+        if not re.fullmatch(r'[A-Za-z0-9_\-]+', basket):
+            raise HTTPException(status_code=400, detail="Invalid basket name")
+        pf = _find_basket_parquet(basket)
+        if not pf:
+            raise HTTPException(status_code=404, detail=f"Basket not found: {basket}")
+        df = pd.read_parquet(pf, columns=['Date', 'Close'])
+        df['Date'] = pd.to_datetime(df['Date'])
+        df = df.sort_values('Date').dropna(subset=['Close'])
+        # Append live row if available and within range
+        if basket in live_closes:
+            live_date, live_close = live_closes[basket]
+            if live_date not in df['Date'].values:
+                live_row = pd.DataFrame({'Date': [live_date], 'Close': [live_close]})
+                df = pd.concat([df, live_row], ignore_index=True).sort_values('Date')
+        # Filter end date first
+        if end:
+            df = df[df['Date'] <= pd.Timestamp(end)]
+        # For start: keep one anchor row before start for pct_change, then filter output
+        start_ts = pd.Timestamp(start) if start else None
+        if start_ts is not None:
+            before_start = df[df['Date'] < start_ts]
+            in_range = df[df['Date'] >= start_ts]
+            if not before_start.empty:
+                df = pd.concat([before_start.iloc[[-1]], in_range])
+            else:
+                df = in_range
+        df['return'] = df['Close'].pct_change()
+        df = df.dropna(subset=['return'])
+        if start_ts is not None:
+            df = df[df['Date'] >= start_ts]
+        return {
+            "basket": basket,
+            "dates": [d.strftime('%Y-%m-%d') for d in df['Date']],
+            "returns": [round(float(r), 6) for r in df['return']],
+            "date_range": date_range,
+        }
+
+    # ── mode=analogs: regime analogs (cross-basket historical similarity) ──
+    if mode == "analogs":
+        top_n = max(1, min(50, top_n))
+        # Filter baskets by group
+        slugs = []
+        for slug in sorted(all_slugs):
+            cat = _categorize(slug)
+            if group != "all":
+                if group == "themes" and cat != "theme":
+                    continue
+                if group == "sectors" and cat != "sector":
+                    continue
+                if group == "industries" and cat != "industry":
+                    continue
+            slugs.append(slug)
+
+        # Read aligned data for all baskets
+        COLS = ['Date', 'Close', 'Uptrend_Pct', 'Breakout_Pct', 'Correlation_Pct', 'RV_EMA']
+        basket_frames = {}
+        for slug in slugs:
+            pf = _find_basket_parquet(slug)
+            if not pf:
+                continue
+            try:
+                df = pd.read_parquet(pf, columns=COLS)
+                df['Date'] = pd.to_datetime(df['Date'])
+                df = df.sort_values('Date').drop_duplicates(subset=['Date'])
+                # Append live close if available
+                if slug in live_closes:
+                    live_date, live_close = live_closes[slug]
+                    if live_date not in df['Date'].values:
+                        live_row = pd.DataFrame({'Date': [live_date], 'Close': [live_close],
+                                                 'Uptrend_Pct': [np.nan], 'Breakout_Pct': [np.nan],
+                                                 'Correlation_Pct': [np.nan], 'RV_EMA': [np.nan]})
+                        df = pd.concat([df, live_row], ignore_index=True).sort_values('Date')
+                basket_frames[slug] = df.set_index('Date')
+            except Exception:
+                continue
+
+        if len(basket_frames) < 3:
+            return {"current": None, "analogs": [], "date_range": date_range, "message": "Not enough baskets"}
+
+        # Outer-join all baskets by date, forward-fill
+        ordered_slugs = sorted(basket_frames.keys())
+        B = len(ordered_slugs)
+        all_dates = sorted(set().union(*(df.index for df in basket_frames.values())))
+        date_idx = pd.DatetimeIndex(all_dates)
+        T = len(date_idx)
+
+        close_mat = np.full((T, B), np.nan)
+        uptrend_mat = np.full((T, B), np.nan)
+        breakout_mat = np.full((T, B), np.nan)
+        corr_mat = np.full((T, B), np.nan)
+        rv_mat = np.full((T, B), np.nan)
+
+        for j, slug in enumerate(ordered_slugs):
+            df = basket_frames[slug]
+            idxs = date_idx.searchsorted(df.index)
+            valid = idxs < T
+            idxs = idxs[valid]
+            close_mat[idxs, j] = df['Close'].values[valid]
+            uptrend_mat[idxs, j] = df['Uptrend_Pct'].values[valid]
+            breakout_mat[idxs, j] = df['Breakout_Pct'].values[valid]
+            corr_mat[idxs, j] = df['Correlation_Pct'].values[valid]
+            rv_mat[idxs, j] = df['RV_EMA'].values[valid]
+
+        # Forward-fill each column
+        for mat in [close_mat, uptrend_mat, breakout_mat, corr_mat, rv_mat]:
+            for j in range(B):
+                col = mat[:, j]
+                mask = np.isnan(col)
+                if mask.all():
+                    continue
+                idx_arr = np.where(~mask, np.arange(T), 0)
+                np.maximum.accumulate(idx_arr, out=idx_arr)
+                mat[:, j] = col[idx_arr]
+                # Keep leading NaN
+                first_valid = np.argmax(~mask)
+                mat[:first_valid, j] = np.nan
+
+        # Find current period indices
+        if not start or not end:
+            return {"current": None, "analogs": [], "date_range": date_range, "message": "start and end required"}
+        start_ts = pd.Timestamp(start)
+        end_ts = pd.Timestamp(end)
+        start_idx = int(date_idx.searchsorted(start_ts, side='left'))
+        end_idx = int(date_idx.searchsorted(end_ts, side='right')) - 1
+        if end_idx < 0 or start_idx >= T:
+            return {"current": None, "analogs": [], "date_range": date_range, "message": "Date range out of bounds"}
+        end_idx = min(end_idx, T - 1)
+        start_idx = min(start_idx, end_idx)
+        W = end_idx - start_idx
+        if W < 5:
+            return {"current": None, "analogs": [], "date_range": date_range, "message": "Window too short (< 5 days)"}
+
+        # Helper: rank across baskets (handles NaN by giving worst rank)
+        def rank_vec(v):
+            """Rank values 1..B. NaN gets rank B."""
+            out = np.full(len(v), float(len(v)))
+            valid = ~np.isnan(v)
+            if valid.sum() > 0:
+                order = np.argsort(v[valid])
+                ranks = np.empty_like(order, dtype=float)
+                ranks[order] = np.arange(1, valid.sum() + 1, dtype=float)
+                out[valid] = ranks
+            return out
+
+        # Current fingerprint
+        cur_ret = close_mat[end_idx] / close_mat[start_idx] - 1
+        cur_ret_ranks = rank_vec(cur_ret)
+        cur_upt_ranks = rank_vec(uptrend_mat[end_idx])
+        cur_bkt_ranks = rank_vec(breakout_mat[end_idx])
+        cur_cor_ranks = rank_vec(corr_mat[end_idx])
+        cur_rv_ranks = rank_vec(rv_mat[end_idx])
+
+        # Rolling fingerprints: vectorized
+        # Return: close_mat[W:] / close_mat[:-W] - 1, shape (T-W, B)
+        roll_ret = close_mat[W:] / close_mat[:-W] - 1  # (T-W, B)
+        roll_upt = uptrend_mat[W:]   # end-of-window snapshots
+        roll_bkt = breakout_mat[W:]
+        roll_cor = corr_mat[W:]
+        roll_rv = rv_mat[W:]
+        N_windows = roll_ret.shape[0]
+
+        # Rank each metric for all windows: vectorized argsort
+        def rank_matrix(mat):
+            """Rank across axis=1 for each row. NaN → rank B."""
+            R = np.full_like(mat, float(B))
+            for i in range(mat.shape[0]):
+                valid = ~np.isnan(mat[i])
+                if valid.sum() == 0:
+                    continue
+                order = np.argsort(mat[i][valid])
+                ranks = np.empty(valid.sum(), dtype=float)
+                ranks[order] = np.arange(1, valid.sum() + 1, dtype=float)
+                R[i][valid] = ranks
+            return R
+
+        rr_ret = rank_matrix(roll_ret)
+        rr_upt = rank_matrix(roll_upt)
+        rr_bkt = rank_matrix(roll_bkt)
+        rr_cor = rank_matrix(roll_cor)
+        rr_rv = rank_matrix(roll_rv)
+
+        # Spearman: rho = 1 - 6*sum(d^2) / (B*(B^2-1))
+        denom = B * (B * B - 1)
+        def spearman_vec(cur_ranks, roll_ranks):
+            d2 = (roll_ranks - cur_ranks[np.newaxis, :]) ** 2
+            return 1.0 - 6.0 * d2.sum(axis=1) / denom
+
+        rho_ret = spearman_vec(cur_ret_ranks, rr_ret)
+        rho_upt = spearman_vec(cur_upt_ranks, rr_upt)
+        rho_bkt = spearman_vec(cur_bkt_ranks, rr_bkt)
+        rho_cor = spearman_vec(cur_cor_ranks, rr_cor)
+        rho_rv = spearman_vec(cur_rv_ranks, rr_rv)
+
+        # Overall similarity: average of 5 metrics
+        rho_avg = (rho_ret + rho_upt + rho_bkt + rho_cor + rho_rv) / 5.0
+
+        # Exclude current window ± W/2 days
+        half_w = W // 2
+        # Each window i corresponds to historical period [i, i+W], where end = i+W
+        # The current window has start_idx at position (start_idx) in original, which maps to
+        # roll index = start_idx (since roll_ret[i] = close[i+W]/close[i] - 1, so i=start_idx means period [start_idx, start_idx+W=end_idx])
+        cur_roll_idx = start_idx
+        excl_lo = max(0, cur_roll_idx - half_w)
+        excl_hi = min(N_windows, cur_roll_idx + half_w + 1)
+        rho_avg[excl_lo:excl_hi] = -999.0
+
+        # Greedy top-N with overlap exclusion
+        selected = []
+        used = rho_avg.copy()
+        for _ in range(top_n):
+            best = int(np.argmax(used))
+            if used[best] <= -999.0:
+                break
+            selected.append(best)
+            # Exclude neighbors within W/2
+            lo = max(0, best - half_w)
+            hi = min(N_windows, best + half_w + 1)
+            used[lo:hi] = -999.0
+
+        # Build response
+        # Current period data
+        current_returns = {}
+        current_metrics = {"uptrend_pct": {}, "breakout_pct": {}, "correlation_pct": {}, "rv_ema": {}}
+        for j, slug in enumerate(ordered_slugs):
+            r = cur_ret[j]
+            current_returns[slug] = round(float(r), 6) if not np.isnan(r) else None
+            current_metrics["uptrend_pct"][slug] = round(float(uptrend_mat[end_idx, j]), 2) if not np.isnan(uptrend_mat[end_idx, j]) else None
+            current_metrics["breakout_pct"][slug] = round(float(breakout_mat[end_idx, j]), 2) if not np.isnan(breakout_mat[end_idx, j]) else None
+            current_metrics["correlation_pct"][slug] = round(float(corr_mat[end_idx, j]), 2) if not np.isnan(corr_mat[end_idx, j]) else None
+            current_metrics["rv_ema"][slug] = round(float(rv_mat[end_idx, j]), 6) if not np.isnan(rv_mat[end_idx, j]) else None
+
+        analogs = []
+        HORIZONS = {"1M": 21, "3M": 63, "6M": 126}
+        for sel_idx in selected:
+            a_start = sel_idx
+            a_end = sel_idx + W
+            a_start_date = date_idx[a_start].strftime('%Y-%m-%d')
+            a_end_date = date_idx[a_end].strftime('%Y-%m-%d')
+
+            # Per-basket returns for this analog
+            a_returns = {}
+            for j, slug in enumerate(ordered_slugs):
+                r = roll_ret[sel_idx, j]
+                a_returns[slug] = round(float(r), 6) if not np.isnan(r) else None
+
+            # Similarity breakdown
+            breakdown = {
+                "returns": round(float(rho_ret[sel_idx]), 4),
+                "breadth": round(float(rho_upt[sel_idx]), 4),
+                "breakout": round(float(rho_bkt[sel_idx]), 4),
+                "correlation": round(float(rho_cor[sel_idx]), 4),
+                "volatility": round(float(rho_rv[sel_idx]), 4),
+            }
+
+            # Forward returns
+            forward = {}
+            for hz_label, hz_days in HORIZONS.items():
+                fwd_idx = a_end + hz_days
+                if fwd_idx >= T:
+                    forward[hz_label] = None
+                else:
+                    fwd = {}
+                    for j, slug in enumerate(ordered_slugs):
+                        c_end = close_mat[a_end, j]
+                        c_fwd = close_mat[fwd_idx, j]
+                        if np.isnan(c_end) or np.isnan(c_fwd) or c_end == 0:
+                            fwd[slug] = None
+                        else:
+                            fwd[slug] = round(float(c_fwd / c_end - 1), 6)
+                    forward[hz_label] = fwd
+
+            analogs.append({
+                "start": a_start_date,
+                "end": a_end_date,
+                "similarity": round(float(rho_avg[sel_idx]) if rho_avg[sel_idx] > -999 else float((rho_ret[sel_idx] + rho_upt[sel_idx] + rho_bkt[sel_idx] + rho_cor[sel_idx] + rho_rv[sel_idx]) / 5), 4),
+                "similarity_breakdown": breakdown,
+                "returns": a_returns,
+                "forward": forward,
+            })
+
+        return {
+            "current": {
+                "start": start,
+                "end": end,
+                "returns": current_returns,
+                "metrics": current_metrics,
+            },
+            "analogs": analogs,
+            "date_range": date_range,
+        }
+
+    # mode=period: one return per basket
+    # Default to 1Y range if no dates specified
+    if not start and not end and global_max:
+        end_dt = global_max
+        start_dt = end_dt - pd.DateOffset(years=1)
+        start = start_dt.strftime('%Y-%m-%d')
+        end = end_dt.strftime('%Y-%m-%d')
+
+    baskets = []
+    for slug in sorted(all_slugs):
+        cat = _categorize(slug)
+        if group != "all":
+            if group == "themes" and cat != "theme":
+                continue
+            if group == "sectors" and cat != "sector":
+                continue
+            if group == "industries" and cat != "industry":
+                continue
+        pf = _find_basket_parquet(slug)
+        if not pf:
+            continue
+        try:
+            df = pd.read_parquet(pf, columns=['Date', 'Close'])
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df.sort_values('Date').dropna(subset=['Close'])
+            # Append live row if available
+            if slug in live_closes:
+                live_date, live_close = live_closes[slug]
+                if live_date not in df['Date'].values:
+                    live_row = pd.DataFrame({'Date': [live_date], 'Close': [live_close]})
+                    df = pd.concat([df, live_row], ignore_index=True).sort_values('Date')
+            if end:
+                df = df[df['Date'] <= pd.Timestamp(end)]
+            # Keep one anchor row before start for the opening price
+            if start:
+                start_ts = pd.Timestamp(start)
+                before = df[df['Date'] < start_ts]
+                in_range = df[df['Date'] >= start_ts]
+                if not before.empty:
+                    df = pd.concat([before.iloc[[-1]], in_range])
+                else:
+                    df = in_range
+            if len(df) < 2:
+                continue
+            first_close = float(df.iloc[0]['Close'])
+            last_close = float(df.iloc[-1]['Close'])
+            if first_close == 0:
+                continue
+            ret = (last_close / first_close) - 1
+            baskets.append({"name": slug, "group": cat, "return": round(ret, 6)})
+        except Exception:
+            continue
+
+    actual_range = {"start": start, "end": end}
+    return {"baskets": baskets, "date_range": date_range, "actual_range": actual_range}
 
 @app.get("/api/baskets/{basket_name}")
 def get_basket_data(basket_name: str):
@@ -1297,12 +1707,10 @@ def get_basket_summary(basket_name: str, start: str = None, end: str = None):
             # Mask inactive days back to NaN
             cum_ret[~active_mask] = float('nan')
             dates = [d.strftime('%Y-%m-%d') for d in ret_pivot.index]
-            join_dates = _get_ticker_join_dates(basket_name, sorted(ret_pivot.columns))
             cum_series = []
             for t in sorted(ret_pivot.columns):
                 vals = [None if pd.isna(v) else round(float(v), 4) for v in cum_ret[t].tolist()]
-                jd = join_dates.get(t)
-                cum_series.append({'ticker': t, 'values': vals, 'join_date': jd.strftime('%Y-%m-%d') if jd else None})
+                cum_series.append({'ticker': t, 'values': vals, 'join_date': None})
         else:
             # Fallback: use close prices and join dates (no contributions file)
             join_dates = _get_ticker_join_dates(basket_name, tickers)
@@ -1586,50 +1994,26 @@ class BacktestRequest(BaseModel):
     position_size: float = 1.0
     initial_equity: float = 100000
     max_leverage: float = 2.5
-    benchmarks_only: bool = False
-    include_positions: bool = False
 
-class MultiBasketLeg(BaseModel):
-    target: str                          # basket name or ticker
-    target_type: str                     # 'basket', 'basket_tickers', or 'ticker'
-    entry_signal: str                    # signal from SIGNAL_TYPES
-    allocation_pct: float                # 0.0-1.0, fraction of total equity
-    position_size: float = 0.25          # per-leg position size as fraction of leg equity
+class MultiBacktestLeg(BaseModel):
+    target: str
+    target_type: str
+    entry_signal: str
+    allocation_pct: float  # 0-1 fraction
+    position_size: float = 1.0
     filters: List[BacktestFilter] = []
 
 class MultiBacktestRequest(BaseModel):
-    legs: List[MultiBasketLeg]
+    legs: List[MultiBacktestLeg]
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     initial_equity: float = 100000
     max_leverage: float = 2.5
 
-@app.get("/api/date-range/{target_type}/{target}")
-def get_date_range(target_type: str, target: str):
-    """Return min/max date for a basket or ticker so the frontend can constrain date pickers."""
-    if target_type in ('basket', 'basket_tickers'):
-        basket_file = _find_basket_parquet(target)
-        if not basket_file:
-            raise HTTPException(status_code=404, detail=f"Basket file not found for {target}")
-        dates = pd.read_parquet(basket_file, columns=['Date'])['Date']
-    else:
-        if not INDIVIDUAL_SIGNALS_FILE.exists():
-            raise HTTPException(status_code=404, detail="Signals file not found")
-        dates = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=['Ticker', 'Date'],
-                                filters=[('Ticker', '==', target)])['Date']
-    dates = pd.to_datetime(dates)
-    if dates.empty:
-        raise HTTPException(status_code=404, detail="No data found")
-    return {"min": dates.min().strftime('%Y-%m-%d'), "max": dates.max().strftime('%Y-%m-%d')}
 
-def _build_leg_data(target, target_type, entry_signal, filters,
-                    start_date=None, end_date=None, compute_paths=True):
-    """Build trades and supporting data for a single target/signal combination.
-
-    Returns dict with: trades, trade_paths, ticker_closes, all_dates, direction,
-    is_long, is_multi_ticker, quarter_membership, df, date_range.
-    Returns None if the filtered DataFrame is empty.
-    Raises HTTPException on hard errors.
+def _build_leg_trades(target, target_type, entry_signal, filters, start_date, end_date):
+    """Extract trade-building logic for a single backtest leg.
+    Returns (trades, df, ticker_closes, direction).
     """
     sig = entry_signal
     is_col = SIGNAL_IS_COL.get(sig)
@@ -1637,13 +2021,17 @@ def _build_leg_data(target, target_type, entry_signal, filters,
         raise HTTPException(status_code=400, detail=f"Unknown signal: {sig}")
     direction = BACKTEST_DIRECTION[sig]
 
+    # Trade data columns for entry signal
     trade_cols = [f'{sig}_Entry_Price', f'{sig}_Exit_Date', f'{sig}_Exit_Price',
                   f'{sig}_Final_Change', f'{sig}_MFE', f'{sig}_MAE']
 
-    is_multi_ticker = target_type == 'basket_tickers'
-    quarter_membership = None
+    # Regime filter metrics we may need
+    pct_metrics = {'Uptrend_Pct', 'Breakout_Pct', 'Correlation_Pct', 'RV_EMA', 'Breakdown_Pct', 'Downtrend_Pct'}
+    bool_metrics = {'Is_Breakout_Sequence', 'Trend', 'BTFD_Triggered', 'STFR_Triggered'}
 
-    # ── 1. Load target data ──
+    is_multi_ticker = target_type == 'basket_tickers'
+
+    # 1. Load target data
     if target_type == 'basket':
         basket_file = _find_basket_parquet(target)
         if not basket_file:
@@ -1660,21 +2048,9 @@ def _build_leg_data(target, target_type, entry_signal, filters,
     elif target_type == 'basket_tickers':
         if not INDIVIDUAL_SIGNALS_FILE.exists():
             raise HTTPException(status_code=404, detail="Signals file not found")
-        quarter_history = _get_universe_history(target)
-        if not quarter_history:
-            basket_tickers = get_latest_universe_tickers(target)
-            if not basket_tickers:
-                basket_tickers = get_meta_file_tickers(target)
-            quarter_membership = None
-        else:
-            basket_tickers = list(set(t for tl in quarter_history.values() for t in tl))
-            quarter_membership = []
-            for q_str, q_tickers in quarter_history.items():
-                q_start = _quarter_str_to_date(q_str)
-                qn = int(q_str.split()[1][1])
-                q_end = pd.Timestamp(year=q_start.year, month=qn * 3, day=1) + pd.offsets.MonthEnd(0)
-                quarter_membership.append((q_start, q_end, set(q_tickers)))
-            quarter_membership.sort(key=lambda x: x[0])
+        basket_tickers = get_latest_universe_tickers(target)
+        if not basket_tickers:
+            basket_tickers = get_meta_file_tickers(target)
         if not basket_tickers:
             raise HTTPException(status_code=404, detail=f"No tickers found for basket {target}")
         base_cols = ['Ticker', 'Date', 'Close', is_col] + trade_cols
@@ -1684,7 +2060,7 @@ def _build_leg_data(target, target_type, entry_signal, filters,
         df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
                              columns=[c for c in base_cols if c],
                              filters=[('Ticker', 'in', basket_tickers)])
-    else:  # ticker
+    else:
         if not INDIVIDUAL_SIGNALS_FILE.exists():
             raise HTTPException(status_code=404, detail="Signals file not found")
         base_cols = ['Ticker', 'Date', 'Close', is_col] + trade_cols
@@ -1701,20 +2077,16 @@ def _build_leg_data(target, target_type, entry_signal, filters,
     else:
         df = df.sort_values('Date').reset_index(drop=True)
 
-    date_range = {
-        "min": df['Date'].min().strftime('%Y-%m-%d'),
-        "max": df['Date'].max().strftime('%Y-%m-%d'),
-    }
-
+    # Date range filter
     if start_date:
         df = df[df['Date'] >= pd.Timestamp(start_date)]
     if end_date:
         df = df[df['Date'] <= pd.Timestamp(end_date)]
 
     if df.empty:
-        return None
+        return [], df, {}, direction
 
-    # ── 2. External filter merge ──
+    # Load external filter sources and merge
     external_sources = {}
     failed_sources = set()
     needs_ext_merge = any(flt.source != 'self' for flt in filters)
@@ -1745,7 +2117,7 @@ def _build_leg_data(target, target_type, entry_signal, filters,
     if needs_ext_merge and is_multi_ticker:
         df = df.sort_values(['Ticker', 'Date']).reset_index(drop=True)
 
-    # ── 3. Shift columns for trending conditions ──
+    # Add shift columns for increasing/decreasing conditions
     for flt in filters:
         col_name = flt.metric
         if flt.source != 'self':
@@ -1756,156 +2128,100 @@ def _build_leg_data(target, target_type, entry_signal, filters,
             else:
                 df[f'{col_name}__prev'] = df[col_name].shift(1)
 
-    # ── 4. Find entries ──
+    # Find entry rows
     entries = df[df[is_col] == True].copy()
 
-    if is_multi_ticker and quarter_membership:
-        q_starts = np.array([q[0].value for q in quarter_membership])
-        q_ends = np.array([q[1].value for q in quarter_membership])
-        q_ticker_sets = [q[2] for q in quarter_membership]
-        dates_i64 = entries['Date'].values.astype('int64')
-        tickers_arr = entries['Ticker'].values
-        qi_arr = np.searchsorted(q_starts, dates_i64, side='right') - 1
-        mask = np.zeros(len(entries), dtype=bool)
-        for i in range(len(entries)):
-            qi = qi_arr[i]
-            if 0 <= qi < len(q_starts) and dates_i64[i] <= q_ends[qi]:
-                if tickers_arr[i] in q_ticker_sets[qi]:
-                    mask[i] = True
-        entries = entries[mask]
+    # Build trades from pre-computed data
+    trades = []
+    for _, row in entries.iterrows():
+        entry_price = row.get(f'{sig}_Entry_Price')
+        exit_date = row.get(f'{sig}_Exit_Date')
+        exit_price = row.get(f'{sig}_Exit_Price')
+        final_change = row.get(f'{sig}_Final_Change')
+        mfe = row.get(f'{sig}_MFE')
+        mae = row.get(f'{sig}_MAE')
 
-    # ── 5. Build trades ──
-    ep_col = f'{sig}_Entry_Price'
-    xd_col = f'{sig}_Exit_Date'
-    xp_col = f'{sig}_Exit_Price'
-    fc_col = f'{sig}_Final_Change'
-    mfe_col = f'{sig}_MFE'
-    mae_col = f'{sig}_MAE'
+        # Skip open trades (no exit)
+        if pd.isna(exit_date) or pd.isna(exit_price):
+            continue
 
-    entries = entries.dropna(subset=[xd_col, xp_col])
-    if entries.empty:
-        trades = []
-    else:
-        entry_dates_np = entries['Date'].dt.date.values
-        exit_dates_np = pd.to_datetime(entries[xd_col]).dt.date.values
-        bars_held_arr = np.array([max(1, int(np.busday_count(ed, xd)))
-                                  for ed, xd in zip(entry_dates_np, exit_dates_np)])
+        entry_date = row['Date']
 
-        regime_mask = np.ones(len(entries), dtype=bool)
+        # Compute bars held
+        exit_dt = pd.Timestamp(exit_date)
+        bars_held = max(1, int(np.busday_count(
+            entry_date.date(), exit_dt.date())))
+
+        trade_return = float(final_change) if pd.notna(final_change) else 0.0
+
+        # Apply regime filters
+        regime_pass = True
         for flt in filters:
             if flt.source != 'self' and flt.source in failed_sources:
                 continue
             col_name = flt.metric
             if flt.source != 'self':
                 col_name = f'{flt.metric}__{flt.source}'
-            if col_name not in entries.columns:
-                regime_mask[:] = False
-                break
-            vals = entries[col_name].values
-            not_na = pd.notna(vals)
+            val = row.get(col_name)
             if flt.condition == 'above':
-                regime_mask &= not_na & (vals.astype(float) > flt.value)
+                regime_pass = regime_pass and (pd.notna(val) and float(val) > flt.value)
             elif flt.condition == 'below':
-                regime_mask &= not_na & (vals.astype(float) < flt.value)
+                regime_pass = regime_pass and (pd.notna(val) and float(val) < flt.value)
             elif flt.condition == 'increasing':
-                prev_col = f'{col_name}__prev'
-                if prev_col in entries.columns:
-                    prev_vals = entries[prev_col].values
-                    regime_mask &= not_na & pd.notna(prev_vals) & (vals.astype(float) > prev_vals.astype(float))
-                else:
-                    regime_mask[:] = False
-                    break
+                prev_val = row.get(f'{col_name}__prev')
+                regime_pass = regime_pass and (pd.notna(val) and pd.notna(prev_val) and float(val) > float(prev_val))
             elif flt.condition == 'decreasing':
-                prev_col = f'{col_name}__prev'
-                if prev_col in entries.columns:
-                    prev_vals = entries[prev_col].values
-                    regime_mask &= not_na & pd.notna(prev_vals) & (vals.astype(float) < prev_vals.astype(float))
-                else:
-                    regime_mask[:] = False
-                    break
+                prev_val = row.get(f'{col_name}__prev')
+                regime_pass = regime_pass and (pd.notna(val) and pd.notna(prev_val) and float(val) < float(prev_val))
             elif flt.condition == 'equals_true':
-                regime_mask &= not_na & vals.astype(bool)
+                regime_pass = regime_pass and (pd.notna(val) and bool(val))
             elif flt.condition == 'equals_false':
-                regime_mask &= not_na & ~vals.astype(bool)
+                regime_pass = regime_pass and (pd.notna(val) and not bool(val))
 
-        entry_dates_str = entries['Date'].dt.strftime('%Y-%m-%d').values
-        exit_dates_str = pd.to_datetime(entries[xd_col]).dt.strftime('%Y-%m-%d').values
-        entry_prices = entries[ep_col].values
-        exit_prices = entries[xp_col].values
-        changes = entries[fc_col].values
-        mfes = entries[mfe_col].values
-        maes = entries[mae_col].values
-        tickers = entries['Ticker'].values if is_multi_ticker else None
+        trade_dict = {
+            'entry_date': entry_date.strftime('%Y-%m-%d'),
+            'exit_date': exit_dt.strftime('%Y-%m-%d'),
+            'entry_price': safe_float(entry_price, 2),
+            'exit_price': safe_float(exit_price, 2),
+            'change': safe_float(trade_return, 4),
+            'mfe': safe_float(mfe, 4),
+            'mae': safe_float(mae, 4),
+            'bars_held': bars_held,
+            'regime_pass': regime_pass,
+        }
+        if is_multi_ticker:
+            trade_dict['ticker'] = row.get('Ticker', '')
+        trades.append(trade_dict)
 
-        trades = []
-        for i in range(len(entries)):
-            fc = changes[i]
-            trade_dict = {
-                'entry_date': entry_dates_str[i],
-                'exit_date': exit_dates_str[i],
-                'entry_price': safe_float(entry_prices[i], 2),
-                'exit_price': safe_float(exit_prices[i], 2),
-                'change': safe_float(float(fc) if pd.notna(fc) else 0.0, 4),
-                'mfe': safe_float(mfes[i], 4),
-                'mae': safe_float(maes[i], 4),
-                'bars_held': int(bars_held_arr[i]),
-                'regime_pass': bool(regime_mask[i]),
-            }
-            if is_multi_ticker:
-                trade_dict['ticker'] = str(tickers[i])
-            trades.append(trade_dict)
-
-    # ── 6. Trade paths + ticker_closes ──
-    trade_paths = []
+    # Build ticker_closes for path computation
     if is_multi_ticker:
         ticker_closes = {}
         for tkr, grp in df.groupby('Ticker'):
             ticker_closes[tkr] = grp.set_index('Date')['Close'].sort_index()
-        if compute_paths:
-            for t in trades:
-                ep = t['entry_price']
-                tkr = t.get('ticker', '')
-                if ep is None or ep == 0 or tkr not in ticker_closes:
-                    trade_paths.append([])
-                    continue
-                ed = pd.Timestamp(t['entry_date'])
-                xd = pd.Timestamp(t['exit_date'])
-                cs = ticker_closes[tkr]
-                segment = cs[(cs.index >= ed) & (cs.index <= xd)]
-                path = [round(float(c) / ep - 1, 6) for c in segment.values]
-                trade_paths.append(path)
     else:
-        closes = df.drop_duplicates('Date').set_index('Date')['Close'].sort_index()
+        closes = df.set_index('Date')['Close'].sort_index()
         ticker_closes = {'': closes}
-        if compute_paths:
-            for t in trades:
-                ep = t['entry_price']
-                if ep is None or ep == 0:
-                    trade_paths.append([])
-                    continue
-                ed = pd.Timestamp(t['entry_date'])
-                xd = pd.Timestamp(t['exit_date'])
-                cmask = (closes.index >= ed) & (closes.index <= xd)
-                segment = closes[cmask]
-                path = [round(float(c) / ep - 1, 6) for c in segment.values]
-                trade_paths.append(path)
 
-    all_dates = sorted(df['Date'].unique())
+    return trades, df, ticker_closes, direction
 
-    return {
-        'trades': trades,
-        'trade_paths': trade_paths,
-        'ticker_closes': ticker_closes,
-        'all_dates': all_dates,
-        'direction': direction,
-        'is_long': direction == 'long',
-        'is_multi_ticker': is_multi_ticker,
-        'quarter_membership': quarter_membership,
-        'df': df,
-        'date_range': date_range,
-        'failed_sources': failed_sources,
-    }
 
+@app.get("/api/date-range/{target_type}/{target}")
+def get_date_range(target_type: str, target: str):
+    """Return min/max date for a basket or ticker so the frontend can constrain date pickers."""
+    if target_type in ('basket', 'basket_tickers'):
+        basket_file = _find_basket_parquet(target)
+        if not basket_file:
+            raise HTTPException(status_code=404, detail=f"Basket file not found for {target}")
+        dates = pd.read_parquet(basket_file, columns=['Date'])['Date']
+    else:
+        if not INDIVIDUAL_SIGNALS_FILE.exists():
+            raise HTTPException(status_code=404, detail="Signals file not found")
+        dates = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=['Ticker', 'Date'],
+                                filters=[('Ticker', '==', target)])['Date']
+    dates = pd.to_datetime(dates)
+    if dates.empty:
+        raise HTTPException(status_code=404, detail="No data found")
+    return {"min": dates.min().strftime('%Y-%m-%d'), "max": dates.max().strftime('%Y-%m-%d')}
 
 @app.post("/api/backtest")
 def run_backtest(req: BacktestRequest):
@@ -1941,28 +2257,12 @@ def run_backtest(req: BacktestRequest):
             df = pd.read_parquet(basket_file)
             df = df[[c for c in base_cols if c in df.columns]]
     elif req.target_type == 'basket_tickers':
-        # Load individual ticker signals for all tickers ever in the basket
+        # Load individual ticker signals for all tickers in the basket
         if not INDIVIDUAL_SIGNALS_FILE.exists():
             raise HTTPException(status_code=404, detail="Signals file not found")
-        # Build quarterly membership lookup: quarter_str -> set of tickers
-        quarter_history = _get_universe_history(req.target)
-        if not quarter_history:
-            # Fallback to latest universe
-            basket_tickers = get_latest_universe_tickers(req.target)
-            if not basket_tickers:
-                basket_tickers = get_meta_file_tickers(req.target)
-            quarter_membership = None
-        else:
-            # Union of all tickers across all quarters
-            basket_tickers = list(set(t for tl in quarter_history.values() for t in tl))
-            # Build sorted list of (q_start_date, q_end_date, ticker_set) for membership lookup
-            quarter_membership = []
-            for q_str, q_tickers in quarter_history.items():
-                q_start = _quarter_str_to_date(q_str)
-                qn = int(q_str.split()[1][1])
-                q_end = pd.Timestamp(year=q_start.year, month=qn * 3, day=1) + pd.offsets.MonthEnd(0)
-                quarter_membership.append((q_start, q_end, set(q_tickers)))
-            quarter_membership.sort(key=lambda x: x[0])
+        basket_tickers = get_latest_universe_tickers(req.target)
+        if not basket_tickers:
+            basket_tickers = get_meta_file_tickers(req.target)
         if not basket_tickers:
             raise HTTPException(status_code=404, detail=f"No tickers found for basket {req.target}")
         base_cols = ['Ticker', 'Date', 'Close', is_col] + trade_cols
@@ -2051,109 +2351,72 @@ def run_backtest(req: BacktestRequest):
     # 5. Find entry rows
     entries = df[df[is_col] == True].copy()
 
-    # 5b. Filter to basket membership: only keep entries where ticker was in basket at entry date
-    if is_multi_ticker and quarter_membership:
-        # Vectorized membership check using searchsorted on quarter start dates
-        q_starts = np.array([q[0].value for q in quarter_membership])  # int64 nanoseconds
-        q_ends = np.array([q[1].value for q in quarter_membership])
-        q_ticker_sets = [q[2] for q in quarter_membership]
+    # 6. Build trades from pre-computed data
+    trades = []
+    for _, row in entries.iterrows():
+        entry_price = row.get(f'{sig}_Entry_Price')
+        exit_date = row.get(f'{sig}_Exit_Date')
+        exit_price = row.get(f'{sig}_Exit_Price')
+        final_change = row.get(f'{sig}_Final_Change')
+        mfe = row.get(f'{sig}_MFE')
+        mae = row.get(f'{sig}_MAE')
 
-        dates_i64 = entries['Date'].values.astype('int64')
-        tickers_arr = entries['Ticker'].values
-        # For each date, find which quarter it falls in via searchsorted
-        qi_arr = np.searchsorted(q_starts, dates_i64, side='right') - 1
-        mask = np.zeros(len(entries), dtype=bool)
-        for i in range(len(entries)):
-            qi = qi_arr[i]
-            if 0 <= qi < len(q_starts) and dates_i64[i] <= q_ends[qi]:
-                if tickers_arr[i] in q_ticker_sets[qi]:
-                    mask[i] = True
-        entries = entries[mask]
+        # Skip open trades (no exit)
+        if pd.isna(exit_date) or pd.isna(exit_price):
+            continue
 
-    # 6. Build trades from pre-computed data (vectorized)
-    ep_col = f'{sig}_Entry_Price'
-    xd_col = f'{sig}_Exit_Date'
-    xp_col = f'{sig}_Exit_Price'
-    fc_col = f'{sig}_Final_Change'
-    mfe_col = f'{sig}_MFE'
-    mae_col = f'{sig}_MAE'
+        entry_date = row['Date']
 
-    # Drop rows with no exit (vectorized filter)
-    entries = entries.dropna(subset=[xd_col, xp_col])
-    if entries.empty:
-        trades = []
-    else:
-        # Vectorized bars_held computation
-        entry_dates_np = entries['Date'].dt.date.values
-        exit_dates_np = pd.to_datetime(entries[xd_col]).dt.date.values
-        bars_held_arr = np.array([max(1, int(np.busday_count(ed, xd)))
-                                  for ed, xd in zip(entry_dates_np, exit_dates_np)])
+        # Compute bars held
+        exit_dt = pd.Timestamp(exit_date)
+        # Count trading days between entry and exit using business days
+        bars_held = max(1, int(np.busday_count(
+            entry_date.date(), exit_dt.date())))
 
-        # Vectorized regime filter mask
-        regime_mask = np.ones(len(entries), dtype=bool)
+        # Apply direction: for short signals, the raw Final_Change is already
+        # from the perspective of the signal (positive = profitable short).
+        # We use Final_Change as-is since the signals engine already accounts for direction.
+        trade_return = float(final_change) if pd.notna(final_change) else 0.0
+
+        # Apply regime filters
+        regime_pass = True
         for flt in req.filters:
+            # Skip filters whose external source had no data
             if flt.source != 'self' and flt.source in failed_sources:
                 continue
             col_name = flt.metric
             if flt.source != 'self':
                 col_name = f'{flt.metric}__{flt.source}'
-            if col_name not in entries.columns:
-                regime_mask[:] = False
-                break
-            vals = entries[col_name].values
-            not_na = pd.notna(vals)
+            val = row.get(col_name)
             if flt.condition == 'above':
-                regime_mask &= not_na & (vals.astype(float) > flt.value)
+                regime_pass = regime_pass and (pd.notna(val) and float(val) > flt.value)
             elif flt.condition == 'below':
-                regime_mask &= not_na & (vals.astype(float) < flt.value)
+                regime_pass = regime_pass and (pd.notna(val) and float(val) < flt.value)
             elif flt.condition == 'increasing':
-                prev_col = f'{col_name}__prev'
-                if prev_col in entries.columns:
-                    prev_vals = entries[prev_col].values
-                    regime_mask &= not_na & pd.notna(prev_vals) & (vals.astype(float) > prev_vals.astype(float))
-                else:
-                    regime_mask[:] = False
-                    break
+                prev_val = row.get(f'{col_name}__prev')
+                regime_pass = regime_pass and (pd.notna(val) and pd.notna(prev_val) and float(val) > float(prev_val))
             elif flt.condition == 'decreasing':
-                prev_col = f'{col_name}__prev'
-                if prev_col in entries.columns:
-                    prev_vals = entries[prev_col].values
-                    regime_mask &= not_na & pd.notna(prev_vals) & (vals.astype(float) < prev_vals.astype(float))
-                else:
-                    regime_mask[:] = False
-                    break
+                prev_val = row.get(f'{col_name}__prev')
+                regime_pass = regime_pass and (pd.notna(val) and pd.notna(prev_val) and float(val) < float(prev_val))
             elif flt.condition == 'equals_true':
-                regime_mask &= not_na & vals.astype(bool)
+                regime_pass = regime_pass and (pd.notna(val) and bool(val))
             elif flt.condition == 'equals_false':
-                regime_mask &= not_na & ~vals.astype(bool)
+                regime_pass = regime_pass and (pd.notna(val) and not bool(val))
 
-        # Build trades list from arrays (no iterrows)
-        entry_dates_str = entries['Date'].dt.strftime('%Y-%m-%d').values
-        exit_dates_str = pd.to_datetime(entries[xd_col]).dt.strftime('%Y-%m-%d').values
-        entry_prices = entries[ep_col].values
-        exit_prices = entries[xp_col].values
-        changes = entries[fc_col].values
-        mfes = entries[mfe_col].values
-        maes = entries[mae_col].values
-        tickers = entries['Ticker'].values if is_multi_ticker else None
-
-        trades = []
-        for i in range(len(entries)):
-            fc = changes[i]
-            trade_dict = {
-                'entry_date': entry_dates_str[i],
-                'exit_date': exit_dates_str[i],
-                'entry_price': safe_float(entry_prices[i], 2),
-                'exit_price': safe_float(exit_prices[i], 2),
-                'change': safe_float(float(fc) if pd.notna(fc) else 0.0, 4),
-                'mfe': safe_float(mfes[i], 4),
-                'mae': safe_float(maes[i], 4),
-                'bars_held': int(bars_held_arr[i]),
-                'regime_pass': bool(regime_mask[i]),
-            }
-            if is_multi_ticker:
-                trade_dict['ticker'] = str(tickers[i])
-            trades.append(trade_dict)
+        trade_dict = {
+            'entry_date': entry_date.strftime('%Y-%m-%d'),
+            'exit_date': exit_dt.strftime('%Y-%m-%d'),
+            'entry_price': safe_float(entry_price, 2),
+            'exit_price': safe_float(exit_price, 2),
+            'change': safe_float(trade_return, 4),
+            'mfe': safe_float(mfe, 4),
+            'mae': safe_float(mae, 4),
+            'bars_held': bars_held,
+            'regime_pass': regime_pass,
+        }
+        if is_multi_ticker:
+            trade_dict['ticker'] = row.get('Ticker', '')
+        trades.append(trade_dict)
 
     # 6b. Compute trade paths (daily cumulative return from entry to exit)
     trade_paths = []
@@ -2162,46 +2425,40 @@ def run_backtest(req: BacktestRequest):
         ticker_closes = {}
         for tkr, grp in df.groupby('Ticker'):
             ticker_closes[tkr] = grp.set_index('Date')['Close'].sort_index()
-        if not req.benchmarks_only:
-            for t in trades:
-                ep = t['entry_price']
-                tkr = t.get('ticker', '')
-                if ep is None or ep == 0 or tkr not in ticker_closes:
-                    trade_paths.append([])
-                    continue
-                ed = pd.Timestamp(t['entry_date'])
-                xd = pd.Timestamp(t['exit_date'])
-                cs = ticker_closes[tkr]
-                segment = cs[(cs.index >= ed) & (cs.index <= xd)]
-                path = [round(float(c) / ep - 1, 6) for c in segment.values]
-                trade_paths.append(path)
+        for t in trades:
+            ep = t['entry_price']
+            tkr = t.get('ticker', '')
+            if ep is None or ep == 0 or tkr not in ticker_closes:
+                trade_paths.append([])
+                continue
+            ed = pd.Timestamp(t['entry_date'])
+            xd = pd.Timestamp(t['exit_date'])
+            cs = ticker_closes[tkr]
+            segment = cs[(cs.index >= ed) & (cs.index <= xd)]
+            path = [round(float(c) / ep - 1, 6) for c in segment.values]
+            trade_paths.append(path)
     else:
         closes = df.set_index('Date')['Close'].sort_index()
-        if not req.benchmarks_only:
-            for t in trades:
-                ep = t['entry_price']
-                if ep is None or ep == 0:
-                    trade_paths.append([])
-                    continue
-                ed = pd.Timestamp(t['entry_date'])
-                xd = pd.Timestamp(t['exit_date'])
-                mask = (closes.index >= ed) & (closes.index <= xd)
-                segment = closes[mask]
-                path = [round(float(c) / ep - 1, 6) for c in segment.values]
-                trade_paths.append(path)
+        for t in trades:
+            ep = t['entry_price']
+            if ep is None or ep == 0:
+                trade_paths.append([])
+                continue
+            ed = pd.Timestamp(t['entry_date'])
+            xd = pd.Timestamp(t['exit_date'])
+            mask = (closes.index >= ed) & (closes.index <= xd)
+            segment = closes[mask]
+            path = [round(float(c) / ep - 1, 6) for c in segment.values]
+            trade_paths.append(path)
 
     # Ensure ticker_closes is available for both modes
     if not is_multi_ticker:
         ticker_closes = {'': closes}
 
     # 7. Build daily mark-to-market equity curves with position sizing
-    if req.benchmarks_only:
-        sorted_trades = sorted(trades, key=lambda t: t['exit_date'])
-        sorted_paths = []
-    else:
-        paired = sorted(zip(trades, trade_paths), key=lambda p: p[0]['exit_date'])
-        sorted_trades = [p[0] for p in paired]
-        sorted_paths = [p[1] for p in paired]
+    paired = sorted(zip(trades, trade_paths), key=lambda p: p[0]['exit_date'])
+    sorted_trades = [p[0] for p in paired]
+    sorted_paths = [p[1] for p in paired]
     initial = req.initial_equity
     pos_size = req.position_size
     max_lev = req.max_leverage
@@ -2241,162 +2498,63 @@ def run_backtest(req: BacktestRequest):
                 total += info['alloc'] * (2 - cp / ep)
         return total
 
+    cash_all = initial
+    cash_filt = initial
+    open_all = {}   # trade_index -> {alloc, entry_price, ticker}
+    open_filt = {}
     eq_dates = []
     eq_all_vals = []
     eq_filt_vals = []
     blew_up = None
-    skipped_entries = []
-    daily_positions = {}
 
-    if req.benchmarks_only:
-        # ── Fast path: single equity track, no filtered, no MTM on idle days ──
-        cash = initial
-        open_pos = {}
-        # Only iterate days that have entries or exits (+ first/last for curve endpoints)
-        active_dates = set()
-        for d_list in entry_map.values():
-            active_dates.update(d_list)
-        for d_list in exit_map.values():
-            active_dates.update(d_list)
-        for date in all_dates:
-            for idx in exit_map.get(date, []):
-                t = trade_map[idx]
-                ret = t['change'] or 0.0
-                if idx in open_pos:
-                    a = open_pos.pop(idx)
-                    cash += a['alloc'] * (1 + ret)
-            for idx in entry_map.get(date, []):
-                t = trade_map[idx]
-                eq_est = mtm_equity(open_pos, cash, date)
-                if eq_est <= 0:
-                    continue
-                wanted = eq_est * pos_size
-                exposure = sum(info['alloc'] for info in open_pos.values())
-                room = max(0, eq_est * max_lev - exposure)
-                alloc = min(wanted, room)
-                if alloc > 0:
-                    open_pos[idx] = {'alloc': alloc, 'entry_price': t['entry_price'] or 0,
-                                     'ticker': t.get('ticker', '')}
-                    cash -= alloc
-            equity = mtm_equity(open_pos, cash, date)
-            eq_dates.append(pd.Timestamp(date).strftime('%Y-%m-%d'))
-            eq_all_vals.append(round(equity, 2))
-        eq_filt_vals = eq_all_vals
-    else:
-        # ── Full path: both filtered + unfiltered tracks, position snapshots ──
-        cash_all = initial
-        cash_filt = initial
-        open_all = {}   # trade_index -> {alloc, entry_price, ticker}
-        open_filt = {}
+    for date in all_dates:
+        # Process exits first (frees capital before new entries)
+        for idx in exit_map.get(date, []):
+            t = trade_map[idx]
+            ret = t['change'] or 0.0
+            if idx in open_all:
+                a = open_all.pop(idx)
+                cash_all += a['alloc'] * (1 + ret)
+            if idx in open_filt:
+                a = open_filt.pop(idx)
+                cash_filt += a['alloc'] * (1 + ret)
 
-        for date in all_dates:
-            # Process exits first (frees capital before new entries)
-            for idx in exit_map.get(date, []):
-                t = trade_map[idx]
-                ret = t['change'] or 0.0
-                if idx in open_all:
-                    a = open_all.pop(idx)
-                    cash_all += a['alloc'] * (1 + ret)
-                if idx in open_filt:
-                    a = open_filt.pop(idx)
-                    cash_filt += a['alloc'] * (1 + ret)
+        # Process entries (allocate capital)
+        for idx in entry_map.get(date, []):
+            t = trade_map[idx]
+            eq_est = mtm_equity(open_all, cash_all, date)
+            if eq_est <= 0:
+                continue
+            wanted = eq_est * pos_size
+            exposure = sum(info['alloc'] for info in open_all.values())
+            room = max(0, eq_est * max_lev - exposure)
+            alloc = min(wanted, room)
+            if alloc > 0:
+                open_all[idx] = {'alloc': alloc, 'entry_price': t['entry_price'] or 0,
+                                  'ticker': t.get('ticker', '')}
+                cash_all -= alloc
+            if t['regime_pass']:
+                eq_est_f = mtm_equity(open_filt, cash_filt, date)
+                if eq_est_f > 0:
+                    wanted_f = eq_est_f * pos_size
+                    exposure_f = sum(info['alloc'] for info in open_filt.values())
+                    room_f = max(0, eq_est_f * max_lev - exposure_f)
+                    alloc_f = min(wanted_f, room_f)
+                    if alloc_f > 0:
+                        open_filt[idx] = {'alloc': alloc_f, 'entry_price': t['entry_price'] or 0,
+                                           'ticker': t.get('ticker', '')}
+                        cash_filt -= alloc_f
 
-            # Process entries (allocate capital)
-            for idx in entry_map.get(date, []):
-                t = trade_map[idx]
-                eq_est = mtm_equity(open_all, cash_all, date)
-                if eq_est <= 0:
-                    continue
-                wanted = eq_est * pos_size
-                exposure = sum(info['alloc'] for info in open_all.values())
-                room = max(0, eq_est * max_lev - exposure)
-                alloc = min(wanted, room)
-                if alloc > 0:
-                    open_all[idx] = {'alloc': alloc, 'entry_price': t['entry_price'] or 0,
-                                      'ticker': t.get('ticker', '')}
-                    cash_all -= alloc
-                if t['regime_pass']:
-                    eq_est_f = mtm_equity(open_filt, cash_filt, date)
-                    if eq_est_f > 0:
-                        wanted_f = eq_est_f * pos_size
-                        exposure_f = sum(info['alloc'] for info in open_filt.values())
-                        room_f = max(0, eq_est_f * max_lev - exposure_f)
-                        alloc_f = min(wanted_f, room_f)
-                        if alloc_f > 0:
-                            open_filt[idx] = {'alloc': alloc_f, 'entry_price': t['entry_price'] or 0,
-                                               'ticker': t.get('ticker', ''),
-                                               'prev_close': t['entry_price'] or 0}
-                            cash_filt -= alloc_f
-                        else:
-                            skipped_entries.append({
-                                'ticker': t.get('ticker', ''),
-                                'entry_date': str(date.date()),
-                                'entry_price': round(t['entry_price'] or 0, 2),
-                                'reason': 'leverage_limit',
-                                'exposure_at_skip': round(exposure_f, 2),
-                                'equity_at_skip': round(eq_est_f, 2),
-                            })
-                            sorted_trades[idx]['skipped'] = True
-                            sorted_trades[idx]['change'] = None
-                            sorted_trades[idx]['mfe'] = None
-                            sorted_trades[idx]['mae'] = None
-                            sorted_trades[idx]['bars_held'] = 0
-
-            # Record daily mark-to-market equity
-            equity_all = mtm_equity(open_all, cash_all, date)
-            equity_filt = mtm_equity(open_filt, cash_filt, date)
-            eq_dates.append(pd.Timestamp(date).strftime('%Y-%m-%d'))
-            eq_all_vals.append(round(equity_all, 2))
-            eq_filt_vals.append(round(equity_filt, 2))
-
-            # Build daily position snapshot for constituents overlay
-            if req.include_positions and open_filt:
-                date_idx = len(eq_dates) - 1
-                positions = []
-                for pidx, info in open_filt.items():
-                    tkr = info.get('ticker', '')
-                    ep = info['entry_price']
-                    cs_series = ticker_closes.get(tkr)
-                    if cs_series is None or ep == 0:
-                        continue
-                    cv = cs_series.asof(date)
-                    if pd.isna(cv):
-                        continue
-                    today_close = float(cv)
-                    prev_cl = info.get('prev_close', ep)
-                    if prev_cl == 0:
-                        prev_cl = ep
-                    price_ret = (today_close / prev_cl - 1) if prev_cl != 0 else 0.0
-                    daily_ret = -price_ret if not is_long else price_ret
-                    # Mark-to-market position value (not original allocation)
-                    if is_long:
-                        mtm_val = info['alloc'] * (today_close / ep)
-                    else:
-                        mtm_val = info['alloc'] * (2 - today_close / ep)
-                    w = mtm_val / equity_filt if equity_filt > 0 else 0.0
-                    contrib = w * daily_ret
-                    positions.append({
-                        'trade_idx': pidx,
-                        'ticker': tkr or None,
-                        'entry_date': trade_map[pidx]['entry_date'],
-                        'alloc': round(mtm_val, 2),
-                        'weight': round(w, 4),
-                        'daily_return': round(daily_ret, 6),
-                        'contribution': round(contrib, 6),
-                    })
-                    info['prev_close'] = today_close
-                if positions:
-                    exp_total = sum(p['alloc'] for p in positions)
-                    daily_positions[date_idx] = {
-                        'exposure_pct': round(exp_total / equity_filt, 4) if equity_filt > 0 else 0,
-                        'equity': round(equity_filt, 2),
-                        'positions': positions,
-                    }
-
-            if equity_all <= 0 and blew_up is None:
-                blew_up = {"date": eq_dates[-1], "trade_index": -1, "equity": "unfiltered"}
-            if equity_filt <= 0 and blew_up is None:
-                blew_up = {"date": eq_dates[-1], "trade_index": -1, "equity": "filtered"}
+        # Record daily mark-to-market equity
+        equity_all = mtm_equity(open_all, cash_all, date)
+        equity_filt = mtm_equity(open_filt, cash_filt, date)
+        eq_dates.append(pd.Timestamp(date).strftime('%Y-%m-%d'))
+        eq_all_vals.append(round(equity_all, 2))
+        eq_filt_vals.append(round(equity_filt, 2))
+        if equity_all <= 0 and blew_up is None:
+            blew_up = {"date": eq_dates[-1], "trade_index": -1, "equity": "unfiltered"}
+        if equity_filt <= 0 and blew_up is None:
+            blew_up = {"date": eq_dates[-1], "trade_index": -1, "equity": "filtered"}
 
     # Build buy-and-hold curve (aligned to equity curve dates)
     if is_multi_ticker:
@@ -2418,19 +2576,17 @@ def run_backtest(req: BacktestRequest):
     bh_vals = []
     if not bh_series.empty:
         first_bh = float(bh_series.iloc[0])
-        if first_bh > 0:
-            date_idx = pd.DatetimeIndex(all_dates)
-            bh_reindexed = bh_series.reindex(date_idx, method='ffill')
-            bh_vals = np.round(initial * bh_reindexed.values / first_bh, 2)
-            bh_vals = np.where(np.isnan(bh_vals), round(initial, 2), bh_vals).tolist()
-        else:
-            bh_vals = [round(initial, 2)] * len(all_dates)
+        for d in all_dates:
+            v = bh_series.asof(pd.Timestamp(d))
+            if pd.notna(v) and first_bh > 0:
+                bh_vals.append(round(initial * float(v) / first_bh, 2))
+            else:
+                bh_vals.append(round(initial, 2))
     else:
         bh_vals = [round(initial, 2)] * len(all_dates)
 
     # 8. Compute stats
     def compute_stats(trade_list, equity_vals):
-        trade_list = [t for t in trade_list if not t.get('skipped')]
         if not trade_list:
             return {'trades': 0, 'win_rate': 0, 'avg_winner': 0, 'avg_loser': 0,
                     'ev': 0, 'profit_factor': 0, 'max_dd': 0, 'avg_bars': 0}
@@ -2470,24 +2626,13 @@ def run_backtest(req: BacktestRequest):
     stats_filtered = compute_stats(filtered_trades, eq_filt_vals)
     stats_unfiltered = compute_stats(trades, eq_all_vals)
 
-    if req.benchmarks_only:
-        resp = {
-            "trades": [],
-            "trade_paths": [],
-            "equity_curve": {"dates": eq_dates, "filtered": eq_all_vals, "unfiltered": eq_all_vals, "buy_hold": bh_vals},
-            "stats": {"filtered": stats_unfiltered, "unfiltered": stats_unfiltered},
-            "date_range": date_range,
-        }
-    else:
-        resp = {
-            "trades": sorted_trades,
-            "trade_paths": sorted_paths,
-            "equity_curve": {"dates": eq_dates, "filtered": eq_filt_vals, "unfiltered": eq_all_vals, "buy_hold": bh_vals},
-            "stats": {"filtered": stats_filtered, "unfiltered": stats_unfiltered},
-            "date_range": date_range,
-            "daily_positions": daily_positions if daily_positions else None,
-            "skipped_entries": skipped_entries if skipped_entries else None,
-        }
+    resp = {
+        "trades": sorted_trades,
+        "trade_paths": sorted_paths,
+        "equity_curve": {"dates": eq_dates, "filtered": eq_filt_vals, "unfiltered": eq_all_vals, "buy_hold": bh_vals},
+        "stats": {"filtered": stats_filtered, "unfiltered": stats_unfiltered},
+        "date_range": date_range,
+    }
     if blew_up:
         resp["blew_up"] = blew_up
     return resp
@@ -2495,242 +2640,12 @@ def run_backtest(req: BacktestRequest):
 
 @app.post("/api/backtest/multi")
 def run_multi_backtest(req: MultiBacktestRequest):
-    """Run a combined multi-leg backtest with shared leverage and per-leg capital."""
-    # ── Validate allocations ──
-    total_alloc = sum(leg.allocation_pct for leg in req.legs)
-    if abs(total_alloc - 1.0) > 0.01:
-        raise HTTPException(status_code=400,
-                            detail=f"Leg allocations must sum to 1.0, got {total_alloc:.4f}")
-    if len(req.legs) < 2:
-        raise HTTPException(status_code=400, detail="Multi-backtest requires at least 2 legs")
-
+    """Run a multi-leg backtest and return combined equity curves + per-leg stats."""
     initial = req.initial_equity
     max_lev = req.max_leverage
-    n_legs = len(req.legs)
-    leg_pos_size = [leg.position_size for leg in req.legs]
 
-    # ── Build trades for each leg ──
-    leg_results = []
-    for leg in req.legs:
-        result = _build_leg_data(
-            leg.target, leg.target_type, leg.entry_signal, leg.filters,
-            req.start_date, req.end_date, compute_paths=True)
-        leg_results.append(result)
-
-    # Handle legs with no data
-    empty_resp = {
-        'trades': [], 'trade_paths': [], 'ticker_closes': {},
-        'all_dates': [], 'direction': 'long', 'is_long': True,
-        'is_multi_ticker': False, 'quarter_membership': None,
-        'df': pd.DataFrame(), 'date_range': {'min': '', 'max': ''},
-        'failed_sources': set(),
-    }
-    leg_results = [r if r is not None else empty_resp for r in leg_results]
-
-    # ── Sort trades per leg by exit_date, tag with leg metadata ──
-    per_leg_trades = []
-    per_leg_paths = []
-    for i, lr in enumerate(leg_results):
-        paired = sorted(zip(lr['trades'], lr['trade_paths']),
-                        key=lambda p: p[0]['exit_date'])
-        trades_sorted = [p[0] for p in paired]
-        paths_sorted = [p[1] for p in paired]
-        # Tag each trade with leg info
-        for t in trades_sorted:
-            t['leg_index'] = i
-            t['leg_target'] = req.legs[i].target
-            t['leg_signal'] = req.legs[i].entry_signal
-        per_leg_trades.append(trades_sorted)
-        per_leg_paths.append(paths_sorted)
-
-    # ── Merge into combined timeline ──
-    # Flatten all trades into one list with global indices
-    all_trades = []
-    all_paths = []
-    for i in range(n_legs):
-        all_trades.extend(per_leg_trades[i])
-        all_paths.extend(per_leg_paths[i])
-
-    # Build combined entry/exit maps
-    entry_map = {}
-    exit_map = {}
-    trade_map = {idx: t for idx, t in enumerate(all_trades)}
-    for idx, t in enumerate(all_trades):
-        ed = pd.Timestamp(t['entry_date'])
-        xd = pd.Timestamp(t['exit_date'])
-        entry_map.setdefault(ed, []).append(idx)
-        exit_map.setdefault(xd, []).append(idx)
-
-    # Merge all unique dates across legs
-    all_dates_set = set()
-    for lr in leg_results:
-        all_dates_set.update(lr['all_dates'])
-    all_dates = sorted(all_dates_set)
-
-    # Merge ticker_closes across legs (same ticker = same prices)
-    combined_closes = {}
-    for lr in leg_results:
-        for tkr, series in lr['ticker_closes'].items():
-            if tkr not in combined_closes or len(series) > len(combined_closes[tkr]):
-                combined_closes[tkr] = series
-
-    # Direction per leg
-    leg_is_long = [lr['is_long'] for lr in leg_results]
-
-    # ── MTM helpers ──
-    def mtm_leg(leg_idx, positions, cash, close_date):
-        """Mark-to-market equity for one leg."""
-        total = cash
-        is_long = leg_is_long[leg_idx]
-        for info in positions.values():
-            tkr = info.get('ticker', '')
-            ep = info['entry_price']
-            cs = combined_closes.get(tkr)
-            if cs is None or ep == 0:
-                total += info['alloc']
-                continue
-            cv = cs.asof(close_date)
-            if pd.isna(cv):
-                total += info['alloc']
-                continue
-            cp = float(cv)
-            if is_long:
-                total += info['alloc'] * (cp / ep)
-            else:
-                total += info['alloc'] * (2 - cp / ep)
-        return total
-
-    # ── Per-leg state ──
-    leg_cash = {i: initial * req.legs[i].allocation_pct for i in range(n_legs)}
-    leg_open = {i: {} for i in range(n_legs)}  # leg -> {global_trade_idx -> info}
-
-    eq_dates = []
-    eq_combined = []
-    eq_per_leg = {i: [] for i in range(n_legs)}
-    skipped_entries = []
-    daily_positions = {}
-
-    # ── Walk every date ──
-    for date in all_dates:
-        # ── Exits first (frees capital) ──
-        for idx in exit_map.get(date, []):
-            t = trade_map[idx]
-            leg_idx = t['leg_index']
-            ret = t['change'] or 0.0
-            if idx in leg_open[leg_idx]:
-                a = leg_open[leg_idx].pop(idx)
-                leg_cash[leg_idx] += a['alloc'] * (1 + ret)
-
-        # ── Entries (allocate capital from leg's pool, shared leverage) ──
-        for idx in entry_map.get(date, []):
-            t = trade_map[idx]
-            leg_idx = t['leg_index']
-            is_long = leg_is_long[leg_idx]
-
-            if not t.get('regime_pass', True):
-                continue
-
-            leg_eq = mtm_leg(leg_idx, leg_open[leg_idx], leg_cash[leg_idx], date)
-            if leg_eq <= 0:
-                continue
-
-            wanted = leg_eq * leg_pos_size[leg_idx]
-
-            # Combined leverage check across ALL legs
-            total_eq = sum(
-                mtm_leg(i, leg_open[i], leg_cash[i], date)
-                for i in range(n_legs))
-            total_exposure = sum(
-                info['alloc']
-                for positions in leg_open.values()
-                for info in positions.values())
-            room = max(0, total_eq * max_lev - total_exposure)
-            alloc = min(wanted, room)
-
-            if alloc > 0:
-                leg_open[leg_idx][idx] = {
-                    'alloc': alloc,
-                    'entry_price': t['entry_price'] or 0,
-                    'ticker': t.get('ticker', ''),
-                }
-                leg_cash[leg_idx] -= alloc
-            else:
-                skipped_entries.append({
-                    'ticker': t.get('ticker', ''),
-                    'entry_date': str(pd.Timestamp(t['entry_date']).date()),
-                    'entry_price': round(t['entry_price'] or 0, 2),
-                    'reason': 'leverage_limit',
-                    'leg_index': leg_idx,
-                    'leg_target': t.get('leg_target', ''),
-                    'exposure_at_skip': round(total_exposure, 2),
-                    'equity_at_skip': round(total_eq, 2),
-                })
-                all_trades[idx]['skipped'] = True
-                all_trades[idx]['change'] = None
-                all_trades[idx]['mfe'] = None
-                all_trades[idx]['mae'] = None
-                all_trades[idx]['bars_held'] = 0
-
-        # ── Record daily equity + position snapshots ──
-        combined = 0.0
-        for i in range(n_legs):
-            leq = mtm_leg(i, leg_open[i], leg_cash[i], date)
-            eq_per_leg[i].append(round(leq, 2))
-            combined += leq
-        date_str = pd.Timestamp(date).strftime('%Y-%m-%d')
-        eq_dates.append(date_str)
-        eq_combined.append(round(combined, 2))
-
-        # Build daily position snapshot across all legs
-        any_open = any(leg_open[i] for i in range(n_legs))
-        if any_open and combined > 0:
-            date_idx = len(eq_dates) - 1
-            positions = []
-            for li in range(n_legs):
-                is_long_leg = leg_is_long[li]
-                for tidx, info in leg_open[li].items():
-                    tkr = info.get('ticker', '')
-                    ep = info['entry_price']
-                    cs_s = combined_closes.get(tkr)
-                    if cs_s is None or ep == 0:
-                        continue
-                    cv = cs_s.asof(date)
-                    if pd.isna(cv):
-                        continue
-                    today_close = float(cv)
-                    prev_cl = info.get('prev_close', ep)
-                    if prev_cl == 0:
-                        prev_cl = ep
-                    price_ret = (today_close / prev_cl - 1) if prev_cl != 0 else 0.0
-                    daily_ret = -price_ret if not is_long_leg else price_ret
-                    if is_long_leg:
-                        mtm_val = info['alloc'] * (today_close / ep)
-                    else:
-                        mtm_val = info['alloc'] * (2 - today_close / ep)
-                    w = mtm_val / combined if combined > 0 else 0.0
-                    contrib = w * daily_ret
-                    positions.append({
-                        'trade_idx': tidx,
-                        'ticker': tkr or None,
-                        'entry_date': trade_map[tidx]['entry_date'],
-                        'leg_target': req.legs[li].target,
-                        'alloc': round(mtm_val, 2),
-                        'weight': round(w, 4),
-                        'daily_return': round(daily_ret, 6),
-                        'contribution': round(contrib, 6),
-                    })
-                    info['prev_close'] = today_close
-            if positions:
-                exp_total = sum(p['alloc'] for p in positions)
-                daily_positions[date_idx] = {
-                    'exposure_pct': round(exp_total / combined, 4) if combined > 0 else 0,
-                    'equity': round(combined, 2),
-                    'positions': positions,
-                }
-
-    # ── Per-leg stats ──
-    def compute_stats_local(trade_list, equity_vals):
-        trade_list = [t for t in trade_list if not t.get('skipped')]
+    # ---- helpers (same compute_stats logic as single endpoint) ----
+    def compute_stats(trade_list, equity_vals):
         if not trade_list:
             return {'trades': 0, 'win_rate': 0, 'avg_winner': 0, 'avg_loser': 0,
                     'ev': 0, 'profit_factor': 0, 'max_dd': 0, 'avg_bars': 0}
@@ -2765,14 +2680,215 @@ def run_multi_backtest(req: MultiBacktestRequest):
             'avg_bars': round(avg_bars, 1),
         }
 
-    # ── Build buy-and-hold with quarterly rebalancing ──
-    # Load per-leg daily return series from basket Close data
-    leg_bh_returns = {}  # leg_index -> pd.Series of daily returns, indexed by Timestamp
-    for i, lr in enumerate(leg_results):
-        is_mt = lr['is_multi_ticker']
-        leg_df = lr['df']
-        if is_mt:
-            basket_file_bh = _find_basket_parquet(req.legs[i].target)
+    # ---- build trades for each leg ----
+    leg_results = []   # list of dicts per leg
+    all_leg_dates = set()
+    global_date_min = None
+    global_date_max = None
+
+    for leg in req.legs:
+        trades, df, ticker_closes, direction = _build_leg_trades(
+            leg.target, leg.target_type, leg.entry_signal,
+            leg.filters, req.start_date, req.end_date,
+        )
+        if not df.empty:
+            dates_in_leg = sorted(df['Date'].unique())
+            all_leg_dates.update(dates_in_leg)
+            leg_min = df['Date'].min()
+            leg_max = df['Date'].max()
+            if global_date_min is None or leg_min < global_date_min:
+                global_date_min = leg_min
+            if global_date_max is None or leg_max > global_date_max:
+                global_date_max = leg_max
+        else:
+            dates_in_leg = []
+
+        leg_results.append({
+            'leg': leg,
+            'trades': trades,
+            'df': df,
+            'ticker_closes': ticker_closes,
+            'direction': direction,
+            'dates': dates_in_leg,
+        })
+
+    # Unified date axis across all legs
+    all_dates = sorted(all_leg_dates)
+    if not all_dates:
+        return {
+            "legs": [],
+            "combined": {
+                "equity_curve": {"dates": [], "combined": [], "per_leg": [], "buy_hold": []},
+                "stats": {},
+            },
+            "date_range": {"min": "", "max": ""},
+        }
+
+    date_range = {
+        "min": global_date_min.strftime('%Y-%m-%d') if global_date_min else "",
+        "max": global_date_max.strftime('%Y-%m-%d') if global_date_max else "",
+    }
+
+    # ---- per-leg equity curves (allocated capital, mark-to-market) ----
+    per_leg_equity = []      # list of lists (one per leg)
+    per_leg_stats = []
+    leg_responses = []       # final leg response dicts
+    skipped_entries = []
+    daily_positions = {}     # date_str -> list of position info
+
+    for li, lr in enumerate(leg_results):
+        leg = lr['leg']
+        trades = lr['trades']
+        direction = lr['direction']
+        ticker_closes = lr['ticker_closes']
+        is_long = direction == 'long'
+        alloc_frac = leg.allocation_pct
+        pos_size = leg.position_size
+        leg_initial = initial * alloc_frac
+
+        # Sort trades by entry date
+        sorted_trades = sorted(trades, key=lambda t: t['entry_date'])
+
+        # Build entry/exit maps
+        entry_map = {}
+        exit_map = {}
+        trade_map = {i: t for i, t in enumerate(sorted_trades)}
+        for i, t in enumerate(sorted_trades):
+            ed = pd.Timestamp(t['entry_date'])
+            xd = pd.Timestamp(t['exit_date'])
+            entry_map.setdefault(ed, []).append(i)
+            exit_map.setdefault(xd, []).append(i)
+
+        def mtm_equity(open_pos, cash, close_date):
+            total = cash
+            for info in open_pos.values():
+                tkr = info.get('ticker', '')
+                ep = info['entry_price']
+                cs = ticker_closes.get(tkr)
+                if cs is None or ep == 0:
+                    total += info['alloc']
+                    continue
+                cv = cs.asof(close_date)
+                if pd.isna(cv):
+                    total += info['alloc']
+                    continue
+                cp = float(cv)
+                if is_long:
+                    total += info['alloc'] * (cp / ep)
+                else:
+                    total += info['alloc'] * (2 - cp / ep)
+            return total
+
+        cash = leg_initial
+        open_pos = {}
+        eq_vals = []
+
+        for date in all_dates:
+            # Process exits first
+            for idx in exit_map.get(date, []):
+                t = trade_map[idx]
+                ret = t['change'] or 0.0
+                if idx in open_pos:
+                    a = open_pos.pop(idx)
+                    cash += a['alloc'] * (1 + ret)
+
+            # Process entries
+            for idx in entry_map.get(date, []):
+                t = trade_map[idx]
+                if not t['regime_pass']:
+                    continue
+                eq_est = mtm_equity(open_pos, cash, date)
+                if eq_est <= 0:
+                    skipped_entries.append({
+                        'leg': li, 'date': pd.Timestamp(date).strftime('%Y-%m-%d'),
+                        'reason': 'equity_zero',
+                    })
+                    continue
+                wanted = eq_est * pos_size
+                exposure = sum(info['alloc'] for info in open_pos.values())
+                leg_lev_cap = eq_est * max_lev
+                room = max(0, leg_lev_cap - exposure)
+                alloc = min(wanted, room)
+                if alloc > 0:
+                    open_pos[idx] = {
+                        'alloc': alloc,
+                        'entry_price': t['entry_price'] or 0,
+                        'ticker': t.get('ticker', ''),
+                    }
+                    cash -= alloc
+                else:
+                    skipped_entries.append({
+                        'leg': li, 'date': pd.Timestamp(date).strftime('%Y-%m-%d'),
+                        'reason': 'leverage_limit',
+                    })
+
+            # Record daily equity
+            equity = mtm_equity(open_pos, cash, date)
+            eq_vals.append(round(equity, 2))
+
+            # Track daily positions for constituents overlay
+            date_str = pd.Timestamp(date).strftime('%Y-%m-%d')
+            if open_pos:
+                pos_list = daily_positions.setdefault(date_str, [])
+                for idx, info in open_pos.items():
+                    pos_list.append({
+                        'leg': li,
+                        'ticker': info.get('ticker', leg.target),
+                        'alloc': round(info['alloc'], 2),
+                        'direction': direction,
+                    })
+
+        per_leg_equity.append(eq_vals)
+
+        # Per-leg stats (filtered trades only — regime_pass == True)
+        filtered_trades = [t for t in sorted_trades if t['regime_pass']]
+        stats = compute_stats(filtered_trades, eq_vals)
+        per_leg_stats.append(stats)
+
+        leg_responses.append({
+            'target': leg.target,
+            'target_type': leg.target_type,
+            'entry_signal': leg.entry_signal,
+            'allocation_pct': leg.allocation_pct,
+            'direction': direction,
+            'trades': sorted_trades,
+            'stats': stats,
+        })
+
+    # ---- combined equity curve (sum of per-leg curves) ----
+    combined_equity = []
+    for i in range(len(all_dates)):
+        total = sum(per_leg_equity[li][i] for li in range(len(leg_results))
+                    if i < len(per_leg_equity[li]))
+        combined_equity.append(round(total, 2))
+
+    # ---- buy-hold curve from first basket leg (or first leg overall) ----
+    bh_vals = []
+    bh_leg = None
+    for lr in leg_results:
+        if lr['leg'].target_type in ('basket', 'basket_tickers'):
+            bh_leg = lr
+            break
+    if bh_leg is None and leg_results:
+        bh_leg = leg_results[0]
+
+    if bh_leg is not None:
+        is_multi_ticker_bh = bh_leg['leg'].target_type == 'basket_tickers'
+        if is_multi_ticker_bh:
+            basket_file_bh = _find_basket_parquet(bh_leg['leg'].target)
+            if basket_file_bh:
+                bh_raw = pd.read_parquet(basket_file_bh, columns=['Date', 'Close'])
+                bh_raw['Date'] = pd.to_datetime(bh_raw['Date'])
+                bh_raw = bh_raw.sort_values('Date')
+                if req.start_date:
+                    bh_raw = bh_raw[bh_raw['Date'] >= pd.Timestamp(req.start_date)]
+                if req.end_date:
+                    bh_raw = bh_raw[bh_raw['Date'] <= pd.Timestamp(req.end_date)]
+                bh_series = bh_raw.set_index('Date')['Close'].sort_index()
+            else:
+                bh_series = pd.Series(dtype=float)
+        elif bh_leg['leg'].target_type == 'basket':
+            basket_file_bh = _find_basket_parquet(bh_leg['leg'].target)
             if basket_file_bh:
                 bh_raw = pd.read_parquet(basket_file_bh, columns=['Date', 'Close'])
                 bh_raw['Date'] = pd.to_datetime(bh_raw['Date'])
@@ -2785,87 +2901,47 @@ def run_multi_backtest(req: MultiBacktestRequest):
             else:
                 bh_series = pd.Series(dtype=float)
         else:
-            if not leg_df.empty:
-                bh_series = leg_df.drop_duplicates('Date').set_index('Date')['Close'].sort_index()
+            bh_df = bh_leg['df']
+            if not bh_df.empty:
+                bh_series = bh_df.drop_duplicates('Date').set_index('Date')['Close'].sort_index()
             else:
                 bh_series = pd.Series(dtype=float)
+
         if not bh_series.empty:
-            date_idx = pd.DatetimeIndex(all_dates)
-            bh_reindexed = bh_series.reindex(date_idx, method='ffill')
-            leg_bh_returns[i] = bh_reindexed.pct_change().fillna(0.0)
+            first_bh = float(bh_series.iloc[0])
+            for d in all_dates:
+                v = bh_series.asof(pd.Timestamp(d))
+                if pd.notna(v) and first_bh > 0:
+                    bh_vals.append(round(initial * float(v) / first_bh, 2))
+                else:
+                    bh_vals.append(round(initial, 2))
         else:
-            leg_bh_returns[i] = pd.Series(0.0, index=pd.DatetimeIndex(all_dates))
+            bh_vals = [round(initial, 2)] * len(all_dates)
+    else:
+        bh_vals = [round(initial, 2)] * len(all_dates)
 
-    # Walk dates: rebalance to target weights at each quarter start
-    target_wts = [req.legs[i].allocation_pct for i in range(n_legs)]
-    leg_values = [initial * target_wts[i] for i in range(n_legs)]
-    bh_combined = []
-    bh_per_leg = {i: [] for i in range(n_legs)}
-    last_quarter = None
+    # Combined stats
+    all_filtered_trades = []
+    for lr, leg in zip(leg_results, req.legs):
+        all_filtered_trades.extend([t for t in lr['trades'] if t['regime_pass']])
+    combined_stats = compute_stats(all_filtered_trades, combined_equity)
 
-    for d_idx, date in enumerate(all_dates):
-        ts = pd.Timestamp(date)
-        current_quarter = (ts.year, (ts.month - 1) // 3)
-
-        # Rebalance at start of each new quarter (except the very first day)
-        if last_quarter is not None and current_quarter != last_quarter:
-            total_val = sum(leg_values)
-            if total_val > 0:
-                leg_values = [total_val * target_wts[i] for i in range(n_legs)]
-        last_quarter = current_quarter
-
-        # Apply daily returns
-        for i in range(n_legs):
-            ret = float(leg_bh_returns[i].iloc[d_idx]) if d_idx < len(leg_bh_returns[i]) else 0.0
-            leg_values[i] *= (1 + ret)
-
-        for i in range(n_legs):
-            bh_per_leg[i].append(round(leg_values[i], 2))
-        bh_combined.append(round(sum(leg_values), 2))
-
-    # ── Build per-leg response ──
-    legs_resp = []
-    for i in range(n_legs):
-        leg_trades_resp = [t for t in all_trades if t.get('leg_index') == i]
-        # Clean internal fields from trade dicts
-        for t in leg_trades_resp:
-            t.pop('leg_index', None)
-            t.pop('leg_target', None)
-            t.pop('leg_signal', None)
-        leg_stats = compute_stats_local(leg_trades_resp, eq_per_leg[i])
-        legs_resp.append({
-            'target': req.legs[i].target,
-            'target_type': req.legs[i].target_type,
-            'entry_signal': req.legs[i].entry_signal,
-            'allocation_pct': req.legs[i].allocation_pct,
-            'direction': leg_results[i]['direction'],
-            'trades': leg_trades_resp,
-            'stats': leg_stats,
-        })
-
-    combined_stats = compute_stats_local(all_trades, eq_combined)
-
-    # Date range: widest across all legs
-    all_mins = [lr['date_range']['min'] for lr in leg_results if lr['date_range']['min']]
-    all_maxs = [lr['date_range']['max'] for lr in leg_results if lr['date_range']['max']]
+    eq_date_strs = [pd.Timestamp(d).strftime('%Y-%m-%d') for d in all_dates]
 
     return {
-        'legs': legs_resp,
-        'combined': {
-            'equity_curve': {
-                'dates': eq_dates,
-                'combined': eq_combined,
-                'per_leg': [eq_per_leg[i] for i in range(n_legs)],
-                'buy_hold': bh_combined,
+        "legs": leg_responses,
+        "combined": {
+            "equity_curve": {
+                "dates": eq_date_strs,
+                "combined": combined_equity,
+                "per_leg": per_leg_equity,
+                "buy_hold": bh_vals,
             },
-            'stats': combined_stats,
+            "stats": combined_stats,
         },
-        'date_range': {
-            'min': min(all_mins) if all_mins else '',
-            'max': max(all_maxs) if all_maxs else '',
-        },
-        'skipped_entries': skipped_entries if skipped_entries else None,
-        'daily_positions': daily_positions if daily_positions else None,
+        "date_range": date_range,
+        "daily_positions": daily_positions,
+        "skipped_entries": skipped_entries,
     }
 
 
@@ -2934,6 +3010,5 @@ async def websocket_endpoint(websocket: WebSocket, ticker: str):
 
 if __name__ == "__main__":
     import uvicorn
-    # Use string import so uvicorn can spawn workers on Windows (fork not available)
-    uvicorn.run("main:app", host="0.0.0.0", port=8000,
-                workers=min(os.cpu_count() or 4, 7))
+    # Use 0.0.0.0 to allow access from other devices on the network
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -7,7 +7,7 @@ Quantitative finance monorepo: signal generation pipeline + web dashboard.
 ```
 rotations/
 ├── signals/              Signal generation pipeline
-│   ├── rotations.py      Main pipeline (~8000 lines, 15 cells)
+│   ├── rotations.py      Main pipeline (~9000 lines, 15 cells)
 │   ├── rotations_old_outputs.py   Extracted Group B report cells
 │   └── databento_test.py
 ├── app/
@@ -46,6 +46,8 @@ Key shared files:
 - `gics_mappings_500.json` — Sector/industry mappings
 - `live_signals_500.parquet` — Intraday signals (Source='live')
 - `live_basket_signals_500.parquet` — Intraday basket OHLC
+- `returns_matrix_500.parquet` — Pre-computed close-return pivot (Date × Ticker); rebuilt when universe/data changes
+- `returns_matrix_500.fingerprint` — MD5 hash guard for `returns_matrix_500.parquet` freshness
 
 ## Commands
 
@@ -93,6 +95,12 @@ Run these agents in the background:
 2. **integration-tracker** — Incrementally update the cross-repo integration map
 3. **session-logger** — Record what changed and why
 
+### RECOMMENDED: After completing a feature
+Run the feature-dev plugin agents in parallel:
+1. **feature-dev:code-reviewer** — Review new code for bugs, security issues, and edge cases
+2. **feature-dev:code-architect** — Generate CLAUDE.md and documentation updates
+Then run the mandatory post-edit agents (dependency-mapper, integration-tracker, session-logger).
+
 ## Agent Reference Files
 
 These files are maintained by agents — read them for instant context:
@@ -108,17 +116,54 @@ These files are maintained by agents — read them for instant context:
 - Weights/rankings must use data from the PRIOR period, never same period
 - All cache-affecting changes require version constant bumps
 - `Source` column: 'norgate' (daily rebuild) vs 'live' (intraday Databento)
+- `FORCE_REBUILD_BASKET_SIGNALS` implies a full equity OHLC rebuild — do not set it without expecting `contrib_df` to be regenerated for all baskets
+- Pre-computed `returns_matrix` / `ohlc_ret_matrices` must be rebuilt whenever `all_signals_df` changes (shape, max date, or ticker set). The `.fingerprint` file guards this automatically
 
 ## File Navigation
 
-- `signals/rotations.py` is ~8000 lines. Check `.claude/dependency-tree.md` for cell map and line ranges FIRST. ALWAYS read the specific function before editing — never edit based on memory.
+- `signals/rotations.py` is ~9000 lines. Check `.claude/dependency-tree.md` for cell map and line ranges FIRST. ALWAYS read the specific function before editing — never edit based on memory.
 - When a function is modified, check both batch path (`signals/rotations.py`) AND live path (`app/backend/signals_engine.py` / `app/backend/main.py`) for parallel implementations.
 
 ## Performance Baselines
 
-Baseline targets:
-- correlation: <18s thematic, <16s sector, <8s industry
-- breadth: <8s thematic, <8s sector, <7s industry
-- TOTAL: <31s thematic, <24s sector, <14s industry
+### Per-Basket Step Targets (median across 27 baskets, post-optimization)
 
-Any change exceeding baseline by >20% per step or >10% total = REGRESSION.
+| Step | Target |
+|---|---|
+| `equity_ohlc` | <12s |
+| `breadth_trend` + `breadth_breakout` combined | <8s |
+| `correlation` | <2s |
+| `contributions` | <0.5s |
+| **Per-basket total (full rebuild)** | **<20s** |
+
+### Full 27-Basket Rebuild Targets
+
+| Run type | Target |
+|---|---|
+| Full rebuild (all baskets, no cache) | <10 min |
+| Incremental (cache valid, appending days) | <2 min |
+
+Any change exceeding a per-step baseline by >20% or the full-rebuild total by >10% = REGRESSION.
+
+### Optimization Baseline (2026-03-17)
+
+Reference run: 27 baskets, full rebuild, `FORCE_REBUILD_BASKET_SIGNALS=True`.
+
+| Step | Measured median |
+|---|---|
+| `equity_ohlc` | ~9.5s |
+| `breadth_trend` + `breadth_breakout` combined | ~5.6s |
+| `correlation` | ~1.2s |
+| `contributions` | ~0.1s |
+| **Total wall time** | **~467s (~7.8 min)** |
+
+Previous baseline before vectorization: ~30 min.
+
+### What drives these numbers
+
+- `returns_matrix_500.parquet` is built **once before the basket loop** (Date x Ticker pivot for close returns + separate Open/High/Low return pivots). All 27 baskets read the same in-memory matrices.
+- `compute_equity_ohlc` takes the **fast vectorized path** when `returns_matrix` and `ohlc_ret_matrices` are both provided. Uses `cumprod`-based weight drift per quarter and produces `contrib_df` as a byproduct.
+- `_compute_within_basket_correlation` uses **numpy z-score variance decomposition** — O(n*w) per date instead of O(n^2*w) pandas `.corr()` loop.
+- Breadth functions use **`_vectorized_quarter_filter`** (searchsorted + merge) followed by a single `groupby`.
+- `_build_quarter_weights` is a **shared helper** called once per basket.
+- `FORCE_REBUILD_BASKET_SIGNALS=True` also forces equity OHLC rebuild so `contrib_df` is always captured.

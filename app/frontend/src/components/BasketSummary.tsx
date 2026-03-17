@@ -37,6 +37,12 @@ interface CumulativeReturnsData {
   series: { ticker: string; values: (number | null)[]; join_date?: string | null }[]
 }
 
+interface BasketsData {
+  Themes: string[]
+  Sectors: string[]
+  Industries: string[]
+}
+
 interface BasketSummaryProps {
   data: {
     open_signals: OpenSignal[]
@@ -48,10 +54,14 @@ interface BasketSummaryProps {
   basketName: string
   apiBase: string
   quarterDateRange?: { from: string; to: string } | null
+  exportTrigger?: number
+  analysisMode?: 'intra' | 'cross'
+  allBaskets?: BasketsData
+  onBasketSelect?: (basket: string) => void
 }
 
 type SortKey = keyof OpenSignal
-type TabType = 'breakout' | 'rotation' | 'btfd' | 'breakout_closed' | 'rotation_closed' | 'btfd_closed' | 'correlation' | 'returns' | 'contribution'
+type TabType = 'breakout' | 'rotation' | 'btfd' | 'breakout_closed' | 'rotation_closed' | 'btfd_closed' | 'correlation' | 'returns' | 'contribution' | 'basket_returns'
 
 const SIGNAL_FILTERS: Record<'breakout' | 'rotation' | 'btfd', string[]> = {
   breakout: ['Breakout', 'Breakdown'],
@@ -325,8 +335,6 @@ function ReturnsChart({ data, quarterDateRange }: { data: CumulativeReturnsData;
   const [hoveredTicker, setHoveredTicker] = useState<string | null>(null)
   const [dims, setDims] = useState({ w: 800, h: 400 })
   const [presetMode, setPresetMode] = useState<'Q' | 'Y'>('Q')
-  const [retSortCol, setRetSortCol] = useState<'ticker' | 'date' | 'change'>('change')
-  const [retSortAsc, setRetSortAsc] = useState(false)
 
   // Date range state — default to quarter range if active, else 1Y lookback
   const allDates = data.dates
@@ -431,33 +439,17 @@ function ReturnsChart({ data, quarterDateRange }: { data: CumulativeReturnsData;
   }, [allDates, data.series, startDate, endDate])
 
   // Sort series by latest return value in the windowed range
-  const seriesWithLatest = useMemo(() => {
-    return windowedData.series.map((s, origIndex) => {
+  const sortedSeries = useMemo(() => {
+    const withLatest = windowedData.series.map((s, origIndex) => {
       let lastVal = 0
       for (let i = s.values.length - 1; i >= 0; i--) {
         if (s.values[i] !== null) { lastVal = s.values[i]!; break }
       }
       return { ...s, origIndex, lastVal }
     })
+    withLatest.sort((a, b) => b.lastVal - a.lastVal)
+    return withLatest
   }, [windowedData.series])
-
-  // Color rank always by return (best=blue, worst=pink)
-  const retColorMap = useMemo(() => {
-    const byReturn = [...seriesWithLatest].sort((a, b) => b.lastVal - a.lastVal)
-    return new Map(byReturn.map((s, rank) => [s.ticker, rankColor(rank, byReturn.length)]))
-  }, [seriesWithLatest])
-
-  const sortedSeries = useMemo(() => {
-    const arr = [...seriesWithLatest]
-    arr.sort((a, b) => {
-      let cmp = 0
-      if (retSortCol === 'ticker') cmp = a.ticker.localeCompare(b.ticker)
-      else if (retSortCol === 'date') cmp = (a.join_date ?? '').localeCompare(b.join_date ?? '')
-      else cmp = a.lastVal - b.lastVal
-      return retSortAsc ? cmp : -cmp
-    })
-    return arr
-  }, [seriesWithLatest, retSortCol, retSortAsc])
 
   useEffect(() => {
     const el = containerRef.current
@@ -527,11 +519,12 @@ function ReturnsChart({ data, quarterDateRange }: { data: CumulativeReturnsData;
       ctx.fillText(windowedData.dates[i].slice(0, 7), x, dims.h - pad.bottom + 15)
     }
 
-    // Draw lines — color by return rank (independent of sort order)
-    sortedSeries.forEach((s) => {
+    // Draw lines — blue (best) → grey → pink (worst) by rank
+    const totalSeries = sortedSeries.length
+    sortedSeries.forEach((s, rank) => {
       const isHovered = hoveredTicker === s.ticker
       const isOther = hoveredTicker !== null && !isHovered
-      ctx.strokeStyle = isOther ? '#dee2e6' : (retColorMap.get(s.ticker) ?? '#586e75')
+      ctx.strokeStyle = isOther ? '#dee2e6' : rankColor(rank, totalSeries)
       ctx.lineWidth = isHovered ? 2.5 : 1.2
       ctx.globalAlpha = isOther ? 0.3 : 1
       ctx.beginPath()
@@ -545,7 +538,7 @@ function ReturnsChart({ data, quarterDateRange }: { data: CumulativeReturnsData;
       ctx.stroke()
       ctx.globalAlpha = 1
     })
-  }, [windowedData, dims, hoveredTicker, sortedSeries, retColorMap])
+  }, [windowedData, dims, hoveredTicker, sortedSeries])
 
   return (
     <div className="returns-container">
@@ -580,26 +573,13 @@ function ReturnsChart({ data, quarterDateRange }: { data: CumulativeReturnsData;
         </div>
       </div>
       <div className="returns-legend-right">
-        <div className="path-legend-header">
-          <span className="path-legend-col ticker" onClick={() => { if (retSortCol === 'ticker') setRetSortAsc(v => !v); else { setRetSortCol('ticker'); setRetSortAsc(true) } }}>
-            Ticker{retSortCol === 'ticker' ? (retSortAsc ? ' \u25B2' : ' \u25BC') : ''}
-          </span>
-          <span className="path-legend-col date" onClick={() => { if (retSortCol === 'date') setRetSortAsc(v => !v); else { setRetSortCol('date'); setRetSortAsc(true) } }}>
-            Entry{retSortCol === 'date' ? (retSortAsc ? ' \u25B2' : ' \u25BC') : ''}
-          </span>
-          <span className="path-legend-col change" onClick={() => { if (retSortCol === 'change') setRetSortAsc(v => !v); else { setRetSortCol('change'); setRetSortAsc(false) } }}>
-            Chg{retSortCol === 'change' ? (retSortAsc ? ' \u25B2' : ' \u25BC') : ''}
-          </span>
-        </div>
-        {sortedSeries.map((s) => (
+        {sortedSeries.map((s, rank) => (
           <div key={s.ticker}
-               className={`path-legend-row ${hoveredTicker === s.ticker ? 'highlighted' : ''}`}
-               style={{ color: retColorMap.get(s.ticker) }}
+               className={`returns-legend-item ${hoveredTicker === s.ticker ? 'highlighted' : ''}`}
+               style={{ color: rankColor(rank, sortedSeries.length) }}
                onMouseEnter={() => setHoveredTicker(s.ticker)}
                onMouseLeave={() => setHoveredTicker(null)}>
-            <span className="path-legend-col ticker">{s.ticker}</span>
-            <span className="path-legend-col date">{s.join_date ? s.join_date.slice(2) : ''}</span>
-            <span className="path-legend-col change">{(s.lastVal * 100).toFixed(1)}%</span>
+            {s.ticker} <span className="returns-legend-val">{(s.lastVal * 100).toFixed(1)}%</span>
           </div>
         ))}
       </div>
@@ -1029,11 +1009,838 @@ function ContributionChart({ basketName, apiBase, quarterDateRange }: { basketNa
   )
 }
 
-export function BasketSummary({ data, loading, basketName, apiBase, quarterDateRange }: BasketSummaryProps) {
-  const [tab, setTab] = useState<TabType>('breakout')
+type BasketReturnMode = 'cross' | 'daily' | 'analogs'
 
-  if (loading) return <div className="summary-panel"><div className="summary-loading">Loading basket analysis...</div></div>
-  if (!data) return <div className="summary-panel"><div className="summary-empty">No summary data</div></div>
+interface AnalogItem {
+  start: string
+  end: string
+  similarity: number
+  similarity_breakdown: {
+    returns: number
+    breadth: number
+    breakout: number
+    correlation: number
+    volatility: number
+  }
+  returns: Record<string, number | null>
+  forward: Record<string, Record<string, number | null> | null>
+}
+
+interface AnalogsData {
+  current: {
+    start: string
+    end: string
+    returns: Record<string, number | null>
+    metrics: {
+      uptrend_pct: Record<string, number | null>
+      breakout_pct: Record<string, number | null>
+      correlation_pct: Record<string, number | null>
+      rv_ema: Record<string, number | null>
+    }
+  } | null
+  analogs: AnalogItem[]
+  date_range: { min: string; max: string }
+  message?: string
+}
+type BasketReturnGroup = 'all' | 'themes' | 'sectors' | 'industries'
+
+interface BasketReturnItem {
+  name: string
+  group: string
+  return: number
+}
+
+const BASKET_RETURN_PRESETS = [
+  { label: '1D', days: 1 },
+  { label: '1W', days: 7 },
+  { label: '1M', days: 30 },
+  { label: '3M', days: 90 },
+  { label: '6M', days: 182 },
+  { label: 'YTD', days: -1 },
+  { label: '1Y', days: 365 },
+  { label: '3Y', days: 1095 },
+  { label: '5Y', days: 1825 },
+  { label: 'ALL', days: 0 },
+] as const
+
+function applyPreset(preset: typeof BASKET_RETURN_PRESETS[number], maxDate: string, minDate: string): { start: string; end: string } {
+  const end = maxDate
+  if (preset.days === 0) return { start: minDate, end }
+  if (preset.days === -1) {
+    const yr = maxDate.slice(0, 4)
+    return { start: `${yr}-01-01`, end }
+  }
+  if (preset.days === 1) {
+    // 1D = single most recent day's return (start=end=maxDate, backend anchors to prior close)
+    return { start: maxDate, end: maxDate }
+  }
+  const d = new Date(maxDate)
+  d.setDate(d.getDate() - preset.days)
+  const start = d.toISOString().slice(0, 10)
+  return { start: start < minDate ? minDate : start, end }
+}
+
+function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; exportTrigger?: number }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const containerRef = useRef<HTMLDivElement>(null)
+  const [dims, setDims] = useState({ w: 800, h: 400 })
+  const [mode, setMode] = useState<BasketReturnMode>('cross')
+  const [group, setGroup] = useState<BasketReturnGroup>('all')
+  const [dateBounds, setDateBounds] = useState<{ min: string; max: string }>({ min: '', max: '' })
+  const [startDate, setStartDate] = useState('')
+  const [endDate, setEndDate] = useState('')
+  const [activePreset, setActivePreset] = useState('1Y')
+  const [loading, setLoading] = useState(false)
+  const [hoveredIdx, setHoveredIdx] = useState<number | null>(null)
+
+  // Cross-basket data
+  const [baskets, setBaskets] = useState<BasketReturnItem[]>([])
+  // Daily data
+  const [dailyBasket, setDailyBasket] = useState('')
+  const [dailyDates, setDailyDates] = useState<string[]>([])
+  const [dailyReturns, setDailyReturns] = useState<number[]>([])
+  // Analogs data
+  const [analogsData, setAnalogsData] = useState<AnalogsData | null>(null)
+  // Available baskets for daily mode picker
+  const [availableBaskets, setAvailableBaskets] = useState<string[]>([])
+  // Basket search state
+  const [basketSearch, setBasketSearch] = useState('')
+  const [basketSearchOpen, setBasketSearchOpen] = useState(false)
+  const basketSearchRef = useRef<HTMLInputElement>(null)
+  const [basketSearchHighlight, setBasketSearchHighlight] = useState(0)
+  // Refs for analog mini canvases
+  const analogCanvasRefs = useRef<Map<number, HTMLCanvasElement>>(new Map())
+
+  const filteredBaskets = useMemo(() => {
+    if (!basketSearch.trim()) return availableBaskets
+    const q = basketSearch.toLowerCase()
+    return availableBaskets.filter(b => b.toLowerCase().replace(/_/g, ' ').includes(q) || b.toLowerCase().includes(q))
+  }, [basketSearch, availableBaskets])
+
+  // Fetch date bounds on mount
+  useEffect(() => {
+    if (!apiBase) return
+    axios.get(`${apiBase}/baskets/returns`)
+      .then(res => {
+        const dr = res.data.date_range
+        if (dr) {
+          setDateBounds(dr)
+          const preset = BASKET_RETURN_PRESETS.find(p => p.label === '1Y')!
+          const { start, end } = applyPreset(preset, dr.max, dr.min)
+          setStartDate(start)
+          setEndDate(end)
+        }
+        if (res.data.baskets) {
+          setAvailableBaskets(res.data.baskets.map((b: BasketReturnItem) => b.name).sort())
+        }
+      })
+      .catch(() => {})
+  }, [apiBase])
+
+  // Fetch data when params change
+  useEffect(() => {
+    if (!apiBase || !startDate || !endDate) return
+    setLoading(true)
+    if (mode === 'cross') {
+      const params = new URLSearchParams({ start: startDate, end: endDate, mode: 'period', group })
+      axios.get(`${apiBase}/baskets/returns?${params}`)
+        .then(res => {
+          const sorted = (res.data.baskets || []).sort((a: BasketReturnItem, b: BasketReturnItem) => a.return - b.return)
+          setBaskets(sorted)
+          if (res.data.baskets) {
+            setAvailableBaskets(res.data.baskets.map((b: BasketReturnItem) => b.name).sort())
+          }
+        })
+        .catch(() => setBaskets([]))
+        .finally(() => setLoading(false))
+    } else if (mode === 'analogs') {
+      const params = new URLSearchParams({ start: startDate, end: endDate, mode: 'analogs', group })
+      axios.get(`${apiBase}/baskets/returns?${params}`)
+        .then(res => setAnalogsData(res.data))
+        .catch(() => setAnalogsData(null))
+        .finally(() => setLoading(false))
+    } else {
+      if (!dailyBasket) { setLoading(false); return }
+      const params = new URLSearchParams({ start: startDate, end: endDate, mode: 'daily', basket: dailyBasket })
+      axios.get(`${apiBase}/baskets/returns?${params}`)
+        .then(res => {
+          setDailyDates(res.data.dates || [])
+          setDailyReturns(res.data.returns || [])
+        })
+        .catch(() => { setDailyDates([]); setDailyReturns([]) })
+        .finally(() => setLoading(false))
+    }
+  }, [apiBase, startDate, endDate, mode, group, dailyBasket])
+
+  // ResizeObserver
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const obs = new ResizeObserver(entries => {
+      const { width, height } = entries[0].contentRect
+      if (width > 0 && height > 0) setDims({ w: width, h: height })
+    })
+    obs.observe(el)
+    return () => obs.disconnect()
+  }, [])
+
+  // Export when exportTrigger fires
+  const prevExportTrigger = useRef(exportTrigger || 0)
+  useEffect(() => {
+    if (!exportTrigger || exportTrigger === prevExportTrigger.current) {
+      prevExportTrigger.current = exportTrigger || 0
+      return
+    }
+    prevExportTrigger.current = exportTrigger
+    const canvas = canvasRef.current
+    if (!canvas) return
+    // Build filename: cross_basket_returns_all_3_17_2026 or single_basket_returns_Financials_3_17_2025_3_17_2026
+    const fmtDate = (d: string) => { const p = d.split('-'); return `${parseInt(p[1])}_${parseInt(p[2])}_${p[0]}` }
+    let name: string
+    if (mode === 'cross') {
+      name = startDate === endDate
+        ? `cross_basket_returns_${group}_${fmtDate(endDate)}`
+        : `cross_basket_returns_${group}_${fmtDate(startDate)}_${fmtDate(endDate)}`
+    } else if (mode === 'analogs') {
+      name = `regime_analogs_${group}_${fmtDate(startDate)}_${fmtDate(endDate)}`
+    } else {
+      const bName = dailyBasket || 'unknown'
+      name = startDate === endDate
+        ? `single_basket_returns_${bName}_${fmtDate(endDate)}`
+        : `single_basket_returns_${bName}_${fmtDate(startDate)}_${fmtDate(endDate)}`
+    }
+    canvas.toBlob((blob) => {
+      if (!blob) return
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${name}.png`
+      a.click()
+      URL.revokeObjectURL(url)
+    }, 'image/png')
+  }, [exportTrigger])
+
+  // Canvas rendering
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+
+    const dpr = window.devicePixelRatio || 1
+    canvas.width = dims.w * dpr
+    canvas.height = dims.h * dpr
+    ctx.scale(dpr, dpr)
+    ctx.clearRect(0, 0, dims.w, dims.h)
+    ctx.fillStyle = '#fdf6e3'
+    ctx.fillRect(0, 0, dims.w, dims.h)
+
+    // Helper: draw a sorted bar chart given name→return map
+    const drawBarChart = (
+      _ctx: CanvasRenderingContext2D, _w: number, _h: number,
+      items: { name: string; ret: number }[],
+      _hoveredIdx: number | null,
+      showLabels: boolean
+    ) => {
+      const n = items.length
+      if (n === 0) return
+      const labelFontSize = showLabels ? Math.min(11, Math.max(7, Math.floor((_w - 110) / n * 0.7 * 0.7))) : 8
+      _ctx.font = `${labelFontSize}px monospace`
+      let maxLabelW = 0
+      if (showLabels) {
+        for (let i = 0; i < n; i++) {
+          const w = _ctx.measureText(items[i].name.replace(/_/g, ' ')).width
+          if (w > maxLabelW) maxLabelW = w
+        }
+      }
+      const dynamicBottom = showLabels ? Math.min(Math.ceil(maxLabelW * 0.707) + 16, Math.floor(_h * 0.4)) : 8
+      const pad = { top: showLabels ? 12 : 4, right: showLabels ? 50 : 4, bottom: dynamicBottom, left: showLabels ? 60 : 4 }
+      const plotW = _w - pad.left - pad.right
+      const plotH = _h - pad.top - pad.bottom
+      const barW = Math.max(2, Math.min(40, (plotW / n) * 0.75))
+      const gap = (plotW - barW * n) / (n + 1)
+
+      let yMin = 0, yMax = 0
+      items.forEach(b => { yMin = Math.min(yMin, b.ret); yMax = Math.max(yMax, b.ret) })
+      const yPad = (yMax - yMin) * 0.1 || 0.005
+      yMin -= yPad; yMax += yPad
+
+      const yScale = (v: number) => pad.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH
+      const zeroY = yScale(0)
+
+      if (showLabels) {
+        _ctx.strokeStyle = '#e9ecef'; _ctx.lineWidth = 1
+        const nTicks = 6
+        for (let i = 0; i <= nTicks; i++) {
+          const v = yMin + (yMax - yMin) * (i / nTicks)
+          const y = yScale(v)
+          _ctx.beginPath(); _ctx.moveTo(pad.left, y); _ctx.lineTo(_w - pad.right, y); _ctx.stroke()
+          _ctx.fillStyle = '#6c757d'; _ctx.font = '10px monospace'; _ctx.textAlign = 'right'
+          _ctx.fillText((v * 100).toFixed(2) + '%', pad.left - 5, y + 3)
+        }
+      }
+
+      _ctx.strokeStyle = '#adb5bd'; _ctx.lineWidth = 1; _ctx.setLineDash([4, 4])
+      _ctx.beginPath(); _ctx.moveTo(pad.left, zeroY); _ctx.lineTo(_w - pad.right, zeroY); _ctx.stroke()
+      _ctx.setLineDash([])
+
+      for (let i = 0; i < n; i++) {
+        const x = pad.left + gap + i * (barW + gap)
+        const val = items[i].ret
+        const bTop = val >= 0 ? yScale(val) : zeroY
+        const bBot = val >= 0 ? zeroY : yScale(val)
+        const barHeight = Math.max(1, bBot - bTop)
+        const isHovered = _hoveredIdx === i
+        _ctx.fillStyle = val >= 0
+          ? (isHovered ? 'rgb(30, 30, 220)' : 'rgb(50, 50, 255)')
+          : (isHovered ? 'rgb(220, 30, 120)' : 'rgb(255, 50, 150)')
+        _ctx.fillRect(x, bTop, barW, barHeight)
+      }
+
+      if (showLabels) {
+        _ctx.save()
+        _ctx.fillStyle = '#586e75'
+        _ctx.font = `${labelFontSize}px monospace`
+        _ctx.textAlign = 'right'
+        for (let i = 0; i < n; i++) {
+          const x = pad.left + gap + i * (barW + gap) + barW / 2
+          _ctx.save()
+          _ctx.translate(x, _h - pad.bottom + 8)
+          _ctx.rotate(-Math.PI / 4)
+          _ctx.fillText(items[i].name.replace(/_/g, ' '), 0, 0)
+          _ctx.restore()
+        }
+        _ctx.restore()
+      }
+    }
+
+    if (mode === 'cross') {
+      const items = baskets.map(b => ({ name: b.name, ret: b.return }))
+      drawBarChart(ctx, dims.w, dims.h, items, hoveredIdx, true)
+    } else if (mode === 'analogs') {
+      // Draw current period chart
+      if (analogsData?.current) {
+        const entries = Object.entries(analogsData.current.returns)
+          .filter(([, v]) => v !== null)
+          .map(([k, v]) => ({ name: k, ret: v as number }))
+          .sort((a, b) => a.ret - b.ret)
+        drawBarChart(ctx, dims.w, dims.h, entries, hoveredIdx, true)
+        // Title
+        ctx.fillStyle = '#586e75'; ctx.font = 'bold 11px monospace'; ctx.textAlign = 'left'
+        ctx.fillText(`CURRENT: ${analogsData.current.start} to ${analogsData.current.end}`, 65, 24)
+      }
+    } else {
+      const n = dailyReturns.length
+      if (n === 0) return
+      const pad = { top: 12, right: 50, bottom: 60, left: 60 }
+      const plotW = dims.w - pad.left - pad.right
+      const plotH = dims.h - pad.top - pad.bottom
+      // Bars fill the full plot width with 25% gap ratio
+      const barW = Math.max(1, (plotW / n) * 0.75)
+      const gap = (plotW - barW * n) / (n + 1)
+
+      let yMin = 0, yMax = 0
+      dailyReturns.forEach(r => { yMin = Math.min(yMin, r); yMax = Math.max(yMax, r) })
+      const yPad = (yMax - yMin) * 0.1 || 0.005
+      yMin -= yPad; yMax += yPad
+
+      const yScale = (v: number) => pad.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH
+      const zeroY = yScale(0)
+
+      ctx.strokeStyle = '#e9ecef'; ctx.lineWidth = 1
+      const nTicks = 6
+      for (let i = 0; i <= nTicks; i++) {
+        const v = yMin + (yMax - yMin) * (i / nTicks)
+        const y = yScale(v)
+        ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(dims.w - pad.right, y); ctx.stroke()
+        ctx.fillStyle = '#6c757d'; ctx.font = '10px monospace'; ctx.textAlign = 'right'
+        ctx.fillText((v * 100).toFixed(2) + '%', pad.left - 5, y + 3)
+      }
+
+      ctx.strokeStyle = '#adb5bd'; ctx.lineWidth = 1; ctx.setLineDash([4, 4])
+      ctx.beginPath(); ctx.moveTo(pad.left, zeroY); ctx.lineTo(dims.w - pad.right, zeroY); ctx.stroke()
+      ctx.setLineDash([])
+
+      for (let i = 0; i < n; i++) {
+        const x = pad.left + gap + i * (barW + gap)
+        const val = dailyReturns[i]
+        const bTop = val >= 0 ? yScale(val) : zeroY
+        const bBot = val >= 0 ? zeroY : yScale(val)
+        const barHeight = Math.max(1, bBot - bTop)
+        const isHovered = hoveredIdx === i
+        ctx.fillStyle = val >= 0
+          ? (isHovered ? 'rgb(30, 30, 220)' : 'rgb(50, 50, 255)')
+          : (isHovered ? 'rgb(220, 30, 120)' : 'rgb(255, 50, 150)')
+        ctx.fillRect(x, bTop, barW, barHeight)
+      }
+
+      ctx.fillStyle = '#93a1a1'; ctx.font = '9px monospace'; ctx.textAlign = 'center'
+      if (n === 1) {
+        const x = pad.left + gap + barW / 2
+        ctx.fillText(dailyDates[0], x, dims.h - pad.bottom + 14)
+      } else {
+        const nLabels = Math.min(6, n)
+        for (let li = 0; li < nLabels; li++) {
+          const idx = Math.round(li * (n - 1) / (nLabels - 1))
+          const x = pad.left + gap + idx * (barW + gap) + barW / 2
+          ctx.fillText(dailyDates[idx], x, dims.h - pad.bottom + 14)
+        }
+      }
+    }
+  }, [baskets, dailyReturns, dailyDates, dims, hoveredIdx, mode, analogsData])
+
+  // Render mini bar charts for analog cards
+  useEffect(() => {
+    if (mode !== 'analogs' || !analogsData?.analogs.length || !analogsData?.current) return
+    const basketOrder = Object.entries(analogsData.current.returns)
+      .filter(([, v]) => v !== null)
+      .map(([k, v]) => ({ name: k, ret: v as number }))
+      .sort((a, b) => a.ret - b.ret)
+      .map(s => s.name)
+
+    analogsData.analogs.forEach((analog, ai) => {
+      const canvas = analogCanvasRefs.current.get(ai)
+      if (!canvas) return
+      const ctx = canvas.getContext('2d')
+      if (!ctx) return
+      const rect = canvas.getBoundingClientRect()
+      const dpr = window.devicePixelRatio || 1
+      const w = rect.width
+      const h = 80
+      canvas.width = w * dpr
+      canvas.height = h * dpr
+      ctx.scale(dpr, dpr)
+      ctx.clearRect(0, 0, w, h)
+      ctx.fillStyle = '#fdf6e3'
+      ctx.fillRect(0, 0, w, h)
+
+      const items = basketOrder
+        .filter(k => analog.returns[k] !== null && analog.returns[k] !== undefined)
+        .map(k => ({ name: k, ret: analog.returns[k] as number }))
+      const n = items.length
+      if (n === 0) return
+      const pad = { top: 4, right: 4, bottom: 4, left: 4 }
+      const plotW = w - pad.left - pad.right
+      const plotH = h - pad.top - pad.bottom
+      const barW = Math.max(2, (plotW / n) * 0.75)
+      const gap = (plotW - barW * n) / (n + 1)
+
+      let yMin = 0, yMax = 0
+      items.forEach(b => { yMin = Math.min(yMin, b.ret); yMax = Math.max(yMax, b.ret) })
+      const yPad = (yMax - yMin) * 0.1 || 0.005
+      yMin -= yPad; yMax += yPad
+      const yScale = (v: number) => pad.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH
+      const zeroY = yScale(0)
+
+      ctx.strokeStyle = '#adb5bd'; ctx.lineWidth = 0.5; ctx.setLineDash([2, 2])
+      ctx.beginPath(); ctx.moveTo(pad.left, zeroY); ctx.lineTo(w - pad.right, zeroY); ctx.stroke()
+      ctx.setLineDash([])
+
+      for (let i = 0; i < n; i++) {
+        const x = pad.left + gap + i * (barW + gap)
+        const val = items[i].ret
+        const bTop = val >= 0 ? yScale(val) : zeroY
+        const bBot = val >= 0 ? zeroY : yScale(val)
+        const barHeight = Math.max(1, bBot - bTop)
+        ctx.fillStyle = val >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)'
+        ctx.fillRect(x, bTop, barW, barHeight)
+      }
+    })
+  }, [analogsData, mode])
+
+  // Mouse hover
+  const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!canvasRef.current) return
+    const rect = canvasRef.current.getBoundingClientRect()
+    const scaleX = dims.w / rect.width
+    const mx = (e.clientX - rect.left) * scaleX
+
+    if (mode === 'cross' || mode === 'analogs') {
+      const items = mode === 'cross'
+        ? baskets.map(b => ({ name: b.name, ret: b.return }))
+        : analogsData?.current
+          ? Object.entries(analogsData.current.returns).filter(([, v]) => v !== null).map(([k, v]) => ({ name: k, ret: v as number })).sort((a, b) => a.ret - b.ret)
+          : []
+      const n = items.length
+      if (!n) return
+      const pad = { left: 60, right: 50 }
+      const plotW = dims.w - pad.left - pad.right
+      const barW = Math.max(4, Math.min(40, (plotW / n) * 0.75))
+      const gap = (plotW - barW * n) / (n + 1)
+      let found = -1
+      for (let i = 0; i < n; i++) {
+        const x = pad.left + gap + i * (barW + gap)
+        if (mx >= x && mx <= x + barW) { found = i; break }
+      }
+      setHoveredIdx(found >= 0 ? found : null)
+    } else {
+      const n = dailyReturns.length
+      if (!n) return
+      const pad = { left: 60, right: 50 }
+      const plotW = dims.w - pad.left - pad.right
+      const barW = Math.max(1, (plotW / n) * 0.75)
+      const gap = (plotW - barW * n) / (n + 1)
+      let found = -1
+      for (let i = 0; i < n; i++) {
+        const x = pad.left + gap + i * (barW + gap)
+        if (mx >= x && mx <= x + barW) { found = i; break }
+      }
+      setHoveredIdx(found >= 0 ? found : null)
+    }
+  }
+
+  // Sorted items for analogs hover
+  const analogsSorted = useMemo(() => {
+    if (!analogsData?.current) return []
+    return Object.entries(analogsData.current.returns)
+      .filter(([, v]) => v !== null)
+      .map(([k, v]) => ({ name: k, ret: v as number }))
+      .sort((a, b) => a.ret - b.ret)
+  }, [analogsData])
+
+  const hovered = hoveredIdx !== null ? (mode === 'cross' && baskets[hoveredIdx]
+    ? { name: baskets[hoveredIdx].name.replace(/_/g, ' '), ret: baskets[hoveredIdx].return, group: baskets[hoveredIdx].group }
+    : mode === 'analogs' && analogsSorted[hoveredIdx]
+      ? { name: analogsSorted[hoveredIdx].name.replace(/_/g, ' '), ret: analogsSorted[hoveredIdx].ret, group: 'current' }
+    : mode === 'daily' && dailyDates[hoveredIdx] !== undefined
+      ? { name: dailyDates[hoveredIdx], ret: dailyReturns[hoveredIdx], group: dailyBasket.replace(/_/g, ' ') }
+      : null
+  ) : null
+
+  const handlePreset = (p: typeof BASKET_RETURN_PRESETS[number]) => {
+    if (!dateBounds.max) return
+    setActivePreset(p.label)
+    const { start, end } = applyPreset(p, dateBounds.max, dateBounds.min)
+    setStartDate(start)
+    setEndDate(end)
+  }
+
+  const selectBasket = (b: string) => {
+    setDailyBasket(b)
+    setBasketSearch('')
+    setBasketSearchOpen(false)
+  }
+
+  const handleBasketSearchKey = (e: React.KeyboardEvent) => {
+    if (e.key === 'ArrowDown') { e.preventDefault(); setBasketSearchHighlight(h => Math.min(h + 1, filteredBaskets.length - 1)) }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); setBasketSearchHighlight(h => Math.max(h - 1, 0)) }
+    else if (e.key === 'Enter' && filteredBaskets.length > 0) { selectBasket(filteredBaskets[basketSearchHighlight]) }
+    else if (e.key === 'Escape') { setBasketSearchOpen(false) }
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+      {/* Controls bar */}
+      <div className="analysis-date-controls">
+        {/* Mode toggle */}
+        {(['cross', 'daily', 'analogs'] as BasketReturnMode[]).map(m => (
+          <button
+            key={m}
+            className={`basket-returns-preset-btn ${mode === m ? 'active' : ''}`}
+            style={{ padding: '3px 8px', fontSize: '10px' }}
+            onClick={() => setMode(m)}
+          >
+            {m === 'cross' ? 'CROSS' : m === 'daily' ? 'SINGLE' : 'ANALOGS'}
+          </button>
+        ))}
+        {/* Group filter (cross + analogs mode) */}
+        {(mode === 'cross' || mode === 'analogs') && (
+          <>
+            <span style={{ color: 'var(--border-color)', margin: '0 1px' }}>|</span>
+            {(['all', 'themes', 'sectors', 'industries'] as BasketReturnGroup[]).map(g => (
+              <button key={g} className={`basket-returns-preset-btn ${group === g ? 'active' : ''}`} onClick={() => setGroup(g)}>
+                {g === 'all' ? 'ALL' : g === 'themes' ? 'T' : g === 'sectors' ? 'S' : 'I'}
+              </button>
+            ))}
+          </>
+        )}
+        {/* Basket search (single/daily mode) */}
+        {mode === 'daily' && (
+          <div className="search-container" style={{ position: 'relative' }}>
+            <input
+              ref={basketSearchRef}
+              className="search-input"
+              style={{ width: 180, fontSize: 11, padding: '3px 6px', height: 24 }}
+              placeholder={dailyBasket ? dailyBasket.replace(/_/g, ' ') : 'Search basket...'}
+              value={basketSearch}
+              onChange={e => { setBasketSearch(e.target.value); setBasketSearchOpen(true); setBasketSearchHighlight(0) }}
+              onFocus={() => setBasketSearchOpen(true)}
+              onKeyDown={handleBasketSearchKey}
+            />
+            {basketSearchOpen && (basketSearch.trim() || true) && (
+              <>
+                <div className="col-filter-backdrop" onClick={() => setBasketSearchOpen(false)} />
+                <div className="search-dropdown" style={{ width: 220, maxHeight: 300, top: '100%', left: 0 }}>
+                  <div className="search-results">
+                    {filteredBaskets.map((b, i) => (
+                      <div
+                        key={b}
+                        className={`search-result-item ${i === basketSearchHighlight ? 'highlighted' : ''}`}
+                        onMouseDown={() => selectBasket(b)}
+                        onMouseEnter={() => setBasketSearchHighlight(i)}
+                      >
+                        <span className="search-result-name">{b.replace(/_/g, ' ')}</span>
+                      </div>
+                    ))}
+                    {filteredBaskets.length === 0 && (
+                      <div className="search-result-empty">No baskets found</div>
+                    )}
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+        <span style={{ color: 'var(--border-color)', margin: '0 1px' }}>|</span>
+        <div className="basket-returns-presets">
+          {BASKET_RETURN_PRESETS.map(p => (
+            <button key={p.label} className={`basket-returns-preset-btn ${activePreset === p.label ? 'active' : ''}`} onClick={() => handlePreset(p)}>
+              {p.label}
+            </button>
+          ))}
+        </div>
+        {loading && <span className="analysis-loading-hint">Loading...</span>}
+        <div style={{ flex: 1 }} />
+        <input type="date" className="date-input" value={startDate} min={dateBounds.min} max={dateBounds.max} onChange={e => { setStartDate(e.target.value); setActivePreset('') }} />
+        <span style={{ fontSize: 10, color: 'var(--text-main)' }}>to</span>
+        <input type="date" className="date-input" value={endDate} min={dateBounds.min} max={dateBounds.max} onChange={e => { setEndDate(e.target.value); setActivePreset('') }} />
+      </div>
+      {/* Chart area */}
+      {mode !== 'analogs' ? (
+        <div style={{ flex: 1, minHeight: 0, position: 'relative' }} ref={containerRef}>
+          <canvas
+            ref={canvasRef}
+            style={{ width: '100%', height: '100%' }}
+            onMouseMove={handleMouseMove}
+            onMouseLeave={() => setHoveredIdx(null)}
+          />
+          {hovered && (
+            <div className="candle-detail-overlay" style={{ minWidth: 140 }}>
+              <div className="candle-detail-title">{hovered.name}</div>
+              <div className="candle-detail-row">
+                <span>Return</span>
+                <span className="ret" style={{ color: hovered.ret >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)' }}>
+                  {(hovered.ret * 100).toFixed(2)}%
+                </span>
+              </div>
+              <div className="candle-detail-row">
+                <span>Group</span>
+                <span className="ret">{hovered.group}</span>
+              </div>
+            </div>
+          )}
+        </div>
+      ) : (
+        <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+          {/* Current period chart — 35% height */}
+          <div style={{ flex: '0 0 35%', position: 'relative', borderBottom: '2px solid var(--border-color)' }} ref={containerRef}>
+            <canvas
+              ref={canvasRef}
+              style={{ width: '100%', height: '100%' }}
+              onMouseMove={handleMouseMove}
+              onMouseLeave={() => setHoveredIdx(null)}
+            />
+            {hovered && (
+              <div className="candle-detail-overlay" style={{ minWidth: 140 }}>
+                <div className="candle-detail-title">{hovered.name}</div>
+                <div className="candle-detail-row">
+                  <span>Return</span>
+                  <span className="ret" style={{ color: hovered.ret >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)' }}>
+                    {(hovered.ret * 100).toFixed(2)}%
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+          {/* Analog cards — scrollable */}
+          <div style={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
+            {analogsData?.message && (
+              <div style={{ padding: 16, fontSize: 12, color: 'var(--base01)', fontStyle: 'italic' }}>{analogsData.message}</div>
+            )}
+            {analogsData?.analogs.map((analog, ai) => {
+              // Sort baskets same order as current chart
+              const basketOrder = analogsSorted.map(s => s.name)
+              const analogItems = basketOrder
+                .filter(k => analog.returns[k] !== null && analog.returns[k] !== undefined)
+                .map(k => ({ name: k, ret: analog.returns[k] as number }))
+
+              // Forward return averages
+              const fwdAvg = (hz: string) => {
+                const fwd = analog.forward[hz]
+                if (!fwd) return null
+                const vals = Object.values(fwd).filter((v): v is number => v !== null)
+                if (vals.length === 0) return null
+                return vals.reduce((a, b) => a + b, 0) / vals.length
+              }
+
+              return (
+                <div key={ai} className="analog-card">
+                  <div className="analog-card-header">
+                    <span style={{ fontSize: 11, fontWeight: 'bold', color: 'var(--text-bold)' }}>
+                      #{ai + 1}: {analog.start} — {analog.end}
+                    </span>
+                    <span className="analog-similarity">{(analog.similarity * 100).toFixed(0)}% MATCH</span>
+                  </div>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 4 }}>
+                    {Object.entries(analog.similarity_breakdown).map(([k, v]) => {
+                      const labels: Record<string, string> = { returns: 'Ret', breadth: 'Brd', breakout: 'BO', correlation: 'Cor', volatility: 'Vol' }
+                      return (
+                        <span key={k} style={{ fontSize: 9, padding: '1px 4px', border: '1px solid var(--border-color)', color: 'var(--text-main)' }}>
+                          {labels[k] || k} {(v * 100).toFixed(0)}%
+                        </span>
+                      )
+                    })}
+                  </div>
+                  {/* Mini bar chart */}
+                  <canvas
+                    ref={el => { if (el) analogCanvasRefs.current.set(ai, el); else analogCanvasRefs.current.delete(ai) }}
+                    style={{ width: '100%', height: 80 }}
+                  />
+                  <div className="analog-forward-row">
+                    {['1M', '3M', '6M'].map(hz => {
+                      const avg = fwdAvg(hz)
+                      return (
+                        <span key={hz} style={{ color: avg === null ? 'var(--base01)' : avg >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)' }}>
+                          +{hz}: {avg !== null ? (avg * 100).toFixed(1) + '% avg' : 'N/A'}
+                        </span>
+                      )
+                    })}
+                  </div>
+                </div>
+              )
+            })}
+            {analogsData && analogsData.analogs.length === 0 && !analogsData.message && (
+              <div style={{ padding: 16, fontSize: 12, color: 'var(--base01)', fontStyle: 'italic' }}>No analogs found</div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+export function BasketSummary({ data, loading, basketName, apiBase, quarterDateRange, exportTrigger, analysisMode = 'intra', allBaskets, onBasketSelect }: BasketSummaryProps) {
+  const [tab, setTab] = useState<TabType>(analysisMode === 'cross' ? 'basket_returns' : 'breakout')
+  const [intraSearch, setIntraSearch] = useState('')
+  const [intraSearchOpen, setIntraSearchOpen] = useState(false)
+  const [intraSearchHighlight, setIntraSearchHighlight] = useState(0)
+  const intraSearchRef = useRef<HTMLInputElement>(null)
+
+  const filteredIntraBaskets = useMemo(() => {
+    const q = intraSearch.toLowerCase().trim()
+    const filterList = (list: string[]) => q ? list.filter(b => b.toLowerCase().replace(/_/g, ' ').includes(q) || b.toLowerCase().includes(q)) : list
+    if (!allBaskets) return []
+    return [
+      ...filterList(allBaskets.Themes).map(b => ({ name: b, group: 'Theme' as const })),
+      ...filterList(allBaskets.Sectors).map(b => ({ name: b, group: 'Sector' as const })),
+      ...filterList(allBaskets.Industries).map(b => ({ name: b, group: 'Industry' as const })),
+    ]
+  }, [intraSearch, allBaskets])
+
+  // When analysisMode changes, reset to a valid default tab
+  const prevMode = useRef(analysisMode)
+  if (analysisMode !== prevMode.current) {
+    prevMode.current = analysisMode
+    if (analysisMode === 'cross' && tab !== 'basket_returns') {
+      setTab('basket_returns')
+    } else if (analysisMode === 'intra' && tab === 'basket_returns') {
+      setTab('breakout')
+    }
+  }
+
+  // Cross-basket mode — no summary data needed
+  if (analysisMode === 'cross') {
+    return (
+      <div className="summary-panel">
+        <div className="summary-tabs">
+          <button className="summary-tab active">
+            Basket Returns
+          </button>
+        </div>
+        <div className="summary-content">
+          <BasketReturnsChart apiBase={apiBase} exportTrigger={exportTrigger} />
+        </div>
+      </div>
+    )
+  }
+
+  // Basket picker bar (shared by both states: no basket selected and basket loaded)
+  const handleIntraSearchKey = (e: React.KeyboardEvent) => {
+    if (e.key === 'ArrowDown') { e.preventDefault(); setIntraSearchHighlight(h => Math.min(h + 1, filteredIntraBaskets.length - 1)) }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); setIntraSearchHighlight(h => Math.max(h - 1, 0)) }
+    else if (e.key === 'Enter' && filteredIntraBaskets.length > 0) {
+      onBasketSelect?.(filteredIntraBaskets[intraSearchHighlight].name)
+      setIntraSearch('')
+      setIntraSearchOpen(false)
+    }
+    else if (e.key === 'Escape') { setIntraSearchOpen(false) }
+  }
+  let flatIdx = 0
+  const groupedItems: { name: string; group: string; idx: number }[] = filteredIntraBaskets.map(b => ({ ...b, idx: flatIdx++ }))
+  const groups = ['Theme', 'Sector', 'Industry'] as const
+
+  const basketPickerBar = (
+    <div className="analysis-date-controls" style={{ justifyContent: 'flex-start' }}>
+      <span style={{ fontSize: 11, fontWeight: 'bold', textTransform: 'uppercase', color: 'var(--text-bold)', whiteSpace: 'nowrap' }}>Analyze:</span>
+      <div className="search-container" style={{ position: 'relative' }}>
+        <input
+          ref={intraSearchRef}
+          className="search-input"
+          style={{ width: 250, fontSize: 12, padding: '4px 8px' }}
+          placeholder={basketName ? basketName.replace(/_/g, ' ') : 'Search baskets...'}
+          value={intraSearch}
+          onChange={e => { setIntraSearch(e.target.value); setIntraSearchOpen(true); setIntraSearchHighlight(0) }}
+          onFocus={() => setIntraSearchOpen(true)}
+          onKeyDown={handleIntraSearchKey}
+        />
+        {intraSearchOpen && (
+          <>
+            <div className="col-filter-backdrop" onClick={() => setIntraSearchOpen(false)} />
+            <div className="search-dropdown" style={{ width: 300, maxHeight: 400 }}>
+              <div className="search-results">
+                {groups.map(g => {
+                  const items = groupedItems.filter(b => b.group === g)
+                  if (items.length === 0) return null
+                  return (
+                    <div key={g}>
+                      <div style={{ padding: '6px 12px', fontSize: 10, fontWeight: 'bold', textTransform: 'uppercase', color: 'var(--text-bold)', background: 'var(--bg-sidebar)', borderBottom: '1px solid var(--border-color)', letterSpacing: '0.05em' }}>{g}s</div>
+                      {items.map(b => (
+                        <div
+                          key={b.name}
+                          className={`search-result-item ${b.idx === intraSearchHighlight ? 'highlighted' : ''}`}
+                          onMouseDown={() => { onBasketSelect?.(b.name); setIntraSearch(''); setIntraSearchOpen(false) }}
+                          onMouseEnter={() => setIntraSearchHighlight(b.idx)}
+                        >
+                          <span className="search-result-name">{b.name.replace(/_/g, ' ')}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )
+                })}
+                {groupedItems.length === 0 && (
+                  <div className="search-result-empty">No baskets found</div>
+                )}
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  )
+
+  // Intrabasket mode — no basket selected yet
+  if (!basketName) {
+    return (
+      <div className="summary-panel">
+        {basketPickerBar}
+        <div className="summary-content" />
+      </div>
+    )
+  }
+
+  // Intrabasket mode — needs summary data
+  if (loading) return <div className="summary-panel">{basketPickerBar}<div className="summary-loading">Loading basket analysis...</div></div>
+  if (!data) return <div className="summary-panel">{basketPickerBar}<div className="summary-empty">No summary data</div></div>
 
   const filterSignals = (key: 'breakout' | 'rotation' | 'btfd') =>
     data.open_signals.filter(s => SIGNAL_FILTERS[key].includes(s.Signal_Type))
@@ -1048,12 +1855,12 @@ export function BasketSummary({ data, loading, basketName, apiBase, quarterDateR
   const btfdClosed = filterClosed('btfd')
   const hasClosed = breakoutClosed.length > 0 || rotationClosed.length > 0 || btfdClosed.length > 0
 
-  // Reset to open tab if on a closed tab that no longer exists
   const closedTabs: TabType[] = ['breakout_closed', 'rotation_closed', 'btfd_closed']
   const activeTab = (!hasClosed && closedTabs.includes(tab)) ? 'breakout' : tab
 
   return (
     <div className="summary-panel">
+      {basketPickerBar}
       <div className="summary-tabs">
         <button className={`summary-tab ${activeTab === 'breakout' ? 'active' : ''}`} onClick={() => setTab('breakout')}>
           LT Trend{hasClosed ? ' Open' : ''} ({breakoutSignals.length})

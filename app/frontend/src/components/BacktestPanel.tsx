@@ -2,6 +2,7 @@ import { useState, useMemo, useRef, useEffect, useCallback } from 'react'
 import axios from 'axios'
 import { createChart, ColorType, CrosshairMode, LineStyle, IChartApi } from 'lightweight-charts'
 import { RangeScrollbar } from './RangeScrollbar'
+import { MultiBacktestPanel } from './MultiBacktestPanel'
 
 interface BacktestFilter {
   metric: string
@@ -144,6 +145,21 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
   const [showCorrelation, setShowCorrelation] = useState(false)
   const [showRV, setShowRV] = useState(true)
 
+  // Multi-leg mode
+  const [multiMode, setMultiMode] = useState(false)
+
+  // Basket selector for single-leg mode (allows testing any basket regardless of sidebar selection)
+  const [allBaskets, setAllBaskets] = useState<Record<string, string[]>>({})
+  const [selectedTarget, setSelectedTarget] = useState(target)
+  const [selectedTargetType, setSelectedTargetType] = useState(targetType)
+
+  useEffect(() => {
+    fetch(`${apiBase}/baskets`).then(r => r.json()).then(setAllBaskets).catch(() => {})
+  }, [apiBase])
+
+  // Sync with props when they change (user navigated to different item)
+  useEffect(() => { setSelectedTarget(target); setSelectedTargetType(targetType) }, [target, targetType])
+
   // Config state
   const [entrySignal, setEntrySignal] = useState('Breakout')
   const [filters, setFilters] = useState<BacktestFilter[]>([])
@@ -235,7 +251,7 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
     prevExportTrigger.current = exportTrigger
 
     const tabLabel = resultTab
-    const filename = `${target}_${entrySignal}_${tabLabel}.png`
+    const filename = `${selectedTarget}_${entrySignal}_${tabLabel}.png`
 
     const downloadCanvas = (canvas: HTMLCanvasElement) => {
       canvas.toBlob((blob) => {
@@ -266,7 +282,7 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
   // Fetch available date range when target changes
   useEffect(() => {
     let cancelled = false
-    axios.get(`${apiBase}/date-range/${targetType}/${target}`)
+    axios.get(`${apiBase}/date-range/${selectedTargetType}/${selectedTarget}`)
       .then(res => {
         if (cancelled) return
         setDataRange(res.data)
@@ -277,7 +293,7 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
         if (!cancelled) setDataRange(null)
       })
     return () => { cancelled = true }
-  }, [target, targetType, apiBase])
+  }, [selectedTarget, selectedTargetType, apiBase])
 
   const addFilter = () => {
     setFilters(prev => [...prev, { metric: 'Uptrend_Pct', condition: 'above', value: 50, source: 'self' }])
@@ -311,9 +327,9 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
     setBenchmarks({})
     const gen = ++benchmarkGenRef.current
     try {
-      const effectiveType = (targetType === 'basket' && useConstituents) ? 'basket_tickers' : targetType
+      const effectiveType = (selectedTargetType === 'basket' && useConstituents) ? 'basket_tickers' : selectedTargetType
       const body = {
-        target,
+        target: selectedTarget,
         target_type: effectiveType,
         entry_signal: entrySignal,
         filters: filters.map(f => ({
@@ -332,7 +348,7 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
 
       // Fire main + 6 benchmarks all in parallel
       const benchBody = {
-        target,
+        target: selectedTarget,
         target_type: effectiveType,
         filters: [],
         start_date: startDate || null,
@@ -1141,9 +1157,9 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
 
     const endpoint = isMulti
       ? `tickers/${encodeURIComponent(currentTicker!)}`
-      : targetType === 'basket'
-        ? `baskets/${encodeURIComponent(target)}`
-        : `tickers/${encodeURIComponent(target)}`
+      : selectedTargetType === 'basket'
+        ? `baskets/${encodeURIComponent(selectedTarget)}`
+        : `tickers/${encodeURIComponent(selectedTarget)}`
 
     const visibleTrades = isMulti
       ? result.trades.filter(t => t.ticker === currentTicker)
@@ -1359,7 +1375,7 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
       btSeriesRef.current = {}
       chartInstanceRef.current = null
     }
-  }, [resultTab, result, target, targetType, entrySignal, apiBase, showPivots, showTargets, chartTickers, chartTickerIdx])
+  }, [resultTab, result, selectedTarget, selectedTargetType, entrySignal, apiBase, showPivots, showTargets, chartTickers, chartTickerIdx])
 
   // Resize ALL charts when visibility toggles change (flex layout needs a frame to settle)
   useEffect(() => {
@@ -1386,9 +1402,36 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
 
   // Config mode
   if (!showResults) {
+    if (multiMode) {
+      return <MultiBacktestPanel apiBase={apiBase} onClose={() => setMultiMode(false)} />
+    }
     return (
       <div className="backtest-panel">
         <div className="backtest-config">
+          <div className="backtest-section">
+            <div className="backtest-pos-presets">
+              <button className="backtest-pos-preset wide active">Single Leg</button>
+              <button className="backtest-pos-preset wide" onClick={() => setMultiMode(true)}>Multi-Leg</button>
+            </div>
+          </div>
+
+          <div className="backtest-section">
+            <label className="backtest-label">Target</label>
+            <select className="backtest-select" value={selectedTarget}
+              onChange={e => {
+                setSelectedTarget(e.target.value)
+                setSelectedTargetType('basket')
+              }}>
+              {/* Current sidebar selection */}
+              {selectedTargetType === 'ticker' && <option value={target}>{target} (ticker)</option>}
+              {Object.entries(allBaskets).map(([group, names]) => (
+                <optgroup key={group} label={group}>
+                  {Array.isArray(names) && names.map(n => <option key={n} value={n}>{n.replace(/_/g, ' ')}</option>)}
+                </optgroup>
+              ))}
+            </select>
+          </div>
+
           <div className="backtest-section">
             <label className="backtest-label">Entry Signal</label>
             <select className="backtest-select" value={entrySignal} onChange={e => setEntrySignal(e.target.value)}>
@@ -1397,7 +1440,7 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
             <span className="backtest-hint">Exit: {EXIT_MAP[entrySignal]?.replace(/_/g, ' ')}</span>
           </div>
 
-          {targetType === 'basket' && (
+          {selectedTargetType === 'basket' && (
             <div className="backtest-section">
               <label className="backtest-label">Trade Source</label>
               <div className="backtest-pos-presets">

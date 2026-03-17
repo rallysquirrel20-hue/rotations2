@@ -777,6 +777,13 @@ export function MultiBacktestPanel({ apiBase, onClose }: MultiBacktestPanelProps
   return (
     <div className="backtest-panel">
       <div className="backtest-config">
+        <div className="backtest-section">
+          <div className="backtest-pos-presets">
+            <button className="backtest-pos-preset wide" onClick={onClose}>Single Leg</button>
+            <button className="backtest-pos-preset wide active">Multi-Leg</button>
+          </div>
+        </div>
+
         {legs.map((leg, i) => (
           <div key={i} className="backtest-section" style={{ borderLeft: `3px solid ${LEG_COLORS[i % LEG_COLORS.length]}`, paddingLeft: 8 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>

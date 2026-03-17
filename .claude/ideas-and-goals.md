@@ -8,12 +8,8 @@
 ### 2. Backtest Accuracy
 Test backtest feature for accuracy.
 
-### 3. Equity Tab Improvements
-- Add constituent feature
-- ~~Scrolling and zooming on equity curve chart~~ — COMPLETED (2026-03-16)
-- ~~Date range selector~~ — COMPLETED (2026-03-16)
-- ~~Fix ugly chart colors~~ — COMPLETED (2026-03-16) — Benchmark curves use coordinated blue (longs) / pink (shorts) palette; filtered = lime green; buy & hold = gray; all solid lines
-- ~~Benchmark equity curves~~ — COMPLETED (2026-03-16) — 6 signal strategy benchmarks displayed alongside filtered backtest and buy & hold
+### ~~3. Equity Tab Improvements~~ — COMPLETED (2026-03-17)
+~~Add constituent feature, scrolling/zooming, date range selector, chart colors, benchmark equity curves.~~
 
 ### ~~4. Distribution Tab Fixes~~ — COMPLETED (2026-03-16)
 ~~Show mean AND/OR median for winners and for losers separately (current shows single mean — not valuable); Fix bold borders on curves~~ Curve borders match fill colors, winner/loser median stats by trade outcome, KDE boundary clamping for MAE/MFE at zero.
@@ -39,24 +35,22 @@ Add variable position sizing feature to backtest.
 ### ~~11. Theme List Dropdown Behavior~~ — RE-FIXED (2026-03-16)
 ~~Theme lists drop down automatically — should only drop down when the arrow is selected.~~ Regression occurred but has been fixed again by separating basket selection (row click) from expansion toggle (chevron click).
 
-### 12. General Basket Analysis Tab
-Add a general basket analysis tab (or nest above current basket analysis features) to analyze all basket returns together.
-- Akin to adding daily/annual reports to web app, with variable date ranges tied to quarterly universe tool
-- Use historical returns of baskets as a feature in backtest to ID similar regimes historically
-- Build tool to estimate which time periods had most similar features based on all basket returns and signal performance
+### ~~12. Basket Returns~~ — COMPLETED (2026-03-17)
+~~Add a general basket analysis tab to analyze all basket returns together.~~ Implemented cross-basket period returns and single-basket daily returns chart with live data overlay, date presets (1D–ALL), group filters (All/T/S/I), searchable basket picker, hover overlay, and PNG export. Backend endpoint `GET /api/baskets/returns` with input validation. Future sub-goals (regime similarity, backtest integration) can be tracked as new goals.
 
-### 13. Live Signal Auto-Refresh (Loops/Hooks) — IN PROGRESS (2026-03-16)
-- ~~Learn what Claude Code loops and hooks are and how to build time-based updates~~ — COMPLETED
-- Implement time-based auto-refresh for live signals during market hours — IMPLEMENTED (15-minute loop via live_loop.py + PM2)
+### ~~13. Live Signal Auto-Refresh (Loops/Hooks)~~ — COMPLETED (2026-03-17)
+~~Learn what Claude Code loops and hooks are and how to build time-based updates. Implement time-based auto-refresh for live signals during market hours.~~ 15-minute loop via live_loop.py + PM2. Fixed PM2 interpreter path for Windows, restored .env after repo consolidation, added cycle banners to stderr.
 
-### 14. Time-Based Update for Signals & Basket Equity/Signals
-Add scheduled updates for signals and basket equity/signals data during market hours.
+### ~~14. Time-Based Update for Signals & Basket Equity/Signals~~ — COMPLETED (2026-03-17)
+~~Add scheduled updates for signals and basket equity/signals data during market hours.~~ Covered by Goal 13's live_loop.py — runs rotations.py every 15 minutes via PM2, which rebuilds signals and basket equity/signals through cache guards.
 
-### 15. Optimize Basket Signals Build Time
-Basket signals build and amend process is too slow — adding new themes or industries takes way too long. Needs performance optimization.
+### ~~15. Optimize Basket Signals Build Time~~ — COMPLETED (2026-03-17)
+~~Basket signals build and amend process is too slow — adding new themes or industries takes way too long. Needs performance optimization.~~ Full rebuild dropped from ~30 min to 7 min 47s (467s), averaging 16.9s per basket. Six optimizations: pre-computed returns matrices, correlation vectorization (numpy z-score variance decomposition), breadth vectorization (searchsorted + groupby), equity OHLC cumprod path, contributions merged into equity OHLC, extracted shared `_build_quarter_weights`.
 
 ## Completed
 
 1. **BTFD/STFR trend guard — verify fix** (2026-03-13): Signals rebuilt (`signals_500.parquet`), zero co-fires confirmed. ~191K spurious BTFD/STFR signals eliminated. Also fixed a latent numpy float32 serialization bug in the ticker-signals endpoint exposed by the rebuild.
 2. **Frontend sidebar empty columns** (2026-03-13): Resolved. Was a frontend parsing/column-mapping issue. Fixed alongside the BTFD/STFR consistency audit and sig-live styling work.
 3. **Repo Consolidation** (2026-03-16): Consolidated rotations_signals and rotations_app into a single monorepo "rotations" at rallysquirrel20-hue/rotations. 44 files, 23,736 lines. Structure: signals/, app/backend/, app/frontend/. All agent definitions updated with relative paths.
+4. **Basket Returns** (2026-03-17): Cross-basket period returns and single-basket daily returns chart with live data overlay, date presets, group filters, basket picker, hover overlay, and PNG export. Backend `GET /api/baskets/returns` endpoint with regex input validation and anchor-row logic.
+5. **Optimize Basket Signals Build Time** (2026-03-17): Full rebuild dropped from ~30 min to 7 min 47s (467s). Six optimizations in `signals/rotations.py`: pre-computed returns matrices, correlation vectorization, breadth vectorization, equity OHLC cumprod, contributions merged into equity OHLC, extracted `_build_quarter_weights`.

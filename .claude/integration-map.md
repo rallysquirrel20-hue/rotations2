@@ -1,6 +1,6 @@
 # Monorepo Integration Map
 
-> Auto-generated 2026-03-16. Last updated 2026-03-16. Tracks all communication points between signals/ and app/backend/.
+> Auto-generated 2026-03-16. Last updated 2026-03-17 (batch 2). Tracks all communication points between signals/ and app/backend/.
 
 ## Signal Refresh Entry Point
 
@@ -61,13 +61,15 @@
 - **Status**: OK
 
 ### Basket Signals Parquets (`*_basket_cache/`)
-- **Written by**: `_finalize_basket_signals_output()` — `signals/rotations.py:3673`
+- **Written by**: `_finalize_basket_signals_output()` — `signals/rotations.py:3846`
   - Parquet write at line 3755, meta write at line 3762
   - Naming: `{slug}_{n}_of_500_signals.parquet` (thematic), `{slug}_of_500_signals.parquet` (sector/industry)
-- **Read by**: `get_basket_data()` — `app/backend/main.py:544`; also `app/backend/verify_backtest.py` (basket-mode verification)
+- **Read by**: `get_basket_data()` — `app/backend/main.py:708`; also `app/backend/verify_backtest.py` (basket-mode verification)
   - Naming glob: `{slug}_*_of_*_signals.parquet` (with `{slug}_of_*_signals.parquet` fallback) — `app/backend/main.py:92`
+  - `get_basket_returns()` reads `Date`, `Close` columns — `app/backend/main.py:554` (slug discovery), `573` (date range scan), `619`/`673` (period & daily return computation)
 - **Columns**: Full signal schema (same as `signals_500.parquet`) plus `Uptrend_Pct`, `Downtrend_Pct`, `Breadth_EMA`, `Breakout_Pct`, `Breakdown_Pct`, `BO_Breadth_EMA`, `B_Trend`, `B_Resistance`, `B_Support`, `B_Up_Rot`, `B_Down_Rot`, `B_Rot_High`, `B_Rot_Low`, `B_Bull_Div`, `B_Bear_Div`, `BO_B_*` variants, `Correlation_Pct`, `Source='norgate'`
   - **Frontend** (`TVChart.tsx`, `BacktestPanel.tsx`): reads `RV_EMA` from `chart_data` returned by `/api/baskets/{basket_name}`; annualizes as `RV_EMA * sqrt(252) * 100` for display as a Realized Volatility indicator pane (percentage)
+  - **`Correlation_Pct` implementation note** (updated 2026-03-17): Computed by `_compute_within_basket_correlation()` (`signals/rotations.py:3700`) using z-score variance decomposition: `avg_pairwise_corr = (n * Var(EW z-portfolio) - 1) / (n - 1)`. This replaced an earlier per-date `.corr()` approach. Values may differ from the old implementation by ~0.1 mean / ~8 max at quarter boundaries (where basket membership changes cause different ticker subsets). All frontend consumers verified working correctly.
 - **Status**: OK
 
 ### Basket Meta JSONs (`*_basket_cache/`)
@@ -78,6 +80,17 @@
 - **Schema**: `{schema_version, signal_logic_version, universe_logic_version, data_fingerprint, latest_source_date, last_cached_date, universe_signature, basket_type, state: {current_quarter, equity_prev_close, weights: {TICKER: float}}}`
 - **Key read by consumer**: `state.weights`
 - **Status**: OK
+
+### Basket Contributions Parquets (`*_basket_cache/`)
+- **Written by**: `_finalize_basket_signals_output()` — `signals/rotations.py:3954–3968`
+  - Uses pre-computed `contrib_df` from `compute_equity_ohlc_cached()` when available (line 3959–3968), otherwise falls back to `_compute_and_save_contributions()` (line 3958)
+  - Naming: `{slug}_{n}_of_500_contributions.parquet` (thematic), `{slug}_of_500_contributions.parquet` (sector/industry)
+- **Read by**: `_find_basket_contributions()`, `get_basket_weights_from_contributions()`, `get_basket_contributions()`, `get_basket_contributions_day()` — `app/backend/main.py:1549`, `242`, `1562`, `1652`
+  - Naming glob: `{slug}_*_of_*_contributions.parquet` (with `{slug}_of_*_contributions.parquet` fallback) — `app/backend/main.py:1554`
+  - `get_basket_summary()` cumulative returns path reads contributions to build per-ticker weighted return series — `app/backend/main.py:~1440`
+  - `get_basket_weights_from_contributions()` reads latest `Weight_BOD` per ticker — `app/backend/main.py:242`
+- **Columns**: `Date`, `Ticker`, `Weight_BOD`, `Daily_Return`, `Contribution`
+- **Status**: OK — schema and file locations unchanged (2026-03-17)
 
 ### Thematic Universe JSONs
 - `beta_universes_500.json` — Written: `signals/rotations.py:545` (write at line 557). Read: `app/backend/main.py:131`, `168`. Schema: `{high: {quarter: [...]}, low: {quarter: [...]}}`. Status: OK
@@ -95,21 +108,76 @@
 
 ### `live_basket_signals_500.parquet`
 - **Written by**: `export_today_signals()` — `signals/rotations.py:5040`
-- **Read by**: `get_basket_data()` — `app/backend/main.py:553`
+- **Read by**: `get_basket_data()` — `app/backend/main.py:717`
   - Also read by basket list overlay at `app/backend/main.py:492`
+  - Also read by `get_basket_returns()` — `app/backend/main.py:588` — reads `BasketName`/`Basket`, `Date`, `Close` to overlay live intraday close on basket return calculations
 - **Columns written**: `Date`, `BasketName`, `Open`, `High`, `Low`, `Close`
-- **Consumer expects**: `BasketName` or `Basket` (tries both) — `app/backend/main.py:494`, `555`
+- **Consumer expects**: `BasketName` or `Basket` (tries both) — `app/backend/main.py:494`, `590`, `719`
 - **Status**: OK
+
+### `returns_matrix_500.parquet` + `returns_matrix_500.fingerprint` (added 2026-03-17)
+- **Written by**: Basket processing loop preamble — `signals/rotations.py:4285–4332`
+  - Parquet write at line 4330, fingerprint write at line 4331
+  - Built from `all_signals_df[['Date', 'Ticker', 'Close']].pct_change()` pivoted to Date x Ticker matrix
+  - Fingerprint: MD5 hash of `f"{all_signals_df.shape}_{max_date}_{sorted_tickers}"`, stored in `.fingerprint` text file
+  - On subsequent runs, fingerprint is checked first; if unchanged, the parquet is loaded from cache instead of rebuilt
+- **Read by**: NOBODY in `app/backend/` — this file is only consumed within the batch pipeline (`signals/rotations.py`)
+  - Passed as `returns_matrix` argument to `process_basket_signals()` (line 4351), then to `compute_equity_ohlc_cached()` (line 4176) and `_compute_within_basket_correlation()` (line 3874) for each basket
+  - Also drives OHLC returns matrices (`ohlc_ret_matrices` dict with `Open_Ret`, `High_Ret`, `Low_Ret`) built alongside `returns_matrix` and passed through the same call chain
+- **Columns**: One column per ticker (ticker name as column header), DatetimeIndex as row index, values are daily close-to-close percentage returns
+- **Purpose**: Pre-computing the full returns matrix once before the basket loop eliminates redundant per-basket pivot operations. The fingerprint cache avoids rebuilding on re-runs when the underlying signals data has not changed.
+- **Status**: OK — pipeline-internal only, no cross-repo contract
 
 ### `correlation_cache/`
 - `basket_correlations_of_500.parquet` + `correlation_meta_500.json`
-- **Written by**: NOBODY — `_save_corr_cache()` was removed when `rotations.py` was trimmed from ~8000 to ~5800 lines. Correlation is now computed inline by `_compute_within_basket_correlation()` (`signals/rotations.py:3566`) and stored directly as `Correlation_Pct` column in basket signals parquets.
+- **Written by**: NOBODY — `_save_corr_cache()` was removed when `rotations.py` was trimmed from ~8000 to ~5800 lines. Correlation is now computed inline by `_compute_within_basket_correlation()` (`signals/rotations.py:3700`) and stored directly as `Correlation_Pct` column in basket signals parquets.
 - **Read by**: Nothing in `app/backend/main.py` or `app/backend/signals_engine.py`
 - **Status**: STALE/REMOVED — These standalone files are no longer produced. Correlation data is now embedded in basket signals parquets.
 
 ---
 
 ## Backend Endpoint Notes
+
+### `GET /api/baskets/returns` — cross-basket and single-basket return data (added 2026-03-17)
+
+**Endpoint**: `app/backend/main.py:543` — `get_basket_returns()`
+
+**Query parameters**:
+- `mode`: `"period"` (default) — one return value per basket; `"daily"` — day-by-day return series for a single basket
+- `start`, `end`: Date range (strings, `YYYY-MM-DD`). Defaults to trailing 1Y from the latest available date in period mode.
+- `basket`: Basket slug (required for `mode=daily`)
+- `group`: `"all"` (default), `"themes"`, `"sectors"`, `"industries"` — filters baskets in period mode
+
+**Data sources consumed**:
+1. **Basket parquets** (`*_of_*_signals.parquet`) from all `BASKET_CACHE_FOLDERS` — reads `Date`, `Close` columns only. Used for:
+   - Slug discovery via glob `*_of_*_signals.parquet` across all folders (line 554)
+   - Global date range computation (line 573)
+   - Period return: `(last_close / first_close) - 1` per basket (line 673)
+   - Daily return: `Close.pct_change()` for a single basket (line 619)
+2. **`live_basket_signals_500.parquet`** — reads `BasketName`/`Basket`, `Date`, `Close` (line 588). Builds a `live_closes` dict mapping slug to `(date, close)`. Live row is appended to each basket's close series if the live date is not already present.
+
+**Response shape** (`mode=period`):
+```
+{
+  "baskets": [{"name": str, "group": "theme"|"sector"|"industry", "return": float}, ...],
+  "date_range": {"min": "YYYY-MM-DD"|null, "max": "YYYY-MM-DD"|null},
+  "actual_range": {"start": str, "end": str}
+}
+```
+
+**Response shape** (`mode=daily`):
+```
+{
+  "basket": str,
+  "dates": ["YYYY-MM-DD", ...],
+  "returns": [float, ...],
+  "date_range": {"min": "YYYY-MM-DD"|null, "max": "YYYY-MM-DD"|null}
+}
+```
+
+**Frontend consumer**: `BasketReturnsChart` component in `app/frontend/src/components/BasketSummary.tsx` — renders cross-basket ranked bar chart (period mode) and single-basket daily return bar chart (daily mode) with date presets and live intraday overlay.
+
+---
 
 ### `GET /api/basket_summary` — `cumulative_returns` series now includes `join_date` (2026-03-16)
 
@@ -372,6 +440,27 @@ Both implement `_build_signals_from_df`. Known differences:
 - `live_signals_500.parquet`: no `Source` column
 - `live_basket_signals_500.parquet`: no `Source` column
 - On rebuild, producer strips `Source='live'` rows before merging new Norgate data
+
+---
+
+## Internal Pipeline Notes (signals/rotations.py only — no backend impact)
+
+### `compute_equity_ohlc_cached()` return signature change (2026-03-17)
+- **Previous signature**: Returns `ohlc_df` (single DataFrame)
+- **Current signature** (`signals/rotations.py:3585`): Returns `(ohlc_df, contrib_df)` tuple
+  - `contrib_df` is a DataFrame with columns `[Date, Ticker, Weight_BOD, Daily_Return, Contribution]` when the equity cache is rebuilt, or `None` when the cache is fully current (line 3608)
+  - The tuple is produced by calling `compute_equity_ohlc()` with `return_contributions=True` (line 3597)
+- **Callers updated**:
+  - Pre-build equity cache loop at line 2769: `eq, _ = compute_equity_ohlc_cached(...)` — discards contributions (pre-build only needs the OHLC cache to exist)
+  - Main basket processing at line 4176: `ohlc_df, _contrib_df = compute_equity_ohlc_cached(...)` — passes `_contrib_df` through to `_finalize_basket_signals_output()` which saves it as the contributions parquet (avoiding redundant recomputation)
+- **No backend impact**: The backend never calls `compute_equity_ohlc_cached()` directly; it reads the output parquet files.
+
+### `FORCE_REBUILD_BASKET_SIGNALS` now forces equity OHLC rebuild (2026-03-17)
+- **Location**: `signals/rotations.py:102` (constant), checked at line 3591
+- **Previous behavior**: `FORCE_REBUILD_BASKET_SIGNALS = True` only forced basket signals parquets to be rebuilt
+- **Current behavior**: `compute_equity_ohlc_cached()` now also checks `FORCE_REBUILD_BASKET_SIGNALS` (line 3591: `if FORCE_REBUILD_EQUITY_CACHE or FORCE_REBUILD_BASKET_SIGNALS`). When either is `True`, the equity OHLC cache is invalidated and rebuilt, which produces fresh `contrib_df` as a byproduct.
+- **Rationale**: Since basket signals now depend on contributions data from the equity OHLC build, forcing basket signals rebuild should also force the upstream equity OHLC rebuild to ensure contributions are fresh.
+- **No backend impact**: These are build-time constants in the batch pipeline.
 
 ---
 
