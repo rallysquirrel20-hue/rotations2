@@ -102,7 +102,7 @@ BASKET_SIGNALS_CACHE_SCHEMA_VERSION = 1
 FORCE_REBUILD_BASKET_SIGNALS = False
 CHART_SCHEMA_VERSION = 2  # Bump to force rebuild of basket chart PNGs (added 21d corr panel)
 BENCHMARK_BASKETS = 0      # If > 0, only process this many baskets then stop
-BENCHMARK_TIMING = False   # If True, print per-step timing breakdown for each basket
+BENCHMARK_TIMING = True    # If True, print per-step timing breakdown for each basket
 
 _basket_timing = {
     'cache_check': [], 'equity_ohlc': [], 'build_signals': [],

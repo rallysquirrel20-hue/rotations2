@@ -1,14 +1,51 @@
-import { useState, useMemo, useRef, useEffect, useCallback } from 'react'
-import axios from 'axios'
-import { createChart, ColorType, CrosshairMode, LineStyle, IChartApi } from 'lightweight-charts'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { RangeScrollbar } from './RangeScrollbar'
-import { MultiBacktestPanel } from './MultiBacktestPanel'
+
+/* ── Interfaces ────────────────────────────────────────────────────── */
 
 interface BacktestFilter {
   metric: string
   condition: string
   value: number | string
   source: string
+}
+
+interface LegConfig {
+  target: string
+  targetType: 'basket' | 'basket_tickers' | 'ticker'
+  entrySignal: string
+  allocationPct: number
+  positionSize: number
+  filters: BacktestFilter[]
+}
+
+interface PortfolioStats {
+  strategy_return: number
+  cagr: number
+  volatility: number
+  max_dd: number
+  sharpe: number
+  sortino: number
+  contribution?: number
+  allocation?: number
+}
+
+interface TradeStats {
+  trades_met_criteria: number
+  trades_taken: number
+  trades_skipped: number
+  win_rate: number
+  avg_winner: number
+  avg_loser: number
+  ev: number
+  profit_factor: number
+  avg_time_winner: number
+  avg_time_loser: number
+}
+
+interface Stats {
+  portfolio: PortfolioStats
+  trade: TradeStats
 }
 
 interface Trade {
@@ -23,24 +60,18 @@ interface Trade {
   bars_held: number
   regime_pass: boolean
   skipped?: boolean
-}
-
-interface Stats {
-  trades: number
-  win_rate: number
-  avg_winner: number
-  avg_loser: number
-  ev: number
-  profit_factor: number
-  max_dd: number
-  avg_bars: number
+  entry_weight: number | null
+  exit_weight: number | null
+  contribution: number | null
 }
 
 interface DailyPosition {
   trade_idx: number
   ticker?: string
   entry_date: string
+  leg_target: string
   alloc: number
+  entry_weight: number
   weight: number
   daily_return: number
   contribution: number
@@ -52,33 +83,42 @@ interface DailySnapshot {
   positions: DailyPosition[]
 }
 
-interface SkippedEntry {
-  ticker?: string
-  entry_date: string
-  entry_price: number
-  reason: string
-  exposure_at_skip: number
-  equity_at_skip: number
-}
-
-interface BacktestResult {
+interface LegResult {
+  target: string
+  target_type: string
+  entry_signal: string
+  allocation_pct: number
+  direction: string
   trades: Trade[]
   trade_paths: number[][]
-  equity_curve: { dates: string[]; filtered: number[]; unfiltered: number[]; buy_hold: number[] }
-  stats: { filtered: Stats; unfiltered: Stats }
+  stats: Stats
+}
+
+interface MultiBacktestResult {
+  legs: LegResult[]
+  combined: {
+    equity_curve: {
+      dates: string[]
+      combined: number[]
+      per_leg: number[][]
+      buy_hold: number[]
+    }
+    stats: Stats
+  }
   date_range: { min: string; max: string }
-  blew_up?: { date: string; trade_index: number; equity: string }
+  skipped_entries?: { ticker?: string; entry_date: string; leg_index: number; leg_target: string }[]
   daily_positions?: Record<number, DailySnapshot>
-  skipped_entries?: SkippedEntry[]
+  leg_correlations?: Record<string, Record<string, number>>
 }
 
 interface BacktestPanelProps {
-  target: string
-  targetType: 'basket' | 'ticker'
   apiBase: string
-  availableBaskets: string[]
+  target?: string
+  targetType?: 'basket' | 'ticker'
   exportTrigger?: number
 }
+
+/* ── Constants ─────────────────────────────────────────────────────── */
 
 const ENTRY_SIGNALS = ['Up_Rot', 'Down_Rot', 'Breakout', 'Breakdown', 'BTFD', 'STFR', 'Buy_Hold']
 const EXIT_MAP: Record<string, string> = {
@@ -87,20 +127,11 @@ const EXIT_MAP: Record<string, string> = {
   BTFD: 'Breakdown', STFR: 'Breakout',
   Buy_Hold: 'End of Period',
 }
-
-const PCT_METRICS = ['Uptrend_Pct', 'Breakout_Pct', 'Correlation_Pct', 'RV_EMA']
+const LEG_COLORS = ['#1565C0', '#C2185B', '#2E7D32', '#E65100', '#6A1B9A', '#00838F']
+const PCT_METRICS = ['Uptrend_Pct', 'Breakout_Pct', 'Correlation_Pct', 'RV_EMA', 'Breakdown_Pct', 'Downtrend_Pct']
 const BOOL_METRICS = ['Is_Breakout_Sequence', 'Trend', 'BTFD_Triggered', 'STFR_Triggered']
 const POS_PRESETS = [1, 5, 10, 25, 50, 100]
 const LEV_PRESETS = [100, 110, 125, 150, 200, 250]
-
-type TradeSortCol = 'ticker' | 'entry_date' | 'exit_date' | 'entry_price' | 'exit_price' | 'change' | 'mfe' | 'mae' | 'bars_held' | 'regime_pass' | 'skipped'
-type ResultTab = 'equity' | 'trades' | 'distribution' | 'chart' | 'path' | 'stats'
-type HistMetric = 'change' | 'mfe' | 'mae'
-
-const LIGHT_PINK = 'rgb(255, 183, 226)'
-const LIGHT_BLUE = 'rgb(179, 222, 255)'
-
-const LONG_SIGNALS = new Set(['Up_Rot', 'Breakout', 'BTFD', 'Buy_Hold'])
 
 const BENCHMARK_COLORS: Record<string, string> = {
   Breakout: '#1565C0',
@@ -111,71 +142,54 @@ const BENCHMARK_COLORS: Record<string, string> = {
   STFR: '#F8BBD0',
 }
 
-const parseTime = (dateStr: string) => {
-  const s = dateStr.includes('T') ? dateStr : dateStr + 'T00:00:00'
-  const d = new Date(s.endsWith('Z') ? s : s + 'Z')
-  return Math.floor(d.getTime() / 1000) as any
-}
+const LIGHT_PINK = 'rgb(255, 183, 226)'
+const LIGHT_BLUE = 'rgb(179, 222, 255)'
 
+type HistMetric = 'change' | 'mfe' | 'mae'
 const HIST_COLORS: Record<HistMetric, { fill: string; stroke: string; label: string }> = {
   mae:    { fill: LIGHT_PINK,           stroke: LIGHT_PINK,            label: 'MAE' },
   change: { fill: 'rgb(200, 210, 220)', stroke: 'rgb(200, 210, 220)', label: 'Change' },
   mfe:    { fill: LIGHT_BLUE,           stroke: LIGHT_BLUE,            label: 'MFE' },
 }
 
-function pctFmt(v: number | null): string {
-  if (v === null) return '--'
-  return (v * 100).toFixed(2) + '%'
-}
-
-function dollarFmt(v: number): string {
+const pctFmt = (v: number | null) => v == null ? '--' : (v * 100).toFixed(2) + '%'
+const dollarFmt = (v: number) => {
   const abs = Math.abs(v)
   const sign = v < 0 ? '-' : ''
-  if (abs >= 1_000_000) return sign + '$' + (abs / 1_000_000).toFixed(2) + 'M'
-  if (abs >= 1_000) return sign + '$' + (abs / 1_000).toFixed(0) + 'K'
+  if (abs >= 1e6) return sign + '$' + (abs / 1e6).toFixed(1) + 'M'
+  if (abs >= 1e3) return sign + '$' + (abs / 1e3).toFixed(1) + 'K'
   return sign + '$' + abs.toFixed(0)
 }
 
-export function BacktestPanel({ target, targetType, apiBase, availableBaskets, exportTrigger }: BacktestPanelProps) {
-  // Chart overlay toggles (local to backtest)
-  const [showPivots, setShowPivots] = useState(true)
-  const [showTargets, setShowTargets] = useState(true)
-  const [showVolume, setShowVolume] = useState(false)
-  const [showBreadth, setShowBreadth] = useState(false)
-  const [showBreakout, setShowBreakout] = useState(false)
-  const [showCorrelation, setShowCorrelation] = useState(false)
-  const [showRV, setShowRV] = useState(true)
+function defaultLeg(): LegConfig {
+  return { target: '', targetType: 'basket_tickers', entrySignal: 'Breakout', allocationPct: 100, positionSize: 25, filters: [] }
+}
 
-  // Multi-leg mode
-  const [multiMode, setMultiMode] = useState(false)
+type ResultTab = 'equity' | 'stats' | 'distribution' | 'path' | 'trades'
 
-  // Basket selector for single-leg mode (allows testing any basket regardless of sidebar selection)
-  const [allBaskets, setAllBaskets] = useState<Record<string, string[]>>({})
+/* ── Component ─────────────────────────────────────────────────────── */
+
+export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: BacktestPanelProps) {
+  // ── Basket & ticker lists ──
+  const [baskets, setBaskets] = useState<Record<string, string[]>>({})
   const [allTickers, setAllTickers] = useState<string[]>([])
-  const [selectedTarget, setSelectedTarget] = useState(target)
-  const [selectedTargetType, setSelectedTargetType] = useState(targetType)
-
-  // Searchable target picker state
-  const [targetSearchOpen, setTargetSearchOpen] = useState(false)
-  const [targetSearchQuery, setTargetSearchQuery] = useState('')
-  const [targetSearchHighlight, setTargetSearchHighlight] = useState(0)
-  const [targetSearchFilter, setTargetSearchFilter] = useState<'all' | 'Themes' | 'Sectors' | 'Industries' | 'Tickers'>('all')
-  const targetSearchRef = useRef<HTMLInputElement>(null)
-
   useEffect(() => {
-    fetch(`${apiBase}/baskets`).then(r => r.json()).then(setAllBaskets).catch(() => {})
+    fetch(`${apiBase}/baskets`).then(r => r.json()).then(setBaskets).catch(() => {})
     fetch(`${apiBase}/tickers`).then(r => r.json()).then(setAllTickers).catch(() => {})
   }, [apiBase])
 
-  // Sync with props when they change (user navigated to different item)
-  useEffect(() => { setSelectedTarget(target); setSelectedTargetType(targetType) }, [target, targetType])
+  // ── Per-leg search state ──
+  const [legSearchOpen, setLegSearchOpen] = useState<number | null>(null)
+  const [legSearchQuery, setLegSearchQuery] = useState('')
+  const [legSearchHighlight, setLegSearchHighlight] = useState(0)
+  const [legSearchFilter, setLegSearchFilter] = useState<'all' | 'Themes' | 'Sectors' | 'Industries' | 'Tickers'>('all')
+  const legSearchRef = useRef<HTMLInputElement>(null)
 
-  // Searchable target results — show all when no query, filter when typing
-  const targetSearchResults = useMemo(() => {
+  const legSearchResults = useMemo(() => {
     const results: { name: string; category: string; displayName: string }[] = []
-    const q = targetSearchQuery.toLowerCase().trim()
+    const q = legSearchQuery.toLowerCase().trim()
     const add = (items: string[], category: string) => {
-      if (targetSearchFilter !== 'all' && targetSearchFilter !== category) return
+      if (legSearchFilter !== 'all' && legSearchFilter !== category) return
       for (const item of items) {
         const display = item.replace(/_/g, ' ')
         if (!q || item.toLowerCase().includes(q) || display.toLowerCase().includes(q)) {
@@ -183,110 +197,245 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
         }
       }
     }
-    add(allBaskets.Themes || [], 'Themes')
-    add(allBaskets.Sectors || [], 'Sectors')
-    add(allBaskets.Industries || [], 'Industries')
+    add(baskets.Themes || [], 'Themes')
+    add(baskets.Sectors || [], 'Sectors')
+    add(baskets.Industries || [], 'Industries')
     add(allTickers, 'Tickers')
     return q ? results.slice(0, 25) : results
-  }, [targetSearchQuery, targetSearchFilter, allBaskets, allTickers])
+  }, [legSearchQuery, legSearchFilter, baskets, allTickers])
 
-  const handleTargetSearchSelect = useCallback((r: { name: string; category: string }) => {
-    setTargetSearchOpen(false)
-    setTargetSearchQuery('')
-    setTargetSearchHighlight(0)
-    setSelectedTarget(r.name)
-    setSelectedTargetType(r.category === 'Tickers' ? 'ticker' : 'basket')
+  // ── Legs config ──
+  // Initialize with target from props if provided
+  const [legs, setLegs] = useState<LegConfig[]>(() => {
+    const initial = defaultLeg()
+    if (target) {
+      initial.target = target
+      initial.targetType = targetType === 'ticker' ? 'ticker' : 'basket_tickers'
+    }
+    return [initial]
+  })
+
+  // Sync first leg target when props change
+  useEffect(() => {
+    if (target) {
+      setLegs(prev => {
+        if (prev.length === 1 && prev[0].target === '') {
+          return [{ ...prev[0], target, targetType: targetType === 'ticker' ? 'ticker' : 'basket_tickers' as const }]
+        }
+        return prev
+      })
+    }
+  }, [target, targetType])
+
+  const isSingleLeg = legs.length === 1
+  const isMultiLeg = legs.length > 1
+
+  const updateLeg = (i: number, patch: Partial<LegConfig>) =>
+    setLegs(prev => prev.map((l, idx) => idx === i ? { ...l, ...patch } : l))
+
+  const handleLegSearchSelect = useCallback((legIdx: number, r: { name: string; category: string }) => {
+    setLegSearchOpen(null)
+    setLegSearchQuery('')
+    setLegSearchHighlight(0)
+    const isTicker = r.category === 'Tickers'
+    setLegs(prev => prev.map((l, idx) => idx === legIdx ? { ...l, target: r.name, targetType: isTicker ? 'ticker' : 'basket_tickers' as const } : l))
   }, [])
 
-  const handleTargetSearchKeyDown = useCallback((e: React.KeyboardEvent) => {
-    if (e.key === 'Escape') { setTargetSearchOpen(false); setTargetSearchQuery(''); targetSearchRef.current?.blur() }
-    else if (e.key === 'ArrowDown') { e.preventDefault(); setTargetSearchHighlight(prev => Math.min(prev + 1, targetSearchResults.length - 1)) }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); setTargetSearchHighlight(prev => Math.max(prev - 1, 0)) }
-    else if (e.key === 'Enter' && targetSearchResults.length > 0) { handleTargetSearchSelect(targetSearchResults[targetSearchHighlight]) }
-  }, [targetSearchResults, targetSearchHighlight, handleTargetSearchSelect])
+  const handleLegSearchKeyDown = useCallback((legIdx: number, e: React.KeyboardEvent) => {
+    if (e.key === 'Escape') { setLegSearchOpen(null); setLegSearchQuery(''); legSearchRef.current?.blur() }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); setLegSearchHighlight(prev => Math.min(prev + 1, legSearchResults.length - 1)) }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); setLegSearchHighlight(prev => Math.max(prev - 1, 0)) }
+    else if (e.key === 'Enter' && legSearchResults.length > 0) { handleLegSearchSelect(legIdx, legSearchResults[legSearchHighlight]) }
+  }, [legSearchResults, legSearchHighlight, handleLegSearchSelect])
 
-  // Config state
-  const [entrySignal, setEntrySignal] = useState('Breakout')
-  const [filters, setFilters] = useState<BacktestFilter[]>([])
+  const addLeg = () => {
+    if (legs.length >= 6) return
+    if (isSingleLeg) {
+      // Going from 1 to 2: set allocations to 50/50
+      setLegs(prev => [{ ...prev[0], allocationPct: 50 }, { ...defaultLeg(), allocationPct: 50 }])
+    } else {
+      const pct = Math.floor(100 / (legs.length + 1))
+      setLegs(prev => [...prev.map(l => ({ ...l, allocationPct: pct })), { ...defaultLeg(), allocationPct: 100 - pct * legs.length }])
+    }
+  }
+
+  const removeLeg = (i: number) => {
+    if (legs.length <= 1) return
+    setLegs(prev => {
+      const next = prev.filter((_, idx) => idx !== i)
+      if (next.length === 1) {
+        // Going back to single leg: allocation is implicitly 100%
+        return [{ ...next[0], allocationPct: 100 }]
+      }
+      const pct = Math.floor(100 / next.length)
+      return next.map((l, idx) => ({ ...l, allocationPct: idx < next.length - 1 ? pct : 100 - pct * (next.length - 1) }))
+    })
+  }
+
+  // ── Fetch date range from first leg with a target ──
+  const [dataRange, setDataRange] = useState<{ min: string; max: string } | null>(null)
+  useEffect(() => {
+    const firstWithTarget = legs.find(l => l.target)
+    if (!firstWithTarget) return
+    const { target: t, targetType: tt } = firstWithTarget
+    fetch(`${apiBase}/date-range/${tt}/${encodeURIComponent(t)}`)
+      .then(r => r.json())
+      .then((d: { min: string; max: string }) => {
+        setDataRange(d)
+        setStartDate(prev => prev || d.min)
+        setEndDate(prev => prev || d.max)
+      })
+      .catch(() => {})
+  }, [legs.map(l => l.target + l.targetType).join(','), apiBase])
+
+  // ── Shared settings ──
+  const [maxLeverage, setMaxLeverage] = useState(250)
   const [startDate, setStartDate] = useState('')
   const [endDate, setEndDate] = useState('')
-  const [dataRange, setDataRange] = useState<{ min: string; max: string } | null>(null)
-  const [initialEquity, setInitialEquity] = useState(100000)
-  const [positionSize, setPositionSize] = useState(100)
-  const [maxLeverage, setMaxLeverage] = useState(250)
-  const [useConstituents, setUseConstituents] = useState(false)
 
-  // Results state
-  const [result, setResult] = useState<BacktestResult | null>(null)
+  // ── Results ──
+  const [result, setResult] = useState<MultiBacktestResult | null>(null)
   const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState('')
   const [showResults, setShowResults] = useState(false)
-
-  // Results sub-state
   const [resultTab, setResultTab] = useState<ResultTab>('equity')
-  const [sortCol, setSortCol] = useState<TradeSortCol>('entry_date')
-  const [sortAsc, setSortAsc] = useState(true)
-  const [histVisible, setHistVisible] = useState<Set<HistMetric>>(new Set(['change', 'mfe', 'mae']))
-  const [hoveredCurve, setHoveredCurve] = useState<HistMetric | null>(null)
-  const [showFiltered, setShowFiltered] = useState(true)
+
+  // ── Log scale toggles ──
+  const [eqLogScale, setEqLogScale] = useState(false)
+  const [pathLogScale, setPathLogScale] = useState(false)
+
+  // ── Equity chart state ──
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const containerRef = useRef<HTMLDivElement>(null)
+  const pathCanvasRef = useRef<HTMLCanvasElement>(null)
+  const pathContainerRef = useRef<HTMLDivElement>(null)
+  const [dims, setDims] = useState({ w: 800, h: 400 })
+  const [pathDims, setPathDims] = useState({ w: 800, h: 400 })
+  const [hoveredPath, setHoveredPath] = useState<number | null>(null)
+  const [pathSortCol, setPathSortCol] = useState<'leg' | 'ticker' | 'date' | 'change'>('change')
+  const [pathSortAsc, setPathSortAsc] = useState(false)
   const [showBuyHold, setShowBuyHold] = useState(false)
+  const [visibleLegs, setVisibleLegs] = useState<Set<number>>(new Set())
+  const [showConstituents, setShowConstituents] = useState(false)
+
+  // ── Benchmark state (auto-calculated for single-leg only) ──
   const [benchmarks, setBenchmarks] = useState<Record<string, number[]>>({})
   const [showBenchmark, setShowBenchmark] = useState<Record<string, boolean>>({})
   const benchmarkGenRef = useRef(0)
 
-  // Equity curve view range (index-based, ref for synchronous mutation in mouse handlers)
-  const eqViewRef = useRef({ start: 0, end: 0 })
-  const [eqViewVersion, setEqViewVersion] = useState(0)
-  const eqDragRef = useRef({ dragging: false, lastX: 0 })
-
-  // Canvas refs — equity curve
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-  const containerRef = useRef<HTMLDivElement>(null)
-  const [dims, setDims] = useState({ w: 800, h: 400 })
-
-  // Canvas refs — histogram
+  // ── Distribution tab state ──
   const histCanvasRef = useRef<HTMLCanvasElement>(null)
   const histContainerRef = useRef<HTMLDivElement>(null)
   const [histDims, setHistDims] = useState({ w: 800, h: 400 })
-  // Chart tab refs
-  const priceChartRef = useRef<HTMLDivElement>(null)
-  const chartInstanceRef = useRef<IChartApi | null>(null)
-  const btChartsRef = useRef<Record<string, IChartApi | null>>({})
-  const btSeriesRef = useRef<Record<string, any>>({})
-  const volChartRef = useRef<HTMLDivElement>(null)
-  const breadthChartRef = useRef<HTMLDivElement>(null)
-  const breakoutChartRef = useRef<HTMLDivElement>(null)
-  const corrChartRef = useRef<HTMLDivElement>(null)
-  const rvChartRef = useRef<HTMLDivElement>(null)
-  const btSavedRangeRef = useRef<{ from: number; to: number } | null>(null)
-  const [tradeIndex, setTradeIndex] = useState(0)
-
-  // Path tab refs
-  const pathCanvasRef = useRef<HTMLCanvasElement>(null)
-  const pathContainerRef = useRef<HTMLDivElement>(null)
-  const [pathDims, setPathDims] = useState({ w: 800, h: 400 })
-  const [hoveredPath, setHoveredPath] = useState<number | null>(null)
-  const [pathSortCol, setPathSortCol] = useState<'ticker' | 'date' | 'change'>('change')
-  const [pathSortAsc, setPathSortAsc] = useState(false)
-
-  // Constituents overlay state
-  const [showConstituents, setShowConstituents] = useState(false)
-  const [eqHoverIdx, setEqHoverIdx] = useState<number | null>(null)
-  const [eqPinnedIdx, setEqPinnedIdx] = useState<number | null>(null)
-  const eqScaleRef = useRef({ padLeft: 20, plotW: 0, n: 0, startIdx: 0 })
-  const eqDidDragRef = useRef(false)
-
-  // Chart ticker navigation (for basket_tickers mode)
-  const [chartTickerIdx, setChartTickerIdx] = useState(0)
-
-  // Store computed curve pixel paths + legend rects for mouse hit-testing
+  const [histVisible, setHistVisible] = useState<Set<HistMetric>>(new Set(['change', 'mfe', 'mae']))
+  const [hoveredCurve, setHoveredCurve] = useState<HistMetric | null>(null)
+  const [distLegFilter, setDistLegFilter] = useState(-1) // -1 = all
   const histHitRef = useRef<{
     curves: { metric: HistMetric; pxPoints: { x: number; y: number }[] }[]
     legendRows: { metric: HistMetric; x: number; y: number; w: number; h: number }[]
-    baseline: number // y pixel of the bottom of the plot area
+    baseline: number
   }>({ curves: [], legendRows: [], baseline: 0 })
 
-  // Export current tab when exportTrigger changes
+  // Zoom/pan refs
+  const eqViewRef = useRef({ start: 0, end: 0 })
+  const [eqViewVersion, setEqViewVersion] = useState(0)
+  const eqDragRef = useRef({ dragging: false, lastX: 0 })
+  const eqDidDragRef = useRef(false)
+  const eqScaleRef = useRef({ padLeft: 20, plotW: 0, n: 0, startIdx: 0 })
+
+  // Constituents hover/pin
+  const [eqHoverIdx, setEqHoverIdx] = useState<number | null>(null)
+  const [eqPinnedIdx, setEqPinnedIdx] = useState<number | null>(null)
+  const [constSortCol, setConstSortCol] = useState<'ticker' | 'leg_target' | 'entry_date' | 'entry_weight' | 'daily_return' | 'weight' | 'contribution'>('weight')
+  const [constSortAsc, setConstSortAsc] = useState(false)
+  const [constMaxH, setConstMaxH] = useState<number | undefined>(undefined)
+
+  // ── Allocation validation ──
+  const totalAlloc = legs.reduce((s, l) => s + l.allocationPct, 0)
+  const allocValid = isSingleLeg || Math.abs(totalAlloc - 100) < 1
+  const allTargetsSet = legs.every(l => l.target !== '')
+
+  // ── Run backtest ──
+  const runBacktest = useCallback(async () => {
+    if (!allocValid || !allTargetsSet) return
+    setLoading(true)
+    setError('')
+    setBenchmarks({})
+    setShowBenchmark({})
+    const gen = ++benchmarkGenRef.current
+    try {
+      const resp = await fetch(`${apiBase}/backtest/multi`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          legs: legs.map(l => ({
+            target: l.target,
+            target_type: l.targetType,
+            entry_signal: l.entrySignal,
+            allocation_pct: isSingleLeg ? 1.0 : l.allocationPct / 100,
+            position_size: l.positionSize / 100,
+            filters: l.filters,
+          })),
+          start_date: startDate || null,
+          end_date: endDate || null,
+          max_leverage: maxLeverage / 100,
+        }),
+      })
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ detail: resp.statusText }))
+        throw new Error(err.detail || resp.statusText)
+      }
+      const data: MultiBacktestResult = await resp.json()
+
+      // Auto-fire benchmarks for single-leg backtests
+      if (isSingleLeg && data.legs.length > 0) {
+        const leg0 = legs[0]
+        const benchSignals = ENTRY_SIGNALS.filter(s => s !== 'Buy_Hold')
+        const benchPromises = benchSignals.map(sig =>
+          fetch(`${apiBase}/backtest/multi`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              legs: [{
+                target: leg0.target,
+                target_type: leg0.targetType,
+                entry_signal: sig,
+                allocation_pct: 1.0,
+                position_size: leg0.positionSize / 100,
+                filters: [],
+              }],
+              start_date: startDate || null,
+              end_date: endDate || null,
+              max_leverage: maxLeverage / 100,
+            }),
+          })
+            .then(r => r.ok ? r.json() : null)
+            .then(d => d ? { sig, curve: d.combined.equity_curve.combined as number[] } : null)
+            .catch(() => null)
+        )
+        Promise.all(benchPromises).then(results => {
+          if (benchmarkGenRef.current !== gen) return
+          const newBench: Record<string, number[]> = {}
+          for (const b of results) {
+            if (b) newBench[b.sig] = b.curve
+          }
+          setBenchmarks(newBench)
+        })
+      }
+
+      setResult(data)
+      setShowResults(true)
+      setResultTab('equity')
+      eqViewRef.current = { start: 0, end: data.combined.equity_curve.dates.length - 1 }
+      setEqViewVersion(v => v + 1)
+    } catch (e: any) {
+      setError(e.message || 'Unknown error')
+    } finally {
+      setLoading(false)
+    }
+  }, [apiBase, legs, startDate, endDate, maxLeverage, allocValid, allTargetsSet, isSingleLeg])
+
+  // ── Export current tab when exportTrigger changes ──
   const prevExportTrigger = useRef(exportTrigger || 0)
   useEffect(() => {
     if (!exportTrigger || exportTrigger === prevExportTrigger.current) {
@@ -294,214 +443,24 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
       return
     }
     prevExportTrigger.current = exportTrigger
-
     const tabLabel = resultTab
-    const filename = `${selectedTarget}_${entrySignal}_${tabLabel}.png`
-
+    const legLabel = legs.map(l => l.target).join('+')
+    const filename = `${legLabel}_${tabLabel}.png`
     const downloadCanvas = (canvas: HTMLCanvasElement) => {
       canvas.toBlob((blob) => {
         if (!blob) return
         const url = URL.createObjectURL(blob)
         const a = document.createElement('a')
-        a.href = url
-        a.download = filename
-        a.click()
+        a.href = url; a.download = filename; a.click()
         URL.revokeObjectURL(url)
       }, 'image/png')
     }
-
-    if (resultTab === 'chart') {
-      const chart = chartInstanceRef.current
-      if (chart) {
-        try { downloadCanvas(chart.takeScreenshot()) } catch {}
-      }
-    } else if (resultTab === 'equity') {
-      if (canvasRef.current) downloadCanvas(canvasRef.current)
-    } else if (resultTab === 'distribution') {
-      if (histCanvasRef.current) downloadCanvas(histCanvasRef.current)
-    } else if (resultTab === 'path') {
-      if (pathCanvasRef.current) downloadCanvas(pathCanvasRef.current)
-    }
+    if (resultTab === 'equity' && canvasRef.current) downloadCanvas(canvasRef.current)
+    else if (resultTab === 'distribution' && histCanvasRef.current) downloadCanvas(histCanvasRef.current)
+    else if (resultTab === 'path' && pathCanvasRef.current) downloadCanvas(pathCanvasRef.current)
   }, [exportTrigger])
 
-  // Fetch available date range when target changes
-  useEffect(() => {
-    let cancelled = false
-    axios.get(`${apiBase}/date-range/${selectedTargetType}/${selectedTarget}`)
-      .then(res => {
-        if (cancelled) return
-        setDataRange(res.data)
-        setStartDate(res.data.min)
-        setEndDate(res.data.max)
-      })
-      .catch(() => {
-        if (!cancelled) setDataRange(null)
-      })
-    return () => { cancelled = true }
-  }, [selectedTarget, selectedTargetType, apiBase])
-
-  const addFilter = () => {
-    setFilters(prev => [...prev, { metric: 'Uptrend_Pct', condition: 'above', value: 50, source: 'self' }])
-  }
-
-  const removeFilter = (i: number) => {
-    setFilters(prev => prev.filter((_, idx) => idx !== i))
-  }
-
-  const updateFilter = (i: number, field: string, val: string | number) => {
-    setFilters(prev => prev.map((f, idx) => {
-      if (idx !== i) return f
-      const updated = { ...f, [field]: val }
-      // Reset condition when switching metric type
-      if (field === 'metric') {
-        if (BOOL_METRICS.includes(val as string)) {
-          updated.condition = 'equals_true'
-          updated.value = ''
-        } else {
-          updated.condition = 'above'
-          updated.value = 50
-        }
-      }
-      return updated
-    }))
-  }
-
-  const runBacktest = async () => {
-    setLoading(true)
-    setError(null)
-    setBenchmarks({})
-    const gen = ++benchmarkGenRef.current
-    try {
-      const effectiveType = (selectedTargetType === 'basket' && useConstituents && entrySignal !== 'Buy_Hold') ? 'basket_tickers' : selectedTargetType
-      const body = {
-        target: selectedTarget,
-        target_type: effectiveType,
-        entry_signal: entrySignal,
-        filters: filters.map(f => ({
-          metric: f.metric,
-          condition: f.condition,
-          value: BOOL_METRICS.includes(f.metric) ? null : Number(f.value),
-          source: f.source,
-        })),
-        start_date: startDate || null,
-        end_date: endDate || null,
-        initial_equity: initialEquity,
-        position_size: positionSize / 100,
-        max_leverage: maxLeverage / 100,
-        include_positions: true,
-      }
-
-      // Fire main + 6 benchmarks all in parallel
-      const benchBody = {
-        target: selectedTarget,
-        target_type: effectiveType,
-        filters: [],
-        start_date: startDate || null,
-        end_date: endDate || null,
-        initial_equity: initialEquity,
-        position_size: positionSize / 100,
-        max_leverage: maxLeverage / 100,
-        benchmarks_only: true,
-      }
-
-      const mainPromise = axios.post(`${apiBase}/backtest`, body)
-
-      const benchSignals = ENTRY_SIGNALS.filter(s => s !== 'Buy_Hold')
-      const benchPromises = benchSignals.map(sig =>
-        axios.post(`${apiBase}/backtest`, { ...benchBody, entry_signal: sig })
-          .then(r => ({ sig, curve: r.data.equity_curve.unfiltered as number[] }))
-          .catch(err => { console.error(`Benchmark ${sig} failed:`, err?.response?.data?.detail || err?.message); return null })
-      )
-
-      // Wait for everything
-      const [res, ...benchResults] = await Promise.all([mainPromise, ...benchPromises])
-
-      if (benchmarkGenRef.current !== gen) return
-      const newBench: Record<string, number[]> = {}
-      for (const b of benchResults) {
-        if (b) newBench[b.sig] = b.curve
-      }
-      setBenchmarks(newBench)
-      setResult(res.data)
-      setShowResults(true)
-      setResultTab('equity')
-    } catch (e: any) {
-      setError(e?.response?.data?.detail || e?.message || 'Backtest failed')
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  // Reset equity view range when new results arrive
-  useEffect(() => {
-    if (result) {
-      eqViewRef.current = { start: 0, end: result.equity_curve.dates.length - 1 }
-      setEqViewVersion(v => v + 1)
-    }
-  }, [result])
-
-  // Equity view range presets
-  const findEqDateIndex = useCallback((targetDate: string, dates: string[]): number => {
-    for (let i = 0; i < dates.length; i++) {
-      if (dates[i] >= targetDate) return i
-    }
-    return dates.length - 1
-  }, [])
-
-  const setEqPreset = useCallback((preset: '1Y' | '3Y' | '5Y' | 'YTD' | 'All') => {
-    if (!result) return
-    const dates = result.equity_curve.dates
-    if (!dates.length) return
-    const endIdx = dates.length - 1
-    let startIdx = 0
-
-    if (preset !== 'All') {
-      const d = new Date(dates[endIdx])
-      if (preset === 'YTD') {
-        startIdx = findEqDateIndex(`${d.getFullYear()}-01-01`, dates)
-      } else {
-        const years = preset === '1Y' ? 1 : preset === '3Y' ? 3 : 5
-        d.setFullYear(d.getFullYear() - years)
-        startIdx = findEqDateIndex(d.toISOString().slice(0, 10), dates)
-      }
-    }
-
-    eqViewRef.current = { start: startIdx, end: endIdx }
-    setEqViewVersion(v => v + 1)
-  }, [result, findEqDateIndex])
-
-  // Sorted trades
-  const sortedTrades = useMemo(() => {
-    if (!result) return []
-    const arr = [...result.trades]
-    arr.sort((a, b) => {
-      const av = a[sortCol], bv = b[sortCol]
-      if (typeof av === 'string' && typeof bv === 'string') return sortAsc ? av.localeCompare(bv) : bv.localeCompare(av)
-      if (typeof av === 'boolean' && typeof bv === 'boolean') return sortAsc ? (av === bv ? 0 : av ? -1 : 1) : (av === bv ? 0 : av ? 1 : -1)
-      const an = av === null || av === undefined ? -Infinity : Number(av)
-      const bn = bv === null || bv === undefined ? -Infinity : Number(bv)
-      return sortAsc ? an - bn : bn - an
-    })
-    return arr
-  }, [result, sortCol, sortAsc])
-
-  // Unique tickers from trades (for multi-ticker chart navigation)
-  const chartTickers = useMemo(() => {
-    if (!result) return []
-    const seen = new Set<string>()
-    const out: string[] = []
-    for (const t of result.trades) {
-      if (t.ticker && !seen.has(t.ticker)) { seen.add(t.ticker); out.push(t.ticker) }
-    }
-    return out.sort()
-  }, [result])
-
-  const handleSort = (col: TradeSortCol) => {
-    if (sortCol === col) setSortAsc(!sortAsc)
-    else { setSortCol(col); setSortAsc(col === 'entry_date' || col === 'exit_date') }
-  }
-
-  // ResizeObserver for equity canvas
+  // ── ResizeObserver for equity canvas container ──
   useEffect(() => {
     const el = containerRef.current
     if (!el) return
@@ -513,19 +472,7 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
     return () => obs.disconnect()
   }, [resultTab, showResults])
 
-  // ResizeObserver for histogram canvas
-  useEffect(() => {
-    const el = histContainerRef.current
-    if (!el) return
-    const obs = new ResizeObserver(entries => {
-      const { width, height } = entries[0].contentRect
-      if (width > 0 && height > 0) setHistDims({ w: width, h: height })
-    })
-    obs.observe(el)
-    return () => obs.disconnect()
-  }, [resultTab, showResults])
-
-  // ResizeObserver for path canvas
+  // ── ResizeObserver for path canvas container ──
   useEffect(() => {
     const el = pathContainerRef.current
     if (!el) return
@@ -537,14 +484,50 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
     return () => obs.disconnect()
   }, [resultTab, showResults])
 
-  // Windowed equity data (sliced to visible range)
+  // ── ResizeObserver for histogram canvas ──
+  useEffect(() => {
+    const el = histContainerRef.current
+    if (!el) return
+    const obs = new ResizeObserver(entries => {
+      const { width, height } = entries[0].contentRect
+      if (width > 0 && height > 0) setHistDims({ w: width, h: height })
+    })
+    obs.observe(el)
+    return () => obs.disconnect()
+  }, [resultTab, showResults])
+
+  // ── Range presets ──
+  const setEqPreset = useCallback((preset: '1Y' | '3Y' | '5Y' | 'YTD' | 'All') => {
+    if (!result) return
+    const dates = result.combined.equity_curve.dates
+    const n = dates.length
+    if (n === 0) return
+    let startIdx = 0
+    const endIdx = n - 1
+    if (preset === 'All') { startIdx = 0 }
+    else {
+      const lastDate = new Date(dates[n - 1] + 'T00:00:00Z')
+      let cutoff: Date
+      if (preset === 'YTD') cutoff = new Date(Date.UTC(lastDate.getUTCFullYear(), 0, 1))
+      else {
+        const years = preset === '1Y' ? 1 : preset === '3Y' ? 3 : 5
+        cutoff = new Date(Date.UTC(lastDate.getUTCFullYear() - years, lastDate.getUTCMonth(), lastDate.getUTCDate()))
+      }
+      const cutStr = cutoff.toISOString().slice(0, 10)
+      startIdx = dates.findIndex(d => d >= cutStr)
+      if (startIdx < 0) startIdx = 0
+    }
+    eqViewRef.current = { start: startIdx, end: endIdx }
+    setEqViewVersion(v => v + 1)
+  }, [result])
+
+  // ── Windowed equity data ──
   const eqWindowed = useMemo(() => {
     if (!result) return null
-    const { dates, filtered, unfiltered, buy_hold } = result.equity_curve
+    const eq = result.combined.equity_curve
     const { start: s, end: e } = eqViewRef.current
-    const cs = Math.max(0, Math.min(s, dates.length - 1))
-    const ce = Math.max(cs, Math.min(e, dates.length - 1))
-    // Rebase all series to 0% return from visible window start
+    const cs = Math.max(0, Math.min(s, eq.dates.length - 1))
+    const ce = Math.max(cs, Math.min(e, eq.dates.length - 1))
     const rebase = (arr: number[]) => {
       const slice = arr.slice(cs, ce + 1)
       const base = slice[0] || 1
@@ -555,20 +538,20 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
       windowedBench[sig] = rebase(curve)
     }
     return {
-      dates: dates.slice(cs, ce + 1),
-      filtered: rebase(filtered),
-      unfiltered: rebase(unfiltered),
-      buy_hold: buy_hold ? rebase(buy_hold) : [],
+      dates: eq.dates.slice(cs, ce + 1),
+      combined: rebase(eq.combined),
+      per_leg: eq.per_leg.map(l => rebase(l)),
+      buy_hold: rebase(eq.buy_hold),
       benchmarks: windowedBench,
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [result, eqViewVersion, benchmarks])
 
-  // Draw equity curve (dollar-based)
+  // ── Draw equity curve ──
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas || !eqWindowed || resultTab !== 'equity') return
-    const { dates, filtered, buy_hold, benchmarks: wBench } = eqWindowed
+    const { dates, combined, per_leg, buy_hold, benchmarks: wBench } = eqWindowed
     if (!dates.length) return
     const ctx = canvas.getContext('2d')
     if (!ctx) return
@@ -581,11 +564,14 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
     const pad = { top: 20, right: 70, bottom: 50, left: 20 }
     const plotW = dims.w - pad.left - pad.right
     const plotH = dims.h - pad.top - pad.bottom
+    const n = dates.length
 
-    // Y range from visible series (percentage returns)
+    // Y range (percentage returns)
     let yMin = 0, yMax = 0
-    if (showFiltered) for (const v of filtered) { yMin = Math.min(yMin, v); yMax = Math.max(yMax, v) }
-    if (showBuyHold && buy_hold) for (const v of buy_hold) { yMin = Math.min(yMin, v); yMax = Math.max(yMax, v) }
+    for (const v of combined) { yMin = Math.min(yMin, v); yMax = Math.max(yMax, v) }
+    if (showBuyHold) for (const v of buy_hold) { yMin = Math.min(yMin, v); yMax = Math.max(yMax, v) }
+    per_leg.forEach((leg, i) => { if (visibleLegs.has(i)) for (const v of leg) { yMin = Math.min(yMin, v); yMax = Math.max(yMax, v) } })
+    // Include benchmarks in y-range
     for (const sig of ENTRY_SIGNALS) {
       if (showBenchmark[sig] && wBench[sig]) {
         for (const v of wBench[sig]) { yMin = Math.min(yMin, v); yMax = Math.max(yMax, v) }
@@ -594,21 +580,26 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
     const yPad = (yMax - yMin) * 0.1 || 0.05
     yMin -= yPad; yMax += yPad
 
-    const n = dates.length
     eqScaleRef.current = { padLeft: pad.left, plotW, n, startIdx: eqViewRef.current.start }
     const xScale = (i: number) => pad.left + (n > 1 ? (i / (n - 1)) * plotW : plotW / 2)
-    const yScale = (v: number) => pad.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH
+    const logT = (v: number) => Math.log(Math.max(1 + v, 1e-8))
+    const logYMin = eqLogScale ? logT(yMin) : 0
+    const logYMax = eqLogScale ? logT(yMax) : 0
+    const yScale = eqLogScale
+      ? (v: number) => pad.top + plotH - ((logT(v) - logYMin) / (logYMax - logYMin)) * plotH
+      : (v: number) => pad.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH
 
     ctx.clearRect(0, 0, dims.w, dims.h)
     ctx.fillStyle = '#fdf6e3'
     ctx.fillRect(0, 0, dims.w, dims.h)
 
     // Grid
-    ctx.strokeStyle = '#eee8d5'
-    ctx.lineWidth = 1
+    ctx.strokeStyle = '#eee8d5'; ctx.lineWidth = 1
     const nTicks = 6
     for (let i = 0; i <= nTicks; i++) {
-      const v = yMin + (yMax - yMin) * (i / nTicks)
+      const v = eqLogScale
+        ? Math.exp(logYMin + (logYMax - logYMin) * (i / nTicks)) - 1
+        : yMin + (yMax - yMin) * (i / nTicks)
       const y = yScale(v)
       ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(dims.w - pad.right, y); ctx.stroke()
       ctx.fillStyle = '#657b83'; ctx.font = '10px monospace'; ctx.textAlign = 'left'
@@ -621,33 +612,29 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
     ctx.beginPath(); ctx.moveTo(pad.left, beY); ctx.lineTo(dims.w - pad.right, beY); ctx.stroke()
     ctx.setLineDash([])
 
-    // X axis labels
+    // X labels
     const labelInterval = Math.max(1, Math.floor(n / 8))
     ctx.fillStyle = '#657b83'; ctx.font = '10px monospace'; ctx.textAlign = 'center'
     for (let i = 0; i < n; i += labelInterval) {
       ctx.fillText(dates[i].slice(0, 7), xScale(i), dims.h - pad.bottom + 15)
     }
 
-    // Helper: draw a solid line (uses data's own length for x-scaling)
+    // Draw helper
     const drawLine = (data: number[], color: string, lw: number) => {
+      if (data.length === 0) return
       const len = data.length
-      if (len === 0) return
       const xS = (i: number) => pad.left + (len > 1 ? (i / (len - 1)) * plotW : plotW / 2)
-      ctx.strokeStyle = color
-      ctx.lineWidth = lw
+      ctx.strokeStyle = color; ctx.lineWidth = lw
       ctx.beginPath()
       for (let i = 0; i < len; i++) {
         const x = xS(i), y = yScale(data[i])
-        if (i === 0) ctx.moveTo(x, y)
-        else ctx.lineTo(x, y)
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)
       }
       ctx.stroke()
     }
 
-    // Draw order (back to front): Buy & Hold → 6 benchmarks → Filtered
-    if (showBuyHold && buy_hold && buy_hold.length > 0) {
-      drawLine(buy_hold, '#93a1a1', 1.5)
-    }
+    // Draw order: buy-hold -> benchmarks -> per-leg -> combined
+    if (showBuyHold && buy_hold.length > 0) drawLine(buy_hold, '#93a1a1', 1.5)
 
     for (const sig of ENTRY_SIGNALS) {
       if (showBenchmark[sig] && wBench[sig] && wBench[sig].length > 0) {
@@ -655,32 +642,34 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
       }
     }
 
-    if (showFiltered) {
-      drawLine(filtered, '#8BC34A', 2.5)
+    if (isMultiLeg) {
+      per_leg.forEach((vals, i) => { if (visibleLegs.has(i)) drawLine(vals, LEG_COLORS[i % LEG_COLORS.length], 1.5) })
     }
+    drawLine(combined, '#8BC34A', 2.5)
 
-    // Legend (values are already percentage returns)
+    // Legend
     const legendItems: { label: string; value: string; color: string }[] = []
-    if (showFiltered) {
-      legendItems.push({ label: 'Filtered', value: pctFmt(filtered[n - 1]), color: '#8BC34A' })
+    legendItems.push({ label: isSingleLeg ? 'Equity' : 'Combined', value: pctFmt(combined[n - 1]), color: '#8BC34A' })
+    if (result && isMultiLeg) {
+      result.legs.forEach((leg, i) => {
+        if (visibleLegs.has(i))
+          legendItems.push({ label: `${leg.target} ${leg.entry_signal}`, value: pctFmt(per_leg[i][n - 1]), color: LEG_COLORS[i % LEG_COLORS.length] })
+      })
     }
     for (const sig of ENTRY_SIGNALS) {
       if (showBenchmark[sig] && wBench[sig] && wBench[sig].length > 0) {
         legendItems.push({ label: sig.replace('_', ' '), value: pctFmt(wBench[sig][wBench[sig].length - 1]), color: BENCHMARK_COLORS[sig] })
       }
     }
-    if (showBuyHold && buy_hold && buy_hold.length > 0) {
-      legendItems.push({ label: 'Buy&Hold', value: pctFmt(buy_hold[buy_hold.length - 1]), color: '#93a1a1' })
+    if (showBuyHold && buy_hold.length > 0) {
+      legendItems.push({ label: 'Buy&Hold', value: pctFmt(buy_hold[n - 1]), color: '#93a1a1' })
     }
 
     if (legendItems.length > 0) {
-      const lx = pad.left + 10, ly = pad.top + 10
-      const rowH = 16
+      const lx = pad.left + 10, ly = pad.top + 10, rowH = 16
       const boxH = legendItems.length * rowH + 2
-      ctx.fillStyle = '#fdf6e3'
-      ctx.fillRect(lx - 4, ly - 10, 250, boxH)
-      ctx.strokeStyle = '#93a1a1'; ctx.lineWidth = 1
-      ctx.strokeRect(lx - 4, ly - 10, 250, boxH)
+      ctx.fillStyle = '#fdf6e3'; ctx.fillRect(lx - 4, ly - 10, 250, boxH)
+      ctx.strokeStyle = '#93a1a1'; ctx.lineWidth = 1; ctx.strokeRect(lx - 4, ly - 10, 250, boxH)
       legendItems.forEach((item, idx) => {
         const iy = ly + idx * rowH
         ctx.strokeStyle = item.color; ctx.lineWidth = 1.5
@@ -689,14 +678,124 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
         ctx.fillText(`${item.label} ${item.value}`, lx + 24, iy + 3)
       })
     }
+  }, [eqWindowed, resultTab, dims, showBuyHold, visibleLegs, result, eqLogScale, showBenchmark, isMultiLeg, isSingleLeg])
 
-  }, [eqWindowed, resultTab, dims, showFiltered, showBuyHold, showBenchmark])
+  // ── Combined trade paths (all legs merged with leg index) ──
+  const allPaths = useMemo(() => {
+    if (!result) return []
+    const items: { path: number[]; trade: Trade; legIdx: number; legTarget: string; ret: number }[] = []
+    result.legs.forEach((leg, li) => {
+      leg.trades.forEach((t, ti) => {
+        const p = leg.trade_paths?.[ti] ?? []
+        items.push({ path: p, trade: t, legIdx: li, legTarget: leg.target, ret: p.length > 0 ? p[p.length - 1] : 0 })
+      })
+    })
+    return items
+  }, [result])
 
-  // Equity curve: wheel zoom + click-drag pan
+  // ── Draw trade paths ──
+  useEffect(() => {
+    const canvas = pathCanvasRef.current
+    if (!canvas || !result || resultTab !== 'path') return
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+
+    const dpr = window.devicePixelRatio || 1
+    canvas.width = pathDims.w * dpr
+    canvas.height = pathDims.h * dpr
+    ctx.scale(dpr, dpr)
+    ctx.clearRect(0, 0, pathDims.w, pathDims.h)
+    ctx.fillStyle = '#fdf6e3'
+    ctx.fillRect(0, 0, pathDims.w, pathDims.h)
+
+    if (allPaths.length === 0) {
+      ctx.fillStyle = '#6c757d'; ctx.font = '14px monospace'; ctx.textAlign = 'center'
+      ctx.fillText('No trade paths', pathDims.w / 2, pathDims.h / 2)
+      return
+    }
+
+    let maxBars = 0
+    let yMin = 0, yMax = 0
+    for (const { path } of allPaths) {
+      maxBars = Math.max(maxBars, path.length)
+      for (const v of path) { yMin = Math.min(yMin, v); yMax = Math.max(yMax, v) }
+    }
+    if (maxBars < 2) return
+    const yPad = (yMax - yMin) * 0.1 || 0.05
+    yMin -= yPad; yMax += yPad
+
+    const pad = { top: 20, right: 60, bottom: 50, left: 20 }
+    const plotW = pathDims.w - pad.left - pad.right
+    const plotH = pathDims.h - pad.top - pad.bottom
+    const xScale = (i: number) => pad.left + (i / (maxBars - 1)) * plotW
+    const logT = (v: number) => Math.log(Math.max(1 + v, 1e-8))
+    const logYMin = pathLogScale ? logT(yMin) : 0
+    const logYMax = pathLogScale ? logT(yMax) : 0
+    const yScale = pathLogScale
+      ? (v: number) => pad.top + plotH - ((logT(v) - logYMin) / (logYMax - logYMin)) * plotH
+      : (v: number) => pad.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH
+
+    // Grid
+    ctx.strokeStyle = '#e9ecef'; ctx.lineWidth = 1
+    const nTicks = 6
+    for (let i = 0; i <= nTicks; i++) {
+      const v = pathLogScale
+        ? Math.exp(logYMin + (logYMax - logYMin) * (i / nTicks)) - 1
+        : yMin + (yMax - yMin) * (i / nTicks)
+      const y = yScale(v)
+      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pathDims.w - pad.right, y); ctx.stroke()
+      ctx.fillStyle = '#6c757d'; ctx.font = '10px monospace'; ctx.textAlign = 'left'
+      ctx.fillText((v * 100).toFixed(1) + '%', pathDims.w - pad.right + 5, y + 3)
+    }
+
+    // Zero line
+    ctx.strokeStyle = '#adb5bd'; ctx.lineWidth = 1; ctx.setLineDash([4, 4])
+    ctx.beginPath(); ctx.moveTo(pad.left, yScale(0)); ctx.lineTo(pathDims.w - pad.right, yScale(0)); ctx.stroke()
+    ctx.setLineDash([])
+
+    // X labels
+    const labelInterval = Math.max(1, Math.floor(maxBars / 10))
+    ctx.fillStyle = '#6c757d'; ctx.font = '10px monospace'; ctx.textAlign = 'center'
+    for (let i = 0; i < maxBars; i += labelInterval) ctx.fillText(String(i), xScale(i), pathDims.h - pad.bottom + 15)
+
+    // Rank & color
+    const ranked = allPaths.map((d, gi) => ({ ...d, gi })).filter(d => d.path.length >= 2).sort((a, b) => b.ret - a.ret)
+    const total = ranked.length
+    const rankColor = (rank: number) => {
+      if (total <= 1) return 'rgb(50, 50, 255)'
+      const t = rank / (total - 1)
+      if (t <= 0.5) { const s = t * 2; return `rgb(${Math.round(50 + 102 * s)}, 50, ${Math.round(255 - 53 * s)})` }
+      const s = (t - 0.5) * 2; return `rgb(${Math.round(152 + 103 * s)}, 50, ${Math.round(202 - 52 * s)})`
+    }
+
+    for (let ri = 0; ri < total; ri++) {
+      const { path, gi } = ranked[ri]
+      if (gi === hoveredPath) continue
+      const isOther = hoveredPath !== null
+      ctx.strokeStyle = isOther ? '#dee2e6' : rankColor(ri)
+      ctx.lineWidth = 1.2; ctx.globalAlpha = isOther ? 0.3 : 1
+      ctx.beginPath()
+      for (let i = 0; i < path.length; i++) { const x = xScale(i), y = yScale(path[i]); i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y) }
+      ctx.stroke()
+    }
+    if (hoveredPath !== null) {
+      const hovRank = ranked.findIndex(d => d.gi === hoveredPath)
+      const entry = ranked[hovRank]
+      if (entry && entry.path.length >= 2) {
+        ctx.strokeStyle = rankColor(hovRank); ctx.lineWidth = 2.5; ctx.globalAlpha = 1
+        ctx.beginPath()
+        for (let i = 0; i < entry.path.length; i++) { const x = xScale(i), y = yScale(entry.path[i]); i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y) }
+        ctx.stroke()
+      }
+    }
+    ctx.globalAlpha = 1
+  }, [allPaths, resultTab, pathDims, hoveredPath, result, pathLogScale])
+
+  // ── Wheel zoom + drag pan ──
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas || !result || resultTab !== 'equity') return
-    const n = result.equity_curve.dates.length
+    const n = result.combined.equity_curve.dates.length
     if (n < 2) return
 
     const handleWheel = (e: WheelEvent) => {
@@ -710,12 +809,10 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
       const delta = newRange - range
       const leftAdj = Math.round(delta * frac)
       const rightAdj = delta - leftAdj
-      let ns = start - leftAdj
-      let ne = end + rightAdj
+      let ns = start - leftAdj, ne = end + rightAdj
       if (ns < 0) { ne -= ns; ns = 0 }
       if (ne >= n) { ns -= (ne - n + 1); ne = n - 1 }
-      ns = Math.max(0, ns)
-      ne = Math.min(n - 1, ne)
+      ns = Math.max(0, ns); ne = Math.min(n - 1, ne)
       eqViewRef.current = { start: ns, end: ne }
       setEqViewVersion(v => v + 1)
     }
@@ -725,7 +822,6 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
       eqDragRef.current = { dragging: true, lastX: e.clientX }
       canvas.style.cursor = 'grabbing'
     }
-
     const handleMouseMove = (e: MouseEvent) => {
       if (!eqDragRef.current.dragging) return
       eqDidDragRef.current = true
@@ -735,22 +831,16 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
       const range = end - start
       const indexDelta = Math.round((dx / rect.width) * range)
       if (indexDelta === 0) return
-      let ns = start - indexDelta
-      let ne = end - indexDelta
+      let ns = start - indexDelta, ne = end - indexDelta
       if (ns < 0) { ne -= ns; ns = 0 }
       if (ne >= n) { ns -= (ne - n + 1); ne = n - 1 }
-      ns = Math.max(0, ns)
-      ne = Math.min(n - 1, ne)
+      ns = Math.max(0, ns); ne = Math.min(n - 1, ne)
       eqViewRef.current = { start: ns, end: ne }
       eqDragRef.current.lastX = e.clientX
       setEqViewVersion(v => v + 1)
     }
-
     const handleMouseUp = () => {
-      if (eqDragRef.current.dragging) {
-        eqDragRef.current.dragging = false
-        canvas.style.cursor = 'grab'
-      }
+      if (eqDragRef.current.dragging) { eqDragRef.current.dragging = false; canvas.style.cursor = 'grab' }
     }
 
     canvas.addEventListener('wheel', handleWheel, { passive: false })
@@ -765,7 +855,17 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
     }
   }, [result, resultTab])
 
-  // Constituents overlay: hover, pin, escape handlers
+  // Track chart container height for constituents overlay max-height
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const ro = new ResizeObserver(() => setConstMaxH(el.clientHeight - 8))
+    ro.observe(el)
+    setConstMaxH(el.clientHeight - 8)
+    return () => ro.disconnect()
+  }, [])
+
+  // ── Constituents overlay: hover, pin, escape ──
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas || !result || resultTab !== 'equity' || !showConstituents) return
@@ -779,7 +879,6 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
       const idx = Math.round(((x - padLeft) / plotW) * (n - 1)) + startIdx
       setEqHoverIdx(idx >= startIdx && idx < startIdx + n ? idx : null)
     }
-
     const handleClick = (e: MouseEvent) => {
       if (eqDidDragRef.current) return
       const rect = canvas.getBoundingClientRect()
@@ -787,15 +886,9 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
       const { padLeft, plotW, n, startIdx } = eqScaleRef.current
       if (n <= 1 || plotW <= 0) return
       const idx = Math.round(((x - padLeft) / plotW) * (n - 1)) + startIdx
-      if (idx >= startIdx && idx < startIdx + n) {
-        setEqPinnedIdx(prev => prev === idx ? null : idx)
-      }
+      if (idx >= startIdx && idx < startIdx + n) setEqPinnedIdx(prev => prev === idx ? null : idx)
     }
-
-    const handleKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') { setEqPinnedIdx(null); setEqHoverIdx(null) }
-    }
-
+    const handleKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { setEqPinnedIdx(null); setEqHoverIdx(null) } }
     const handleLeave = () => { if (eqPinnedIdx == null) setEqHoverIdx(null) }
 
     canvas.addEventListener('mousemove', handleMove)
@@ -810,7 +903,19 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
     }
   }, [result, resultTab, showConstituents, eqPinnedIdx])
 
-  // Draw overlaid KDE density curves
+  // ── Distribution: trades filtered by leg ──
+  const distTrades = useMemo(() => {
+    if (!result) return []
+    if (distLegFilter < 0) {
+      // All legs
+      const trades: Trade[] = []
+      result.legs.forEach(leg => trades.push(...leg.trades))
+      return trades
+    }
+    return result.legs[distLegFilter]?.trades ?? []
+  }, [result, distLegFilter])
+
+  // ── Draw distribution KDE curves ──
   useEffect(() => {
     const canvas = histCanvasRef.current
     if (!canvas || !result || resultTab !== 'distribution') return
@@ -826,14 +931,14 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
     ctx.fillStyle = '#fdf6e3'
     ctx.fillRect(0, 0, histDims.w, histDims.h)
 
-    // Collect values for all visible metrics
+    const trades = distTrades
     const metrics = (['mae', 'change', 'mfe'] as HistMetric[]).filter(m => histVisible.has(m))
     if (metrics.length === 0) return
 
     const allValsByMetric: Record<string, number[]> = {}
     let globalMin = Infinity, globalMax = -Infinity
     for (const m of metrics) {
-      const vals = result.trades.map(t => t[m]).filter((v): v is number => v !== null && v !== undefined)
+      const vals = trades.map(t => t[m]).filter((v): v is number => v !== null && v !== undefined)
       allValsByMetric[m] = vals
       for (const v of vals) { globalMin = Math.min(globalMin, v); globalMax = Math.max(globalMax, v) }
     }
@@ -844,7 +949,6 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
       return
     }
 
-    // Extend range slightly for padding
     const range = globalMax - globalMin || 0.01
     const xMin = globalMin - range * 0.08
     const xMax = globalMax + range * 0.08
@@ -854,7 +958,7 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
     const plotH = histDims.h - pad.top - pad.bottom
     const nPoints = Math.min(200, plotW)
 
-    // KDE: Gaussian kernel with reduced bandwidth, hard boundary clamp
+    // KDE: Gaussian kernel
     function kde(vals: number[], clampMax?: number, clampMin?: number): { xs: number[]; ys: number[] } {
       const n = vals.length
       const mean = vals.reduce((a, b) => a + b, 0) / n
@@ -863,7 +967,6 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
       const invH = 1 / h
       const coeff = 1 / (n * h * Math.sqrt(2 * Math.PI))
 
-      // Build evaluation points, injecting exact boundary values
       const rawXs: number[] = []
       for (let i = 0; i < nPoints; i++) rawXs.push(xMin + (i / (nPoints - 1)) * (xMax - xMin))
       if (clampMax !== undefined && !rawXs.includes(clampMax)) rawXs.push(clampMax)
@@ -886,17 +989,16 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
       return { xs, ys }
     }
 
-    // Compute KDE for each metric
     const median = (arr: number[]) => {
       if (arr.length === 0) return 0
       const s = [...arr].sort((a, b) => a - b)
       const mid = Math.floor(s.length / 2)
       return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2
     }
-    // Split trades into winners/losers by trade outcome (change > 0)
+
     const winIdx = new Set<number>()
     const loseIdx = new Set<number>()
-    result.trades.forEach((t, i) => {
+    trades.forEach((t, i) => {
       if (t.change !== null && t.change !== undefined && t.change > 0) winIdx.add(i)
       else loseIdx.add(i)
     })
@@ -909,7 +1011,7 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
       const { xs, ys } = kde(vals, m === 'mae' ? 0 : undefined, m === 'mfe' ? 0 : undefined)
       for (const y of ys) maxDensity = Math.max(maxDensity, y)
       const winVals: number[] = [], loseVals: number[] = []
-      result.trades.forEach((t, i) => {
+      trades.forEach((t, i) => {
         const v = t[m]
         if (v === null || v === undefined) return
         if (winIdx.has(i)) winVals.push(v as number)
@@ -920,7 +1022,6 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
 
     if (maxDensity === 0) return
 
-    // Scales
     const xScale = (v: number) => pad.left + ((v - xMin) / (xMax - xMin)) * plotW
     const yScale = (d: number) => pad.top + plotH - (d / maxDensity) * plotH
 
@@ -930,14 +1031,14 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
       hitCurves.push({ metric, pxPoints: xs.map((x, i) => ({ x: xScale(x), y: yScale(ys[i]) })) })
     }
 
-    // Grid lines
+    // Grid
     ctx.strokeStyle = '#e9ecef'; ctx.lineWidth = 1
     for (let i = 0; i <= 4; i++) {
       const y = pad.top + (plotH * i) / 4
       ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + plotW, y); ctx.stroke()
     }
 
-    // Draw order: non-hovered first (dimmed), hovered last (on top)
+    // Draw order: non-hovered first, hovered last
     const drawOrder = hoveredCurve
       ? [...curves.filter(c => c.metric !== hoveredCurve), ...curves.filter(c => c.metric === hoveredCurve)]
       : curves
@@ -950,7 +1051,6 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
       ctx.globalAlpha = alpha
       if (xs.length > 1) {
         const baseline = pad.top + plotH
-        // Filled area
         ctx.beginPath()
         ctx.moveTo(xScale(xs[0]), baseline)
         for (let i = 0; i < xs.length; i++) ctx.lineTo(xScale(xs[i]), yScale(ys[i]))
@@ -959,7 +1059,6 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
         ctx.fillStyle = colors.fill
         ctx.fill()
 
-        // Stroke outline — follows the full boundary including vertical edges
         ctx.beginPath()
         ctx.moveTo(xScale(xs[0]), baseline)
         for (let i = 0; i < xs.length; i++) ctx.lineTo(xScale(xs[i]), yScale(ys[i]))
@@ -979,8 +1078,7 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
       ctx.fillText((v * 100).toFixed(1) + '%', xScale(v), histDims.h - pad.bottom + 15)
     }
 
-
-    // Legend — top right
+    // Legend
     const legendW = 270
     const rowH = 16
     const legendH = 12 + curves.length * rowH
@@ -996,12 +1094,10 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
       const colors = HIST_COLORS[metric]
       const rowY = ly + i * rowH
       const isHovered = hoveredCurve === metric
-      // Color swatch
       ctx.fillStyle = colors.fill
       ctx.fillRect(lx, rowY - 4, 14, 10)
       ctx.strokeStyle = colors.stroke; ctx.lineWidth = 1
       ctx.strokeRect(lx, rowY - 4, 14, 10)
-      // Label — fixed columns: name | W value | L value
       const font = (isHovered ? 'bold ' : '') + '10px monospace'
       ctx.font = font; ctx.fillStyle = isHovered ? colors.stroke : '#586e75'
       const colName = lx + 18, colW = lx + 62, colWVal = lx + 148, colL = lx + 156, colLVal = lx + 260
@@ -1018,8 +1114,7 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
     }
 
     histHitRef.current = { curves: hitCurves, legendRows, baseline: pad.top + plotH }
-
-  }, [result, resultTab, histVisible, histDims, hoveredCurve])
+  }, [distTrades, resultTab, histVisible, histDims, hoveredCurve, result])
 
   // Mouse handler for histogram legend hover
   const handleHistMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -1028,7 +1123,6 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
     const rect = canvas.getBoundingClientRect()
     const mx = e.clientX - rect.left
     const my = e.clientY - rect.top
-
     for (const row of histHitRef.current.legendRows) {
       if (mx >= row.x && mx <= row.x + row.w && my >= row.y && my <= row.y + row.h) {
         if (hoveredCurve !== row.metric) setHoveredCurve(row.metric)
@@ -1037,988 +1131,725 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
     }
     if (hoveredCurve !== null) setHoveredCurve(null)
   }
-
   const handleHistMouseLeave = () => { setHoveredCurve(null) }
 
-  // Draw path chart (trade paths from 0% to exit)
-  useEffect(() => {
-    const canvas = pathCanvasRef.current
-    if (!canvas || !result || resultTab !== 'path') return
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
+  // ── Trades table ──
+  const [sortCol, setSortCol] = useState('entry_date')
+  const [sortAsc, setSortAsc] = useState(true)
+  const [tradesLegFilter, setTradesLegFilter] = useState(-1)
 
-    const dpr = window.devicePixelRatio || 1
-    canvas.width = pathDims.w * dpr
-    canvas.height = pathDims.h * dpr
-    ctx.scale(dpr, dpr)
-
-    ctx.clearRect(0, 0, pathDims.w, pathDims.h)
-    ctx.fillStyle = '#fdf6e3'
-    ctx.fillRect(0, 0, pathDims.w, pathDims.h)
-
-    const paths = result.trade_paths
-    if (!paths || paths.length === 0) {
-      ctx.fillStyle = '#6c757d'; ctx.font = '14px monospace'; ctx.textAlign = 'center'
-      ctx.fillText('No trade paths', pathDims.w / 2, pathDims.h / 2)
-      return
-    }
-
-    // Find max bars and Y range
-    let maxBars = 0
-    let yMin = 0, yMax = 0
-    for (const p of paths) {
-      maxBars = Math.max(maxBars, p.length)
-      for (const v of p) { yMin = Math.min(yMin, v); yMax = Math.max(yMax, v) }
-    }
-    if (maxBars < 2) return
-    const yPad = (yMax - yMin) * 0.1 || 0.05
-    yMin -= yPad; yMax += yPad
-
-    const pad = { top: 20, right: 60, bottom: 50, left: 20 }
-    const plotW = pathDims.w - pad.left - pad.right
-    const plotH = pathDims.h - pad.top - pad.bottom
-
-    const xScale = (i: number) => pad.left + (i / (maxBars - 1)) * plotW
-    const yScale = (v: number) => pad.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH
-
-    // Grid
-    ctx.strokeStyle = '#e9ecef'; ctx.lineWidth = 1
-    const nTicks = 6
-    for (let i = 0; i <= nTicks; i++) {
-      const v = yMin + (yMax - yMin) * (i / nTicks)
-      const y = yScale(v)
-      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pathDims.w - pad.right, y); ctx.stroke()
-      ctx.fillStyle = '#6c757d'; ctx.font = '10px monospace'; ctx.textAlign = 'left'
-      ctx.fillText((v * 100).toFixed(1) + '%', pathDims.w - pad.right + 5, y + 3)
-    }
-
-    // Zero line
-    const zeroY = yScale(0)
-    ctx.strokeStyle = '#adb5bd'; ctx.lineWidth = 1; ctx.setLineDash([4, 4])
-    ctx.beginPath(); ctx.moveTo(pad.left, zeroY); ctx.lineTo(pathDims.w - pad.right, zeroY); ctx.stroke()
-    ctx.setLineDash([])
-
-    // X axis labels (bars)
-    const labelInterval = Math.max(1, Math.floor(maxBars / 10))
-    ctx.fillStyle = '#6c757d'; ctx.font = '10px monospace'; ctx.textAlign = 'center'
-    for (let i = 0; i < maxBars; i += labelInterval) {
-      ctx.fillText(String(i), xScale(i), pathDims.h - pad.bottom + 15)
-    }
-
-    // Rank paths by final return (best first) for color gradient
-    const ranked = paths.map((p, i) => ({ p, i, ret: p.length > 0 ? p[p.length - 1] : 0 }))
-      .filter(d => d.p.length >= 2)
-      .sort((a, b) => b.ret - a.ret)
-    const totalRanked = ranked.length
-
-    // Blue (best) -> Purple (mid) -> Pink (worst) gradient
-    const rankColor = (rank: number, total: number): string => {
-      if (total <= 1) return 'rgb(50, 50, 255)'
-      const t = rank / (total - 1)
-      if (t <= 0.5) {
-        const s = t * 2
-        return `rgb(${Math.round(50 + 102 * s)}, 50, ${Math.round(255 - 53 * s)})`
-      } else {
-        const s = (t - 0.5) * 2
-        return `rgb(${Math.round(152 + 103 * s)}, 50, ${Math.round(202 - 52 * s)})`
-      }
-    }
-
-    // Draw non-hovered paths first, then hovered on top
-    for (let ri = 0; ri < totalRanked; ri++) {
-      const { p, i: pi } = ranked[ri]
-      if (pi === hoveredPath) continue
-      const isOther = hoveredPath !== null
-      ctx.strokeStyle = isOther ? '#dee2e6' : rankColor(ri, totalRanked)
-      ctx.lineWidth = 1.2
-      ctx.globalAlpha = isOther ? 0.3 : 1
-      ctx.beginPath()
-      for (let i = 0; i < p.length; i++) {
-        const x = xScale(i), y = yScale(p[i])
-        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y)
-      }
-      ctx.stroke()
-    }
-
-    // Draw hovered path on top
-    if (hoveredPath !== null) {
-      const hovRank = ranked.findIndex(d => d.i === hoveredPath)
-      const entry = ranked[hovRank]
-      if (entry && entry.p.length >= 2) {
-        ctx.strokeStyle = rankColor(hovRank, totalRanked)
-        ctx.lineWidth = 2.5
-        ctx.globalAlpha = 1
-        ctx.beginPath()
-        for (let i = 0; i < entry.p.length; i++) {
-          const x = xScale(i), y = yScale(entry.p[i])
-          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y)
-        }
-        ctx.stroke()
-      }
-    }
-    ctx.globalAlpha = 1
-
-  }, [result, resultTab, pathDims, hoveredPath])
-
-  // Navigate chart to a specific trade (uses visible trades for current ticker)
-  const navigateToTrade = useCallback((idx: number) => {
-    if (!result || !chartInstanceRef.current) return
-    const currentTkr = chartTickers.length > 0 ? chartTickers[Math.min(chartTickerIdx, chartTickers.length - 1)] : null
-    const visibleTrades = currentTkr ? result.trades.filter(t => t.ticker === currentTkr) : result.trades
-    if (visibleTrades.length === 0) return
-    const clamped = Math.max(0, Math.min(idx, visibleTrades.length - 1))
-    setTradeIndex(clamped)
-    const t = visibleTrades[clamped]
-    const entryTime = new Date(t.entry_date + 'T00:00:00Z').getTime()
-    const from = new Date(entryTime - 90 * 86400000)
-    const to = new Date(entryTime + 270 * 86400000)
-    chartInstanceRef.current.timeScale().setVisibleRange({
-      from: (Math.floor(from.getTime() / 1000)) as any,
-      to: (Math.floor(to.getTime() / 1000)) as any,
+  const allTrades = useMemo(() => {
+    if (!result) return []
+    const trades: (Trade & { legTarget: string; legSignal: string; legIdx: number })[] = []
+    result.legs.forEach((leg, i) => {
+      leg.trades.forEach(t => trades.push({ ...t, legTarget: leg.target, legSignal: leg.entry_signal, legIdx: i }))
     })
-  }, [result, chartTickers, chartTickerIdx])
+    return trades
+  }, [result])
 
-  // Price chart with trade markers + indicator panes (all created upfront)
-  useEffect(() => {
-    if (resultTab !== 'chart' || !result || !priceChartRef.current) return
-
-    // Save current range before teardown
-    const priceChart = btChartsRef.current.price
-    if (priceChart) {
-      const range = priceChart.timeScale().getVisibleLogicalRange()
-      if (range) btSavedRangeRef.current = { from: range.from, to: range.to }
-    }
-
-    // Clean up all previous charts
-    for (const c of Object.values(btChartsRef.current)) {
-      try { c?.remove() } catch {}
-    }
-    btChartsRef.current = {}
-    btSeriesRef.current = {}
-    chartInstanceRef.current = null
-
-    const isLong = LONG_SIGNALS.has(entrySignal)
-    const isMulti = chartTickers.length > 0
-    const currentTicker = isMulti ? chartTickers[Math.min(chartTickerIdx, chartTickers.length - 1)] : null
-
-    const endpoint = isMulti
-      ? `tickers/${encodeURIComponent(currentTicker!)}`
-      : selectedTargetType === 'basket'
-        ? `baskets/${encodeURIComponent(selectedTarget)}`
-        : `tickers/${encodeURIComponent(selectedTarget)}`
-
-    const visibleTrades = isMulti
-      ? result.trades.filter(t => t.ticker === currentTicker)
-      : result.trades
-
-    axios.get(`${apiBase}/${endpoint}`).then(res => {
-      if (!priceChartRef.current) return
-      const rawData: any[] = res.data.chart_data || []
-      if (rawData.length === 0) return
-
-      const sorted = [...rawData].sort((a, b) => String(a.Date).localeCompare(String(b.Date)))
-      const times = sorted.map(d => parseTime(d.Date))
-      const ohlc = sorted
-        .map((d, i) => ({ time: times[i], open: Number(d.Open), high: Number(d.High), low: Number(d.Low), close: Number(d.Close) }))
-        .filter(d => !isNaN(d.open))
-
-      const chartOpts = {
-        layout: { background: { type: ColorType.Solid as const, color: '#fdf6e3' }, textColor: '#586e75' },
-        grid: { vertLines: { visible: false }, horzLines: { visible: false } },
-        crosshair: { mode: CrosshairMode.Normal },
-        rightPriceScale: { minimumWidth: 70 },
-        timeScale: { borderColor: '#93a1a1', timeVisible: true, rightOffset: 10 },
-        handleScroll: { mouseWheel: true, pressedMouseMove: true },
-        handleScale: { axisPressedMouseMove: true, mouseWheel: true, pinch: true },
-      }
-
-      // Create ALL 5 charts upfront
-      const pc = createChart(priceChartRef.current!, chartOpts)
-      const vc = volChartRef.current     ? createChart(volChartRef.current,     { ...chartOpts, timeScale: { ...chartOpts.timeScale, timeVisible: false } }) : null
-      const bc = breadthChartRef.current ? createChart(breadthChartRef.current, { ...chartOpts, timeScale: { ...chartOpts.timeScale, timeVisible: false } }) : null
-      const boc = breakoutChartRef.current ? createChart(breakoutChartRef.current, { ...chartOpts, timeScale: { ...chartOpts.timeScale, timeVisible: false } }) : null
-      const cc = corrChartRef.current    ? createChart(corrChartRef.current,    { ...chartOpts, timeScale: { ...chartOpts.timeScale, timeVisible: false } }) : null
-      const rvc = rvChartRef.current    ? createChart(rvChartRef.current,     { ...chartOpts, timeScale: { ...chartOpts.timeScale, timeVisible: false } }) : null
-
-      btChartsRef.current = { price: pc, volume: vc, breadth: bc, breakout: boc, correlation: cc, rv: rvc }
-      chartInstanceRef.current = pc
-
-      // Price pane
-      const candleSeries = pc.addCandlestickSeries({
-        upColor: 'transparent', downColor: '#586e75',
-        borderVisible: true,
-        borderUpColor: '#586e75', borderDownColor: '#586e75',
-        wickUpColor: '#586e75', wickDownColor: '#586e75',
-      })
-      candleSeries.setData(ohlc)
-      btSeriesRef.current.price = candleSeries
-
-      // Pivots
-      if (showPivots) {
-        const rs = pc.addLineSeries({ color: 'transparent', priceLineVisible: false, crosshairMarkerVisible: false, lastValueVisible: false, pointMarkersVisible: true, pointMarkersRadius: 1, lineVisible: false } as any)
-        const ss = pc.addLineSeries({ color: 'transparent', priceLineVisible: false, crosshairMarkerVisible: false, lastValueVisible: false, pointMarkersVisible: true, pointMarkersRadius: 1, lineVisible: false } as any)
-        const rp: any[] = [], sp: any[] = []
-        sorted.forEach((d, i) => {
-          if (d.Resistance_Pivot != null && !d.Trend) rp.push({ time: times[i], value: Number(d.Resistance_Pivot), color: 'rgb(255, 50, 150)' })
-          if (d.Support_Pivot != null && d.Trend) sp.push({ time: times[i], value: Number(d.Support_Pivot), color: 'rgb(50, 50, 255)' })
-        })
-        rs.setData(rp)
-        ss.setData(sp)
-      }
-
-      // Targets
-      if (showTargets) {
-        const uT = sorted.filter(d => d.Upper_Target != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Upper_Target) }))
-        const lT = sorted.filter(d => d.Lower_Target != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Lower_Target) }))
-        if (uT.length) pc.addLineSeries({ color: 'rgb(50, 50, 255)', lineWidth: 2, priceLineVisible: false, crosshairMarkerVisible: false }).setData(uT)
-        if (lT.length) pc.addLineSeries({ color: 'rgb(255, 50, 150)', lineWidth: 2, priceLineVisible: false, crosshairMarkerVisible: false }).setData(lT)
-      }
-
-      // Trade lines + markers
-      for (const t of visibleTrades) {
-        if (t.skipped || t.entry_price == null || t.exit_price == null) continue
-        const isWinner = (t.change ?? 0) > 0
-        const color = isWinner ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)'
-        pc.addLineSeries({ color, lineWidth: 3, lineStyle: LineStyle.Dashed, priceLineVisible: false, crosshairMarkerVisible: false, lastValueVisible: false })
-          .setData([{ time: parseTime(t.entry_date), value: t.entry_price }, { time: parseTime(t.exit_date), value: t.exit_price }])
-      }
-      const markers: any[] = []
-      for (const t of visibleTrades) {
-        if (t.skipped) continue
-        markers.push({ time: parseTime(t.entry_date), position: isLong ? 'belowBar' : 'aboveBar', color: isLong ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)', shape: isLong ? 'arrowUp' : 'arrowDown', size: 2, text: '' })
-        markers.push({ time: parseTime(t.exit_date), position: isLong ? 'aboveBar' : 'belowBar', color: isLong ? 'rgb(255, 50, 150)' : 'rgb(50, 50, 255)', shape: isLong ? 'arrowDown' : 'arrowUp', size: 2, text: '' })
-      }
-      if (result.skipped_entries) {
-        const currentTkr = isMulti ? currentTicker : null
-        for (const s of result.skipped_entries) {
-          if (currentTkr && s.ticker !== currentTkr) continue
-          markers.push({
-            time: parseTime(s.entry_date), position: isLong ? 'belowBar' : 'aboveBar',
-            color: '#93a1a1', shape: isLong ? 'arrowUp' : 'arrowDown', size: 1, text: 'skip',
-          })
-        }
-      }
-      markers.sort((a, b) => a.time - b.time)
-      candleSeries.setMarkers(markers)
-
-      // Alignment data for indicator panes
-      const alignData = ohlc.map(d => ({ time: d.time, value: d.close }))
-      const addAlign = (ic: IChartApi) => {
-        ic.addLineSeries({ color: 'rgba(0,0,0,0)', priceLineVisible: false, crosshairMarkerVisible: false, lastValueVisible: false, priceScaleId: '__align__' }).setData(alignData)
-        ic.priceScale('__align__').applyOptions({ visible: false })
-      }
-
-      // Volume pane
-      if (vc) {
-        addAlign(vc)
-        const vs = vc.addHistogramSeries({ color: 'rgba(147, 161, 161, 0.5)', priceFormat: { type: 'volume' } })
-        vs.setData(sorted.filter(d => d.Volume != null).map((d, i) => ({ time: times[i], value: Number(d.Volume) })))
-        btSeriesRef.current.volume = vs
-      }
-
-      // Breadth pane
-      if (bc) {
-        addAlign(bc)
-        const bs = bc.addLineSeries({ color: 'rgb(50, 50, 255)', lineWidth: 2, title: 'Breadth %' })
-        bs.setData(sorted.filter(d => d.Uptrend_Pct != null).map((d, i) => ({ time: times[i], value: Number(d.Uptrend_Pct) })))
-        btSeriesRef.current.breadth = bs
-      }
-
-      // Breakout pane
-      if (boc) {
-        addAlign(boc)
-        const bos = boc.addLineSeries({ color: 'rgb(255, 50, 150)', lineWidth: 2, title: 'Breakout %' })
-        bos.setData(sorted.filter(d => d.Breakout_Pct != null).map((d, i) => ({ time: times[i], value: Number(d.Breakout_Pct) })))
-        btSeriesRef.current.breakout = bos
-      }
-
-      // Correlation pane
-      if (cc) {
-        addAlign(cc)
-        const cs = cc.addLineSeries({ color: '#586e75', lineWidth: 2, title: 'Correlation %' })
-        cs.setData(sorted.filter(d => d.Correlation_Pct != null).map((d, i) => ({ time: times[i], value: Number(d.Correlation_Pct) })))
-        btSeriesRef.current.correlation = cs
-      }
-
-      // RV pane
-      const ANNUALIZE = Math.sqrt(252)
-      if (rvc) {
-        addAlign(rvc)
-        const rvs = rvc.addLineSeries({ color: '#b58900', lineWidth: 2, title: 'RV %', priceFormat: { type: 'custom', formatter: (v: number) => v.toFixed(1) + '%' } })
-        rvs.setData(sorted.filter(d => d.RV_EMA != null).map((d, i) => ({ time: times[i], value: Number(d.RV_EMA) * ANNUALIZE * 100 })))
-        btSeriesRef.current.rv = rvs
-      }
-
-      // Sync time scales + crosshairs across all charts
-      const chartEntries: [string, IChartApi][] = Object.entries(btChartsRef.current).filter((e): e is [string, IChartApi] => e[1] != null)
-      let rangeSyncing = false
-      let crosshairSyncing = false
-      const refMap: Record<string, React.RefObject<HTMLDivElement | null>> = { price: priceChartRef, volume: volChartRef, breadth: breadthChartRef, breakout: breakoutChartRef, correlation: corrChartRef, rv: rvChartRef }
-      const seriesDataMaps: Record<string, Map<any, number>> = {}
-      const priceMap = new Map<any, number>()
-      ohlc.forEach(d => priceMap.set(d.time, d.close))
-      seriesDataMaps.price = priceMap
-      sorted.forEach((d, i) => {
-        if (d.Volume != null) { if (!seriesDataMaps.volume) seriesDataMaps.volume = new Map(); seriesDataMaps.volume.set(times[i], Number(d.Volume)) }
-        if (d.Uptrend_Pct != null) { if (!seriesDataMaps.breadth) seriesDataMaps.breadth = new Map(); seriesDataMaps.breadth.set(times[i], Number(d.Uptrend_Pct)) }
-        if (d.Breakout_Pct != null) { if (!seriesDataMaps.breakout) seriesDataMaps.breakout = new Map(); seriesDataMaps.breakout.set(times[i], Number(d.Breakout_Pct)) }
-        if (d.Correlation_Pct != null) { if (!seriesDataMaps.correlation) seriesDataMaps.correlation = new Map(); seriesDataMaps.correlation.set(times[i], Number(d.Correlation_Pct)) }
-        if (d.RV_EMA != null) { if (!seriesDataMaps.rv) seriesDataMaps.rv = new Map(); seriesDataMaps.rv.set(times[i], Number(d.RV_EMA) * ANNUALIZE * 100) }
-      })
-
-      chartEntries.forEach(([, source]) => {
-        source.timeScale().subscribeVisibleLogicalRangeChange(r => {
-          if (rangeSyncing || !r) return
-          rangeSyncing = true
-          chartEntries.forEach(([, target]) => { if (target !== source) target.timeScale().setVisibleLogicalRange(r) })
-          rangeSyncing = false
-        })
-        source.subscribeCrosshairMove(p => {
-          if (crosshairSyncing) return
-          crosshairSyncing = true
-          try {
-            chartEntries.forEach(([otherId, target]) => {
-              if (target === source) return
-              const container = refMap[otherId]
-              if (container?.current && container.current.clientHeight === 0) return
-              const s = btSeriesRef.current[otherId]
-              if (!s) return
-              if (!p.time) { target.clearCrosshairPosition() }
-              else {
-                const val = seriesDataMaps[otherId]?.get(p.time)
-                if (val !== undefined) target.setCrosshairPosition(val, p.time as any, s)
-              }
-            })
-          } finally { crosshairSyncing = false }
-        })
-      })
-
-      // Restore saved range or default 1yr around first trade
-      const initRange = btSavedRangeRef.current
-      btSavedRangeRef.current = null
-      if (initRange) {
-        chartEntries.forEach(([, c]) => c.timeScale().setVisibleLogicalRange(initRange))
-      } else if (visibleTrades.length > 0) {
-        const firstEntry = new Date(visibleTrades[0].entry_date + 'T00:00:00Z').getTime()
-        const from = new Date(firstEntry - 90 * 86400000)
-        const to = new Date(firstEntry + 270 * 86400000)
-        pc.timeScale().setVisibleRange({ from: (Math.floor(from.getTime() / 1000)) as any, to: (Math.floor(to.getTime() / 1000)) as any })
-      } else {
-        pc.timeScale().fitContent()
-      }
+  const filteredTrades = useMemo(() => {
+    const t = tradesLegFilter < 0 ? allTrades : allTrades.filter(x => x.legIdx === tradesLegFilter)
+    const col = sortCol
+    const dir = sortAsc ? 1 : -1
+    return [...t].sort((a: any, b: any) => {
+      const av = a[col], bv = b[col]
+      if (av == null && bv == null) return 0
+      if (av == null) return 1
+      if (bv == null) return -1
+      if (typeof av === 'string') return av.localeCompare(bv) * dir
+      return (av - bv) * dir
     })
+  }, [allTrades, tradesLegFilter, sortCol, sortAsc])
 
-    return () => {
-      const priceC = btChartsRef.current.price
-      if (priceC) {
-        const range = priceC.timeScale().getVisibleLogicalRange()
-        if (range) btSavedRangeRef.current = { from: range.from, to: range.to }
-      }
-      for (const c of Object.values(btChartsRef.current)) {
-        try { c?.remove() } catch {}
-      }
-      btChartsRef.current = {}
-      btSeriesRef.current = {}
-      chartInstanceRef.current = null
-    }
-  }, [resultTab, result, selectedTarget, selectedTargetType, entrySignal, apiBase, showPivots, showTargets, chartTickers, chartTickerIdx])
+  // ── Filter helpers ──
+  const addFilter = (legIdx: number) => {
+    updateLeg(legIdx, { filters: [...legs[legIdx].filters, { metric: 'Uptrend_Pct', condition: 'above', value: 50, source: 'self' }] })
+  }
+  const removeFilter = (legIdx: number, fIdx: number) => {
+    updateLeg(legIdx, { filters: legs[legIdx].filters.filter((_, i) => i !== fIdx) })
+  }
+  const updateFilterField = (legIdx: number, fIdx: number, field: string, val: any) => {
+    const updated = legs[legIdx].filters.map((f, i) => i === fIdx ? { ...f, [field]: val } : f)
+    updateLeg(legIdx, { filters: updated })
+  }
 
-  // Resize ALL charts when visibility toggles change (flex layout needs a frame to settle)
-  useEffect(() => {
-    const handle = requestAnimationFrame(() => {
-      const refMap: Record<string, React.RefObject<HTMLDivElement | null>> = {
-        price: priceChartRef, volume: volChartRef, breadth: breadthChartRef, breakout: breakoutChartRef, correlation: corrChartRef, rv: rvChartRef,
-      }
-      const priceChart = btChartsRef.current.price
-      const currentRange = priceChart?.timeScale().getVisibleLogicalRange()
+  /* ━━━━━━━━━━━━━━━━━━━━━━ RENDER ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 
-      for (const [id, chart] of Object.entries(btChartsRef.current)) {
-        if (!chart) continue
-        const ref = refMap[id]
-        if (ref?.current && ref.current.clientHeight > 0) {
-          chart.applyOptions({ width: ref.current.clientWidth, height: ref.current.clientHeight })
-          if (id !== 'price' && currentRange) {
-            chart.timeScale().setVisibleLogicalRange(currentRange)
-          }
-        }
-      }
-    })
-    return () => cancelAnimationFrame(handle)
-  }, [showVolume, showBreadth, showBreakout, showCorrelation, showRV])
+  if (showResults && result) {
+    const resultIsMultiLeg = result.legs.length > 1
 
-  // Config mode
-  if (!showResults) {
-    if (multiMode) {
-      return <MultiBacktestPanel apiBase={apiBase} onClose={() => setMultiMode(false)} />
-    }
     return (
       <div className="backtest-panel">
-        <div className="backtest-config">
-          <div className="backtest-section">
-            <div className="backtest-pos-presets">
-              <button className="backtest-pos-preset wide active">Single Leg</button>
-              <button className="backtest-pos-preset wide" onClick={() => setMultiMode(true)}>Multi-Leg</button>
-            </div>
-          </div>
+        <div className="backtest-results-header">
+          <button className="backtest-nav-btn" onClick={() => setShowResults(false)}>Configure</button>
+          <span style={{ fontWeight: 600, fontSize: 13 }}>
+            {resultIsMultiLeg
+              ? result.legs.map(l => `${l.target}(${l.entry_signal})`).join(' + ')
+              : `${result.legs[0].target.replace(/_/g, ' ')} -- ${result.legs[0].entry_signal.replace(/_/g, ' ')} Backtest`
+            }
+          </span>
+          {result.date_range && (
+            <span className="backtest-hint" style={{ marginLeft: 8 }}>
+              {result.date_range.min} to {result.date_range.max}
+            </span>
+          )}
+        </div>
 
-         <div className="multi-leg-grid single-leg-grid">
-          <div className="single-leg-card">
+        <div className="summary-tabs" style={{ padding: '0 12px' }}>
+          {(['equity', 'stats', 'distribution', 'path', 'trades'] as ResultTab[]).map(tab => (
+            <button key={tab} className={`summary-tab ${resultTab === tab ? 'active' : ''}`}
+              onClick={() => setResultTab(tab)}>{tab.charAt(0).toUpperCase() + tab.slice(1)}</button>
+          ))}
+        </div>
 
-          <div className="backtest-section">
-            <label className="backtest-label">Target</label>
-            <div className="bt-search-container">
-              <div className="bt-search-input-wrapper" onClick={() => { setTargetSearchOpen(true); setTimeout(() => targetSearchRef.current?.focus(), 0) }}>
-                {targetSearchOpen ? (
-                  <input
-                    ref={targetSearchRef}
-                    className="bt-search-input"
-                    value={targetSearchQuery}
-                    onChange={e => { setTargetSearchQuery(e.target.value); setTargetSearchHighlight(0) }}
-                    onKeyDown={handleTargetSearchKeyDown}
-                    onBlur={() => setTimeout(() => setTargetSearchOpen(false), 200)}
-                    placeholder={selectedTarget.replace(/_/g, ' ')}
-                    autoFocus
-                  />
-                ) : (
-                  <div className="bt-search-display">
-                    <span className="bt-search-display-name">{selectedTarget.replace(/_/g, ' ')}</span>
-                    <span className="bt-search-display-tag">{selectedTargetType === 'ticker' ? 'Ticker' : 'Basket'}</span>
-                  </div>
-                )}
-              </div>
-              {targetSearchOpen && (
-                <div className="bt-search-dropdown">
-                  <div className="search-filters">
-                    {(['all', 'Themes', 'Sectors', 'Industries', 'Tickers'] as const).map(f => (
-                      <button
-                        key={f}
-                        className={`search-filter-btn ${targetSearchFilter === f ? 'active' : ''}`}
-                        onMouseDown={e => { e.preventDefault(); setTargetSearchFilter(f) }}
-                      >
-                        {f === 'all' ? 'All' : f}
+        <div className="backtest-body">
+          <div className="backtest-main">
+            <div className="backtest-content">
+              {/* ── Equity tab ── */}
+              {resultTab === 'equity' && (
+                <>
+                  <div className="analysis-date-controls">
+                    <div className="bt-strat-btns">
+                      <button className="bt-strat-btn active"
+                        style={{ background: '#8BC34A', borderColor: '#8BC34A', color: '#fff' }}>
+                        {isSingleLeg ? 'Equity' : 'Combined'}
                       </button>
+                      {resultIsMultiLeg && result.legs.map((leg, i) => (
+                        <button key={i} className={`bt-strat-btn ${visibleLegs.has(i) ? 'active' : ''}`}
+                          style={visibleLegs.has(i) ? { background: LEG_COLORS[i % LEG_COLORS.length], borderColor: LEG_COLORS[i % LEG_COLORS.length], color: '#fff' } : undefined}
+                          onClick={() => setVisibleLegs(prev => { const next = new Set(prev); if (next.has(i)) next.delete(i); else next.add(i); return next })}>{leg.target.replace(/_/g, ' ')}</button>
+                      ))}
+                      {isSingleLeg && Object.keys(benchmarks).length > 0 && (
+                        <>
+                          {(['Breakout', 'Up_Rot', 'BTFD', 'Breakdown', 'Down_Rot', 'STFR'] as const).map(sig => (
+                            <button key={sig} className={`bt-strat-btn ${showBenchmark[sig] ? 'active' : ''}`}
+                              style={showBenchmark[sig] ? { background: BENCHMARK_COLORS[sig], borderColor: BENCHMARK_COLORS[sig], color: '#fff' } : undefined}
+                              onClick={() => setShowBenchmark(prev => ({ ...prev, [sig]: !prev[sig] }))}>{sig.replace('_', ' ')}</button>
+                          ))}
+                        </>
+                      )}
+                      <button className={`bt-strat-btn ${showBuyHold ? 'active' : ''}`}
+                        style={showBuyHold ? { background: '#93a1a1', borderColor: '#93a1a1', color: '#fff' } : undefined}
+                        onClick={() => setShowBuyHold(v => !v)}>Buy Hold</button>
+                      <button className={`bt-strat-btn ${showConstituents ? 'active' : ''}`}
+                        style={showConstituents ? { background: '#d33682', borderColor: '#d33682', color: '#fff' } : undefined}
+                        onClick={() => { setShowConstituents(v => !v); setEqPinnedIdx(null); setEqHoverIdx(null) }}>Const</button>
+                    </div>
+                    <div style={{ flex: 1 }} />
+                    <div className="basket-returns-presets">
+                      {(['1Y', '3Y', '5Y', 'YTD', 'All'] as const).map(p => (
+                        <button key={p} className="basket-returns-preset-btn" onClick={() => setEqPreset(p)}>{p}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="backtest-chart" ref={containerRef} style={{ position: 'relative' }}>
+                    <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: '100%', cursor: 'grab' }} />
+                    <button className={`log-toggle-btn ${eqLogScale ? 'active' : ''}`} onClick={() => setEqLogScale(v => !v)}>L</button>
+                    {showConstituents && (() => {
+                      const activeIdx = eqPinnedIdx ?? eqHoverIdx
+                      if (activeIdx == null) return null
+                      const { padLeft, plotW, n, startIdx } = eqScaleRef.current
+                      const localIdx = activeIdx - startIdx
+                      const crosshairX = n > 1 ? padLeft + (localIdx / (n - 1)) * plotW : padLeft
+                      const showCrosshair = localIdx >= 0 && localIdx < n
+                      const snapshot = result?.daily_positions?.[activeIdx]
+                      const date = result?.combined.equity_curve.dates[activeIdx]
+                      const toggleSort = (col: typeof constSortCol) => {
+                        if (constSortCol === col) setConstSortAsc(v => !v)
+                        else { setConstSortCol(col); setConstSortAsc(col === 'ticker' || col === 'leg_target' || col === 'entry_date') }
+                      }
+                      const sortedPositions = snapshot ? [...snapshot.positions].sort((a, b) => {
+                        let va: number | string, vb: number | string
+                        if (constSortCol === 'ticker') { va = (a.ticker || a.leg_target || ''); vb = (b.ticker || b.leg_target || '') }
+                        else if (constSortCol === 'leg_target') { va = a.leg_target || ''; vb = b.leg_target || '' }
+                        else if (constSortCol === 'entry_date') { va = a.entry_date || ''; vb = b.entry_date || '' }
+                        else { va = a[constSortCol] ?? 0; vb = b[constSortCol] ?? 0 }
+                        const cmp = typeof va === 'string' ? va.localeCompare(vb as string) : (va as number) - (vb as number)
+                        return constSortAsc ? cmp : -cmp
+                      }) : []
+                      const arrow = (col: typeof constSortCol) => constSortCol === col ? (constSortAsc ? ' \u25b2' : ' \u25bc') : ''
+                      return (
+                        <>
+                          {showCrosshair && (
+                            <div style={{
+                              position: 'absolute', top: 0, bottom: 0, left: crosshairX, width: 1,
+                              background: eqPinnedIdx != null ? 'rgb(50,50,255)' : '#93a1a1',
+                              pointerEvents: 'none', zIndex: 100,
+                            }} />
+                          )}
+                          {snapshot && date && (
+                            <div style={{ position: 'absolute', top: 4, left: 8, bottom: 54, pointerEvents: 'none', zIndex: 200, display: 'flex', flexDirection: 'column' }}>
+                            <div className="candle-detail-overlay" style={{ ...(eqPinnedIdx != null ? { pointerEvents: 'auto' as const, borderColor: 'rgb(50,50,255)' } : {}), minWidth: resultIsMultiLeg ? 540 : 480, position: 'relative', top: 'auto', left: 'auto', maxHeight: '100%' }}>
+                              <div className="candle-detail-title">
+                                {date} &mdash; {dollarFmt(snapshot.equity)}
+                                {eqPinnedIdx != null
+                                  ? <span style={{ marginLeft: 8, fontSize: 9, color: 'rgb(50,50,255)' }}>PINNED (esc)</span>
+                                  : <span style={{ marginLeft: 8, fontSize: 9, color: '#93a1a1' }}>click to pin</span>}
+                              </div>
+                              <div className="candle-detail-row const-header" style={{ fontWeight: 'bold', borderBottom: '1px solid #ccc', cursor: 'pointer', userSelect: 'none' }}>
+                                <span className="const-ticker" onClick={() => toggleSort('ticker')}>Ticker{arrow('ticker')}</span>
+                                {resultIsMultiLeg && <span className="const-leg" onClick={() => toggleSort('leg_target')}>Leg{arrow('leg_target')}</span>}
+                                <span className="const-entry" onClick={() => toggleSort('entry_date')}>Entry{arrow('entry_date')}</span>
+                                <span className="const-ew" onClick={() => toggleSort('entry_weight')}>Ent.Wt{arrow('entry_weight')}</span>
+                                <span className="const-ret" onClick={() => toggleSort('daily_return')}>Return{arrow('daily_return')}</span>
+                                <span className="const-cw" onClick={() => toggleSort('weight')}>Cur.Wt{arrow('weight')}</span>
+                                <span className="const-contrib" onClick={() => toggleSort('contribution')}>Contrib{arrow('contribution')}</span>
+                              </div>
+                              {sortedPositions.map((p, i) => (
+                                <div key={i} className="candle-detail-row">
+                                  <span className="const-ticker">{p.ticker || p.leg_target}</span>
+                                  {resultIsMultiLeg && <span className="const-leg" style={{ fontSize: 9 }}>{p.leg_target}</span>}
+                                  <span className="const-entry">{p.entry_date ? p.entry_date.slice(5) + '-' + p.entry_date.slice(0, 4) : ''}</span>
+                                  <span className="const-ew">{((p.entry_weight ?? 0) * 100).toFixed(1)}%</span>
+                                  <span className="const-ret" style={{ color: p.daily_return >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)' }}>
+                                    {(p.daily_return * 100).toFixed(2)}%</span>
+                                  <span className="const-cw">{(p.weight * 100).toFixed(1)}%</span>
+                                  <span className="const-contrib" style={{ color: p.contribution >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)' }}>
+                                    {(p.contribution * 100).toFixed(3)}%</span>
+                                </div>
+                              ))}
+                              <div className="candle-detail-row" style={{ borderTop: '1px solid #93a1a1', fontWeight: 'bold' }}>
+                                <span className="const-ticker">Total</span>
+                                {resultIsMultiLeg && <span className="const-leg"></span>}
+                                <span className="const-entry"></span>
+                                <span className="const-ew"></span>
+                                <span className="const-ret"></span>
+                                <span className="const-cw">{(snapshot.exposure_pct * 100).toFixed(1)}%</span>
+                                <span className="const-contrib" style={{
+                                  color: snapshot.positions.reduce((s, p) => s + p.contribution, 0) >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)'
+                                }}>
+                                  {(snapshot.positions.reduce((s, p) => s + p.contribution, 0) * 100).toFixed(3)}%</span>
+                              </div>
+                            </div>
+                            </div>
+                          )}
+                        </>
+                      )
+                    })()}
+                  </div>
+                  {result && (
+                    <RangeScrollbar
+                      total={result.combined.equity_curve.dates.length}
+                      start={eqViewRef.current.start}
+                      end={eqViewRef.current.end}
+                      onChange={(s, e) => { eqViewRef.current = { start: s, end: e }; setEqViewVersion(v => v + 1) }}
+                    />
+                  )}
+                </>
+              )}
+
+              {/* ── Stats tab ── */}
+              {resultTab === 'stats' && (() => {
+                const cs = result.combined.stats
+                const lc = result.leg_correlations
+                const renderStatsTable = (
+                  title: string,
+                  titleColor: string,
+                  portfolioRows: { label: string; values: string[]; colors?: (string | undefined)[] }[],
+                  tradeRows: { label: string; values: string[]; colors?: (string | undefined)[] }[],
+                ) => (
+                  <div style={{ marginBottom: 20 }}>
+                    <div style={{ fontWeight: 700, fontSize: 13, color: titleColor, marginBottom: 6, borderBottom: `2px solid ${titleColor}`, paddingBottom: 4 }}>{title}</div>
+                    <table className="backtest-stats-table" style={{ width: '100%', marginBottom: 8 }}>
+                      <thead>
+                        <tr><th className="backtest-stats-th" colSpan={2} style={{ textAlign: 'left', fontSize: 11, color: '#657b83' }}>Portfolio Stats</th></tr>
+                      </thead>
+                      <tbody>
+                        {portfolioRows.map((r, ri) => (
+                          <tr key={ri}>
+                            <td className="backtest-stats-td" style={{ fontWeight: 600, width: '50%' }}>{r.label}</td>
+                            <td className="backtest-stats-td" style={{ color: r.colors?.[0] }}>{r.values[0]}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    <table className="backtest-stats-table" style={{ width: '100%' }}>
+                      <thead>
+                        <tr><th className="backtest-stats-th" colSpan={2} style={{ textAlign: 'left', fontSize: 11, color: '#657b83' }}>Trade Stats</th></tr>
+                      </thead>
+                      <tbody>
+                        {tradeRows.map((r, ri) => (
+                          <tr key={ri}>
+                            <td className="backtest-stats-td" style={{ fontWeight: 600, width: '50%' }}>{r.label}</td>
+                            <td className="backtest-stats-td" style={{ color: r.colors?.[0] }}>{r.values[0]}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )
+
+                const buildPortfolioRows = (p: PortfolioStats, legTarget?: string) => {
+                  const rows: { label: string; values: string[]; colors?: (string | undefined)[] }[] = [
+                    ...(p.allocation != null && resultIsMultiLeg ? [{ label: 'Allocation', values: [(p.allocation * 100).toFixed(0) + '%'] }] : []),
+                    { label: 'Return', values: [pctFmt(p.strategy_return)], colors: [p.strategy_return >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)'] },
+                    { label: 'CAGR', values: [pctFmt(p.cagr)], colors: [p.cagr >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)'] },
+                    { label: 'Volatility', values: [pctFmt(p.volatility)] },
+                    { label: 'Max Drawdown', values: [pctFmt(p.max_dd)], colors: ['rgb(255,50,150)'] },
+                    { label: 'Sharpe', values: [p.sharpe.toFixed(2)] },
+                    { label: 'Sortino', values: [p.sortino.toFixed(2)] },
+                  ]
+                  if (p.contribution != null && resultIsMultiLeg) {
+                    rows.push({ label: 'Contribution', values: [pctFmt(p.contribution)], colors: [p.contribution >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)'] })
+                  }
+                  // Inter-leg correlations
+                  if (lc && legTarget && lc[legTarget]) {
+                    for (const [otherLeg, corr] of Object.entries(lc[legTarget])) {
+                      rows.push({ label: `Corr: ${otherLeg.replace(/_/g, ' ')}`, values: [corr.toFixed(4)] })
+                    }
+                  }
+                  return rows
+                }
+
+                const buildTradeRows = (t: TradeStats) => [
+                  { label: 'Trades Met Criteria', values: [String(t.trades_met_criteria)] },
+                  { label: 'Trades Taken', values: [String(t.trades_taken)] },
+                  { label: 'Trades Skipped', values: [String(t.trades_skipped)] },
+                  { label: 'Win Rate', values: [pctFmt(t.win_rate)] },
+                  { label: 'Avg Winner', values: [pctFmt(t.avg_winner)], colors: ['rgb(50,50,255)'] },
+                  { label: 'Avg Loser', values: [pctFmt(t.avg_loser)], colors: ['rgb(255,50,150)'] },
+                  { label: 'EV', values: [pctFmt(t.ev)], colors: [t.ev >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)'] },
+                  { label: 'Profit Factor', values: [t.profit_factor.toFixed(2)] },
+                  { label: 'Avg Time Winner', values: [t.avg_time_winner.toFixed(1) + ' bars'] },
+                  { label: 'Avg Time Loser', values: [t.avg_time_loser.toFixed(1) + ' bars'] },
+                ]
+
+                return (
+                  <div style={{ padding: 12, overflowY: 'auto', display: 'flex', flexWrap: 'wrap', gap: 16, alignItems: 'flex-start' }}>
+                    {result.legs.map((leg, i) =>
+                      <div key={i} style={{ flex: '1 1 300px', maxWidth: 400 }}>
+                        {renderStatsTable(
+                          `${leg.target.replace(/_/g, ' ')} — ${leg.entry_signal.replace(/_/g, ' ')} (${leg.direction})`,
+                          resultIsMultiLeg ? LEG_COLORS[i % LEG_COLORS.length] : '#657b83',
+                          buildPortfolioRows(leg.stats.portfolio, leg.target),
+                          buildTradeRows(leg.stats.trade),
+                        )}
+                      </div>
+                    )}
+                    {resultIsMultiLeg && (
+                      <div style={{ flex: '1 1 300px', maxWidth: 400 }}>
+                        {renderStatsTable(
+                          'Combined Portfolio',
+                          '#8BC34A',
+                          buildPortfolioRows(cs.portfolio),
+                          buildTradeRows(cs.trade),
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )
+              })()}
+
+              {/* ── Distribution tab ── */}
+              {resultTab === 'distribution' && (
+                <>
+                  <div className="backtest-hist-toggles">
+                    {resultIsMultiLeg && (
+                      <div style={{ display: 'flex', gap: 4, marginRight: 12, alignItems: 'center' }}>
+                        <span style={{ fontSize: 11, fontWeight: 600, color: '#657b83' }}>Leg:</span>
+                        <button
+                          className={`summary-tab ${distLegFilter === -1 ? 'active' : ''}`}
+                          onClick={() => setDistLegFilter(-1)}>All</button>
+                        {result.legs.map((leg, i) => (
+                          <button key={i}
+                            className={`summary-tab ${distLegFilter === i ? 'active' : ''}`}
+                            style={{ borderBottomColor: distLegFilter === i ? LEG_COLORS[i] : undefined }}
+                            onClick={() => setDistLegFilter(i)}>
+                            {leg.target.replace(/_/g, ' ').slice(0, 12)}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    {(['mae', 'change', 'mfe'] as HistMetric[]).map(m => (
+                      <button key={m}
+                        className={`summary-tab ${histVisible.has(m) ? 'active' : ''}`}
+                        style={histVisible.has(m) ? { borderBottomColor: HIST_COLORS[m].stroke, color: HIST_COLORS[m].stroke } : {}}
+                        onClick={() => setHistVisible(prev => {
+                          const next = new Set(prev)
+                          if (next.has(m)) next.delete(m); else next.add(m)
+                          return next
+                        })}>{HIST_COLORS[m].label}</button>
                     ))}
                   </div>
-                  <div className="search-results">
-                    {targetSearchResults.map((r, i) => (
-                      <div
-                        key={`${r.category}-${r.name}`}
-                        className={`search-result-item ${i === targetSearchHighlight ? 'highlighted' : ''}`}
-                        ref={i === targetSearchHighlight ? el => el?.scrollIntoView({ block: 'nearest' }) : undefined}
-                        onMouseDown={() => handleTargetSearchSelect(r)}
-                        onMouseEnter={() => setTargetSearchHighlight(i)}
-                      >
-                        <span className="search-result-name">{r.displayName}</span>
-                        <span className="search-result-tag">{r.category}</span>
-                      </div>
-                    ))}
-                    {targetSearchResults.length === 0 && (
-                      <div className="search-result-empty">No matches</div>
+                  <div className="backtest-chart" ref={histContainerRef}>
+                    <canvas ref={histCanvasRef} style={{ display: 'block', width: '100%', height: '100%' }}
+                      onMouseMove={handleHistMouseMove} onMouseLeave={handleHistMouseLeave} />
+                  </div>
+                </>
+              )}
+
+              {/* ── Path tab ── */}
+              {resultTab === 'path' && (
+                <div className="backtest-path-container">
+                  <div className="backtest-chart" ref={pathContainerRef} style={{ position: 'relative' }}>
+                    <canvas ref={pathCanvasRef} style={{ display: 'block', width: '100%', height: '100%' }} />
+                    <button className={`log-toggle-btn ${pathLogScale ? 'active' : ''}`} onClick={() => setPathLogScale(v => !v)}>L</button>
+                  </div>
+                  <div className="backtest-path-legend" style={resultIsMultiLeg ? { width: 320, minWidth: 320 } : undefined}>
+                    {(() => {
+                      const rankColor = (rank: number, total: number): string => {
+                        if (total <= 1) return 'rgb(50, 50, 255)'
+                        const t = rank / (total - 1)
+                        if (t <= 0.5) { const s = t * 2; return `rgb(${Math.round(50 + 102 * s)}, 50, ${Math.round(255 - 53 * s)})` }
+                        const s = (t - 0.5) * 2; return `rgb(${Math.round(152 + 103 * s)}, 50, ${Math.round(202 - 52 * s)})`
+                      }
+                      const items = allPaths.map((d, gi) => ({ ...d, gi }))
+                      const hasTickers = items.some(d => d.trade.ticker)
+                      const colorRanked = [...items].sort((a, b) => b.ret - a.ret)
+                      const colorMap = new Map(colorRanked.map((d, rank) => [d.gi, rankColor(rank, colorRanked.length)]))
+                      const sorted = [...items].sort((a, b) => {
+                        let cmp = 0
+                        if (pathSortCol === 'leg') cmp = a.legTarget.localeCompare(b.legTarget)
+                        else if (pathSortCol === 'ticker') cmp = (a.trade.ticker ?? '').localeCompare(b.trade.ticker ?? '')
+                        else if (pathSortCol === 'date') cmp = a.trade.entry_date.localeCompare(b.trade.entry_date)
+                        else cmp = a.ret - b.ret
+                        return pathSortAsc ? cmp : -cmp
+                      })
+                      const toggleSort = (col: typeof pathSortCol) => {
+                        if (pathSortCol === col) setPathSortAsc(v => !v)
+                        else { setPathSortCol(col); setPathSortAsc(col === 'change' ? false : true) }
+                      }
+                      const arrow = (col: typeof pathSortCol) => pathSortCol === col ? (pathSortAsc ? ' \u25B2' : ' \u25BC') : ''
+                      return (
+                        <>
+                          <div className="path-legend-header">
+                            {resultIsMultiLeg && <span className="path-legend-col ticker" onClick={() => toggleSort('leg')}>Leg{arrow('leg')}</span>}
+                            {hasTickers && <span className="path-legend-col ticker" onClick={() => toggleSort('ticker')}>Ticker{arrow('ticker')}</span>}
+                            <span className="path-legend-col date" onClick={() => toggleSort('date')}>Date{arrow('date')}</span>
+                            <span className="path-legend-col change" onClick={() => toggleSort('change')}>Chg{arrow('change')}</span>
+                          </div>
+                          {sorted.map(({ trade, gi, ret, legTarget, legIdx }) => (
+                            <div key={gi}
+                              className={`path-legend-row ${hoveredPath === gi ? 'highlighted' : ''}`}
+                              style={{ color: colorMap.get(gi) }}
+                              onMouseEnter={() => setHoveredPath(gi)}
+                              onMouseLeave={() => setHoveredPath(null)}>
+                              {resultIsMultiLeg && <span className="path-legend-col ticker" style={{ color: LEG_COLORS[legIdx % LEG_COLORS.length] }}>{legTarget.replace(/_/g, ' ').slice(0, 10)}</span>}
+                              {hasTickers && <span className="path-legend-col ticker">{trade.ticker || ''}</span>}
+                              <span className="path-legend-col date">{trade.entry_date.slice(2)}</span>
+                              <span className="path-legend-col change">{(ret * 100).toFixed(1)}%</span>
+                            </div>
+                          ))}
+                        </>
+                      )
+                    })()}
+                  </div>
+                </div>
+              )}
+
+              {/* ── Trades tab ── */}
+              {resultTab === 'trades' && (
+                <div style={{ padding: '8px 12px', overflowY: 'auto', flex: 1, minHeight: 0 }}>
+                  {resultIsMultiLeg && (
+                    <div style={{ display: 'flex', gap: 8, marginBottom: 8, alignItems: 'center' }}>
+                      <span style={{ fontSize: 12, fontWeight: 600 }}>Filter:</span>
+                      <button className={`summary-tab ${tradesLegFilter === -1 ? 'active' : ''}`}
+                        onClick={() => setTradesLegFilter(-1)}>All ({allTrades.length})</button>
+                      {result.legs.map((leg, i) => (
+                        <button key={i}
+                          className={`summary-tab ${tradesLegFilter === i ? 'active' : ''}`}
+                          style={{ borderBottomColor: tradesLegFilter === i ? LEG_COLORS[i] : undefined }}
+                          onClick={() => setTradesLegFilter(i)}>
+                          {leg.target} ({leg.trades.length})
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <div className="summary-table-wrapper">
+                    <table className="summary-table">
+                      <thead>
+                        <tr>
+                          {[
+                            ...(resultIsMultiLeg ? ['legTarget'] : []),
+                            'ticker', 'entry_date', 'exit_date', 'entry_price', 'exit_price', 'change',
+                            'entry_weight', 'exit_weight', 'contribution', 'bars_held',
+                          ].map(col => (
+                            <th key={col} className="summary-th"
+                              onClick={() => { setSortCol(col); setSortAsc(sortCol === col ? !sortAsc : true) }}
+                              style={{ cursor: 'pointer' }}>
+                              {col === 'legTarget' ? 'Leg' : col === 'entry_weight' ? 'Ent.Wt' : col === 'exit_weight' ? 'Ex.Wt' : col === 'contribution' ? 'Contrib' : col.replace(/_/g, ' ')}
+                              {sortCol === col && (sortAsc ? ' \u2191' : ' \u2193')}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {filteredTrades.slice(0, 500).map((t, i) => (
+                          <tr key={i} style={{
+                            background: t.skipped ? 'rgba(147,161,161,0.12)' :
+                              (t.change != null && t.change > 0 ? 'rgba(50,50,255,0.06)' : 'rgba(255,50,150,0.06)')
+                          }}>
+                            {resultIsMultiLeg && (
+                              <td className="summary-td" style={{ color: LEG_COLORS[t.legIdx % LEG_COLORS.length], fontWeight: 600, fontSize: 11 }}>
+                                {t.legTarget}
+                              </td>
+                            )}
+                            <td className="summary-td">{t.ticker || ''}</td>
+                            <td className="summary-td">{t.entry_date}</td>
+                            <td className="summary-td">{t.exit_date}</td>
+                            <td className="summary-td">{t.entry_price != null ? '$' + t.entry_price.toFixed(2) : '--'}</td>
+                            <td className="summary-td">{t.exit_price != null ? '$' + t.exit_price.toFixed(2) : '--'}</td>
+                            <td className="summary-td" style={{
+                              color: t.skipped ? '#93a1a1' : (t.change != null && t.change > 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)'),
+                              fontWeight: 600,
+                            }}>
+                              {t.skipped ? 'SKIP' : pctFmt(t.change)}
+                            </td>
+                            <td className="summary-td">{t.skipped ? '--' : pctFmt(t.entry_weight)}</td>
+                            <td className="summary-td">{t.skipped ? '--' : pctFmt(t.exit_weight)}</td>
+                            <td className="summary-td" style={{
+                              color: !t.skipped && t.contribution != null ? (t.contribution >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)') : undefined,
+                              fontWeight: !t.skipped && t.contribution != null ? 600 : undefined,
+                            }}>
+                              {t.skipped ? '--' : pctFmt(t.contribution)}
+                            </td>
+                            <td className="summary-td">{t.skipped ? '--' : t.bars_held}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    {filteredTrades.length > 500 && (
+                      <div className="summary-empty">Showing first 500 of {filteredTrades.length} trades</div>
                     )}
                   </div>
                 </div>
               )}
             </div>
           </div>
-
-          <div className="backtest-section">
-            <label className="backtest-label">Entry Signal</label>
-            <select className="backtest-select" value={entrySignal} onChange={e => setEntrySignal(e.target.value)}>
-              {ENTRY_SIGNALS.map(s => <option key={s} value={s}>{s.replace(/_/g, ' ')}</option>)}
-            </select>
-            <span className="backtest-hint">Exit: {EXIT_MAP[entrySignal]?.replace(/_/g, ' ')}</span>
-          </div>
-
-          {selectedTargetType === 'basket' && entrySignal !== 'Buy_Hold' && (
-            <div className="backtest-section">
-              <label className="backtest-label">Trade Source</label>
-              <div className="backtest-pos-presets">
-                <button className={`backtest-pos-preset wide ${!useConstituents ? 'active' : ''}`}
-                  onClick={() => setUseConstituents(false)}>Basket Signal</button>
-                <button className={`backtest-pos-preset wide ${useConstituents ? 'active' : ''}`}
-                  onClick={() => setUseConstituents(true)}>Constituent Tickers</button>
-              </div>
-            </div>
-          )}
-
-          <div className="backtest-section">
-            <label className="backtest-label">Position Sizing</label>
-            <div className="backtest-sizing-row">
-              <div className="backtest-sizing-field">
-                <span className="backtest-hint">Size %</span>
-                <input type="number" className="backtest-input" value={positionSize}
-                  onChange={e => setPositionSize(Number(e.target.value))} />
-              </div>
-              <div className="backtest-sizing-field">
-                <span className="backtest-hint">Max Lev %</span>
-                <input type="number" className="backtest-input" value={maxLeverage}
-                  onChange={e => setMaxLeverage(Number(e.target.value))} />
-              </div>
-            </div>
-            <div className="backtest-pos-presets">
-              <span className="backtest-preset-label">Size:</span>
-              {POS_PRESETS.map(p => (
-                <button key={p}
-                  className={`backtest-pos-preset ${positionSize === p ? 'active' : ''}`}
-                  onClick={() => setPositionSize(p)}>{p}%</button>
-              ))}
-            </div>
-            <div className="backtest-pos-presets">
-              <span className="backtest-preset-label">Lev:</span>
-              {LEV_PRESETS.map(p => (
-                <button key={p}
-                  className={`backtest-pos-preset ${maxLeverage === p ? 'active' : ''}`}
-                  onClick={() => setMaxLeverage(p)}>{p}%</button>
-              ))}
-            </div>
-          </div>
-
-          <div className="backtest-section">
-            <label className="backtest-label">Regime Filters</label>
-            {filters.map((f, i) => {
-              const isBool = BOOL_METRICS.includes(f.metric)
-              return (
-                <div key={i} className="backtest-filter-row">
-                  <select className="backtest-select" value={f.metric}
-                    onChange={e => updateFilter(i, 'metric', e.target.value)}>
-                    <optgroup label="Percentage">
-                      {PCT_METRICS.map(m => <option key={m} value={m}>{m}</option>)}
-                    </optgroup>
-                    <optgroup label="Boolean">
-                      {BOOL_METRICS.map(m => <option key={m} value={m}>{m}</option>)}
-                    </optgroup>
-                  </select>
-                  <select className="backtest-select" value={f.condition}
-                    onChange={e => updateFilter(i, 'condition', e.target.value)}>
-                    {isBool ? (
-                      <>
-                        <option value="equals_true">= True</option>
-                        <option value="equals_false">= False</option>
-                      </>
-                    ) : (
-                      <>
-                        <option value="above">Above</option>
-                        <option value="below">Below</option>
-                        <option value="increasing">Increasing</option>
-                        <option value="decreasing">Decreasing</option>
-                      </>
-                    )}
-                  </select>
-                  {!isBool && f.condition !== 'increasing' && f.condition !== 'decreasing' && (
-                    <input type="number" className="backtest-input" value={f.value}
-                      onChange={e => updateFilter(i, 'value', e.target.value)} />
-                  )}
-                  {targetType === 'ticker' && (
-                    <select className="backtest-select" value={f.source}
-                      onChange={e => updateFilter(i, 'source', e.target.value)}>
-                      <option value="self">Self</option>
-                      {availableBaskets.map(b => <option key={b} value={b}>{b.replace(/_/g, ' ')}</option>)}
-                    </select>
-                  )}
-                  <button className="backtest-remove-btn" onClick={() => removeFilter(i)}>X</button>
-                </div>
-              )
-            })}
-            <button className="control-btn" onClick={addFilter}>+ Add Filter</button>
-          </div>
-
-          <div className="backtest-section">
-            <label className="backtest-label">Date Range</label>
-            <div className="backtest-filter-row">
-              <input type="date" className="backtest-input" value={startDate}
-                min={dataRange?.min} max={endDate || dataRange?.max}
-                onChange={e => setStartDate(e.target.value)} style={{ width: 130 }} />
-              <span className="backtest-hint">to</span>
-              <input type="date" className="backtest-input" value={endDate}
-                min={startDate || dataRange?.min} max={dataRange?.max}
-                onChange={e => setEndDate(e.target.value)} style={{ width: 130 }} />
-            </div>
-            {dataRange && (
-              <span className="backtest-hint">Data: {dataRange.min} to {dataRange.max}</span>
-            )}
-          </div>
-
-          <button className="control-btn primary" onClick={runBacktest} disabled={loading}>
-            {loading ? 'Running...' : 'Run Backtest'}
-          </button>
-          {error && <div className="backtest-error">{error}</div>}
-
-          </div>{/* single-leg-card */}
-         </div>{/* multi-leg-grid */}
         </div>
       </div>
     )
   }
 
-  // Results mode
-  const stats = result!.stats
+  /* ━━━━━━━━━━━━━━━━━━━━━━ Configuration Mode ━━━━━━━━━━━━━━━━━━━━━━ */
 
-  const isMultiTicker = result?.trades.some(t => t.ticker) ?? false
-  const tradeColumns: { key: TradeSortCol; label: string }[] = [
-    ...(isMultiTicker ? [{ key: 'ticker' as TradeSortCol, label: 'Ticker' }] : []),
-    { key: 'entry_date', label: 'Entry Date' },
-    { key: 'exit_date', label: 'Exit Date' },
-    { key: 'entry_price', label: 'Entry $' },
-    { key: 'exit_price', label: 'Exit $' },
-    { key: 'change', label: 'Change%' },
-    { key: 'mfe', label: 'MFE' },
-    { key: 'mae', label: 'MAE' },
-    { key: 'bars_held', label: 'Bars' },
-    { key: 'regime_pass', label: 'Filter' },
-  ]
-
-  const statRows: { label: string; filt: string; unfilt: string; filtColor?: string; unfiltColor?: string }[] = [
-    { label: 'Trades', filt: String(stats.filtered.trades), unfilt: String(stats.unfiltered.trades) },
-    { label: 'Win Rate', filt: pctFmt(stats.filtered.win_rate), unfilt: pctFmt(stats.unfiltered.win_rate) },
-    { label: 'Avg Winner', filt: pctFmt(stats.filtered.avg_winner), unfilt: pctFmt(stats.unfiltered.avg_winner), filtColor: 'rgb(50,50,255)', unfiltColor: 'rgb(50,50,255)' },
-    { label: 'Avg Loser', filt: pctFmt(stats.filtered.avg_loser), unfilt: pctFmt(stats.unfiltered.avg_loser), filtColor: 'rgb(255,50,150)', unfiltColor: 'rgb(255,50,150)' },
-    { label: 'EV', filt: pctFmt(stats.filtered.ev), unfilt: pctFmt(stats.unfiltered.ev),
-      filtColor: stats.filtered.ev >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)',
-      unfiltColor: stats.unfiltered.ev >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)' },
-    { label: 'PF', filt: stats.filtered.profit_factor.toFixed(2), unfilt: stats.unfiltered.profit_factor.toFixed(2) },
-    { label: 'Max DD', filt: pctFmt(stats.filtered.max_dd), unfilt: pctFmt(stats.unfiltered.max_dd), filtColor: 'rgb(255,50,150)', unfiltColor: 'rgb(255,50,150)' },
-    { label: 'Avg Bars', filt: stats.filtered.avg_bars.toFixed(1), unfilt: stats.unfiltered.avg_bars.toFixed(1) },
-  ]
-
-  return (
-    <div className="backtest-panel">
-      <div className="backtest-results-header">
-        <button className="summary-tab" onClick={() => setShowResults(false)}>Back</button>
-        <span className="backtest-results-title">
-          {selectedTarget.replace(/_/g, ' ')}{isMultiTicker ? ' Tickers' : ''} -- {entrySignal.replace(/_/g, ' ')} Backtest
-        </span>
-        {result?.date_range && (
-          <span className="backtest-hint">
-            {result.date_range.min} to {result.date_range.max}
-          </span>
+  const renderLegCard = (leg: LegConfig, i: number) => (
+    <div key={i} className={isSingleLeg ? 'single-leg-card' : 'multi-leg-card'}
+      style={isMultiLeg ? { borderTop: `3px solid ${LEG_COLORS[i % LEG_COLORS.length]}` } : undefined}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <label className="backtest-label" style={isMultiLeg ? { color: LEG_COLORS[i % LEG_COLORS.length] } : undefined}>
+          {isMultiLeg ? `Leg ${i + 1}` : 'Target'}
+        </label>
+        {isMultiLeg && (
+          <button className="backtest-remove-btn" onClick={() => removeLeg(i)}>X</button>
         )}
       </div>
 
-      {result?.blew_up && (
-        <div className="backtest-blowup">
-          BLEW UP on {result.blew_up.date} ({result.blew_up.equity} equity went to zero)
+      <div className="bt-search-container">
+        <div className="bt-search-input-wrapper" onClick={() => { setLegSearchOpen(i); setLegSearchQuery(''); setTimeout(() => legSearchRef.current?.focus(), 0) }}>
+          {legSearchOpen === i ? (
+            <input
+              ref={legSearchRef}
+              className="bt-search-input"
+              value={legSearchQuery}
+              onChange={e => { setLegSearchQuery(e.target.value); setLegSearchHighlight(0) }}
+              onKeyDown={e => handleLegSearchKeyDown(i, e)}
+              onBlur={() => setTimeout(() => setLegSearchOpen(null), 200)}
+              placeholder={leg.target ? leg.target.replace(/_/g, ' ') : 'Search basket or ticker...'}
+              autoFocus
+            />
+          ) : (
+            <div className="bt-search-display">
+              <span className="bt-search-display-name">{leg.target ? leg.target.replace(/_/g, ' ') : 'Select target...'}</span>
+              {leg.target && <span className="bt-search-display-tag">{leg.targetType === 'ticker' ? 'Ticker' : 'Basket'}</span>}
+            </div>
+          )}
+        </div>
+        {legSearchOpen === i && (
+          <div className="bt-search-dropdown">
+            <div className="search-filters">
+              {(['all', 'Themes', 'Sectors', 'Industries', 'Tickers'] as const).map(f => (
+                <button
+                  key={f}
+                  className={`search-filter-btn ${legSearchFilter === f ? 'active' : ''}`}
+                  onMouseDown={e => { e.preventDefault(); setLegSearchFilter(f) }}
+                >
+                  {f === 'all' ? 'All' : f}
+                </button>
+              ))}
+            </div>
+            <div className="search-results">
+              {legSearchResults.map((r, ri) => (
+                <div
+                  key={`${r.category}-${r.name}`}
+                  className={`search-result-item ${ri === legSearchHighlight ? 'highlighted' : ''}`}
+                  ref={ri === legSearchHighlight ? el => el?.scrollIntoView({ block: 'nearest' }) : undefined}
+                  onMouseDown={() => handleLegSearchSelect(i, r)}
+                  onMouseEnter={() => setLegSearchHighlight(ri)}
+                >
+                  <span className="search-result-name">{r.displayName}</span>
+                  <span className="search-result-tag">{r.category}</span>
+                </div>
+              ))}
+              {legSearchResults.length === 0 && (
+                <div className="search-result-empty">No matches</div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {leg.targetType !== 'ticker' && (
+        <div className="backtest-pos-presets" style={{ marginTop: 4 }}>
+          <button className={`backtest-pos-preset wide ${leg.targetType === 'basket' ? 'active' : ''}`}
+            onClick={() => updateLeg(i, { targetType: 'basket' })}>Basket Signal</button>
+          <button className={`backtest-pos-preset wide ${leg.targetType === 'basket_tickers' ? 'active' : ''}`}
+            onClick={() => updateLeg(i, { targetType: 'basket_tickers' })}>Constituent Tickers</button>
         </div>
       )}
 
-      <div className="backtest-body">
-        <div className="backtest-main">
-          <div className="summary-tabs">
-            <button className={`summary-tab ${resultTab === 'equity' ? 'active' : ''}`} onClick={() => setResultTab('equity')}>Equity</button>
-            <button className={`summary-tab ${resultTab === 'stats' ? 'active' : ''}`} onClick={() => setResultTab('stats')}>Stats</button>
-            <button className={`summary-tab ${resultTab === 'distribution' ? 'active' : ''}`} onClick={() => setResultTab('distribution')}>Distribution</button>
-            <button className={`summary-tab ${resultTab === 'chart' ? 'active' : ''}`} onClick={() => setResultTab('chart')}>Chart</button>
-            <button className={`summary-tab ${resultTab === 'path' ? 'active' : ''}`} onClick={() => setResultTab('path')}>Path</button>
-            <button className={`summary-tab ${resultTab === 'trades' ? 'active' : ''}`} onClick={() => setResultTab('trades')}>Trades</button>
-          </div>
+      <div className="backtest-section">
+        <label className="backtest-label">Entry Signal</label>
+        <select className="backtest-select" value={leg.entrySignal}
+          onChange={e => updateLeg(i, { entrySignal: e.target.value })}>
+          {ENTRY_SIGNALS.map(s => <option key={s} value={s}>{s.replace(/_/g, ' ')}</option>)}
+        </select>
+        <span className="backtest-hint">Exit: {EXIT_MAP[leg.entrySignal]?.replace(/_/g, ' ')}</span>
+      </div>
 
-          <div className="backtest-content">
-            {resultTab === 'equity' ? (
-              <>
-                <div className="analysis-date-controls">
-                  <div className="bt-strat-btns">
-                    <button className={`bt-strat-btn ${showFiltered ? 'active' : ''}`}
-                      style={showFiltered ? { background: '#8BC34A', borderColor: '#8BC34A', color: '#fff' } : undefined}
-                      onClick={() => setShowFiltered(v => !v)}>Filtered</button>
-                    {(['Breakout', 'Up_Rot', 'BTFD'] as const).map(sig => (
-                      <button key={sig} className={`bt-strat-btn ${showBenchmark[sig] ? 'active' : ''}`}
-                        style={showBenchmark[sig] ? { background: BENCHMARK_COLORS[sig], borderColor: BENCHMARK_COLORS[sig], color: '#fff' } : undefined}
-                        onClick={() => setShowBenchmark(prev => ({ ...prev, [sig]: !prev[sig] }))}>{sig.replace('_', ' ')}</button>
-                    ))}
-                    {(['Breakdown', 'Down_Rot', 'STFR'] as const).map(sig => (
-                      <button key={sig} className={`bt-strat-btn ${showBenchmark[sig] ? 'active' : ''}`}
-                        style={showBenchmark[sig] ? { background: BENCHMARK_COLORS[sig], borderColor: BENCHMARK_COLORS[sig], color: '#fff' } : undefined}
-                        onClick={() => setShowBenchmark(prev => ({ ...prev, [sig]: !prev[sig] }))}>{sig.replace('_', ' ')}</button>
-                    ))}
-                    <button className={`bt-strat-btn ${showBuyHold ? 'active' : ''}`}
-                      style={showBuyHold ? { background: '#93a1a1', borderColor: '#93a1a1', color: '#fff' } : undefined}
-                      onClick={() => setShowBuyHold(v => !v)}>Buy Hold</button>
-                    <button className={`bt-strat-btn ${showConstituents ? 'active' : ''}`}
-                      style={showConstituents ? { background: '#d33682', borderColor: '#d33682', color: '#fff' } : undefined}
-                      onClick={() => { setShowConstituents(v => !v); setEqPinnedIdx(null); setEqHoverIdx(null) }}>Const</button>
-                  </div>
-                  <div style={{ flex: 1 }} />
-                  <div className="basket-returns-presets">
-                    {(['1Y', '3Y', '5Y', 'YTD', 'All'] as const).map(p => (
-                      <button key={p} className="basket-returns-preset-btn" onClick={() => setEqPreset(p)}>{p}</button>
-                    ))}
-                  </div>
-                </div>
-                <div className="backtest-chart" ref={containerRef} style={{ position: 'relative' }}>
-                  <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: '100%', cursor: 'grab' }} />
-                  {showConstituents && (() => {
-                    const activeIdx = eqPinnedIdx ?? eqHoverIdx
-                    if (activeIdx == null) return null
-                    const { padLeft, plotW, n, startIdx } = eqScaleRef.current
-                    const localIdx = activeIdx - startIdx
-                    const crosshairX = n > 1 ? padLeft + (localIdx / (n - 1)) * plotW : padLeft
-                    const showCrosshair = localIdx >= 0 && localIdx < n
-                    const snapshot = result?.daily_positions?.[activeIdx]
-                    const date = result?.equity_curve.dates[activeIdx]
-                    return (
-                      <>
-                        {showCrosshair && (
-                          <div style={{
-                            position: 'absolute', top: 0, bottom: 0, left: crosshairX, width: 1,
-                            background: eqPinnedIdx != null ? 'rgb(50,50,255)' : '#93a1a1',
-                            pointerEvents: 'none', zIndex: 100,
-                          }} />
-                        )}
-                        {snapshot && date && (
-                          <div className="candle-detail-overlay" style={eqPinnedIdx != null ? { pointerEvents: 'auto', borderColor: 'rgb(50,50,255)' } : undefined}>
-                            <div className="candle-detail-title">
-                              {date} &mdash; {dollarFmt(snapshot.equity)}
-                              {eqPinnedIdx != null
-                                ? <span style={{ marginLeft: 8, fontSize: 9, color: 'rgb(50,50,255)' }}>PINNED (esc)</span>
-                                : <span style={{ marginLeft: 8, fontSize: 9, color: '#93a1a1' }}>click to pin</span>}
-                            </div>
-                            <div className="candle-detail-row" style={{ fontWeight: 'bold', borderBottom: '1px solid #ccc' }}>
-                              <span className="ticker">{isMultiTicker ? 'Ticker' : 'Entry'}</span>
-                              <span className="weight">Weight</span>
-                              <span className="ret">Return</span>
-                              <span className="contrib">Contrib</span>
-                            </div>
-                            {snapshot.positions.map((p, i) => (
-                              <div key={i} className="candle-detail-row">
-                                <span className="ticker">{isMultiTicker ? p.ticker : p.entry_date?.slice(5)}</span>
-                                <span className="weight">{(p.weight * 100).toFixed(1)}%</span>
-                                <span className="ret" style={{ color: p.daily_return >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)' }}>
-                                  {(p.daily_return * 100).toFixed(2)}%</span>
-                                <span className="contrib" style={{ color: p.contribution >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)' }}>
-                                  {(p.contribution * 100).toFixed(3)}%</span>
-                              </div>
-                            ))}
-                            <div className="candle-detail-row" style={{ borderTop: '1px solid #93a1a1', fontWeight: 'bold' }}>
-                              <span className="ticker">Total</span>
-                              <span className="weight">{(snapshot.exposure_pct * 100).toFixed(1)}%</span>
-                              <span className="ret"></span>
-                              <span className="contrib" style={{
-                                color: snapshot.positions.reduce((s, p) => s + p.contribution, 0) >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)'
-                              }}>
-                                {(snapshot.positions.reduce((s, p) => s + p.contribution, 0) * 100).toFixed(3)}%</span>
-                            </div>
-                          </div>
-                        )}
-                      </>
-                    )
-                  })()}
-                </div>
-                {result && (
-                  <RangeScrollbar
-                    total={result.equity_curve.dates.length}
-                    start={eqViewRef.current.start}
-                    end={eqViewRef.current.end}
-                    onChange={(s, e) => { eqViewRef.current = { start: s, end: e }; setEqViewVersion(v => v + 1) }}
-                  />
-                )}
-              </>
-            ) : resultTab === 'chart' ? (
-              <>
-              <div className="header-toggles" style={{ padding: '4px 8px' }}>
-                <label className="overlay-checkbox"><input type="checkbox" checked={showPivots} onChange={e => setShowPivots(e.target.checked)} /> Pivots</label>
-                <label className="overlay-checkbox"><input type="checkbox" checked={showTargets} onChange={e => setShowTargets(e.target.checked)} /> Targets</label>
-                {(chartTickers.length > 0 || targetType === 'ticker') ? (
-                  <label className="overlay-checkbox"><input type="checkbox" checked={showVolume} onChange={e => setShowVolume(e.target.checked)} /> Volume</label>
+      <div className="backtest-section">
+        <label className="backtest-label">Position Sizing</label>
+        <div className="backtest-sizing-row">
+          {isMultiLeg && (
+            <div className="backtest-sizing-field">
+              <span className="backtest-hint">Alloc %</span>
+              <input type="number" className="backtest-input" min={1} max={100}
+                value={leg.allocationPct}
+                onChange={e => updateLeg(i, { allocationPct: Number(e.target.value) })} />
+            </div>
+          )}
+          <div className="backtest-sizing-field">
+            <span className="backtest-hint">Size %</span>
+            <input type="number" className="backtest-input" min={1} max={100}
+              value={leg.positionSize}
+              onChange={e => updateLeg(i, { positionSize: Number(e.target.value) })} />
+          </div>
+        </div>
+        <div className="backtest-pos-presets">
+          <span className="backtest-preset-label">Size:</span>
+          {POS_PRESETS.map(p => (
+            <button key={p}
+              className={`backtest-pos-preset ${leg.positionSize === p ? 'active' : ''}`}
+              onClick={() => updateLeg(i, { positionSize: p })}>{p}%</button>
+          ))}
+        </div>
+      </div>
+
+      <div className="backtest-section">
+        <label className="backtest-label">Regime Filters</label>
+        {leg.filters.map((f, fi) => {
+          const isBool = BOOL_METRICS.includes(f.metric)
+          return (
+            <div key={fi} className="backtest-filter-row">
+              <select className="backtest-select" value={f.metric}
+                onChange={e => {
+                  const m = e.target.value
+                  updateFilterField(i, fi, 'metric', m)
+                  if (BOOL_METRICS.includes(m)) updateFilterField(i, fi, 'condition', 'equals_true')
+                }}>
+                <optgroup label="Percentage">
+                  {PCT_METRICS.map(m => <option key={m} value={m}>{m}</option>)}
+                </optgroup>
+                <optgroup label="Boolean">
+                  {BOOL_METRICS.map(m => <option key={m} value={m}>{m}</option>)}
+                </optgroup>
+              </select>
+              <select className="backtest-select" value={f.condition}
+                onChange={e => updateFilterField(i, fi, 'condition', e.target.value)}>
+                {isBool ? (
+                  <>
+                    <option value="equals_true">= True</option>
+                    <option value="equals_false">= False</option>
+                  </>
                 ) : (
                   <>
-                    <label className="overlay-checkbox"><input type="checkbox" checked={showBreadth} onChange={e => setShowBreadth(e.target.checked)} /> Breadth%</label>
-                    <label className="overlay-checkbox"><input type="checkbox" checked={showBreakout} onChange={e => setShowBreakout(e.target.checked)} /> Breakout%</label>
-                    <label className="overlay-checkbox"><input type="checkbox" checked={showCorrelation} onChange={e => setShowCorrelation(e.target.checked)} /> Correlation%</label>
+                    <option value="above">Above</option>
+                    <option value="below">Below</option>
+                    <option value="increasing">Increasing</option>
+                    <option value="decreasing">Decreasing</option>
                   </>
                 )}
-                <label className="overlay-checkbox"><input type="checkbox" checked={showRV} onChange={e => setShowRV(e.target.checked)} /> RV</label>
-                {result && result.trades.length > 0 && (
-                  <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6 }}>
-                    {chartTickers.length > 0 && (
-                      <>
-                        <button className="backtest-nav-btn" onClick={() => { setChartTickerIdx(i => Math.max(0, i - 1)); setTradeIndex(0) }} disabled={chartTickerIdx <= 0}>&larr;</button>
-                        <select className="backtest-nav-select" value={chartTickerIdx}
-                          onChange={e => { setChartTickerIdx(Number(e.target.value)); setTradeIndex(0) }}>
-                          {chartTickers.map((tkr, i) => <option key={tkr} value={i}>{tkr}</option>)}
-                        </select>
-                        <button className="backtest-nav-btn" onClick={() => { setChartTickerIdx(i => Math.min(chartTickers.length - 1, i + 1)); setTradeIndex(0) }} disabled={chartTickerIdx >= chartTickers.length - 1}>&rarr;</button>
-                        <span style={{ borderLeft: '1px solid var(--border-color)', height: 16, margin: '0 4px' }} />
-                      </>
-                    )}
-                    {(() => {
-                      const currentTkr = chartTickers.length > 0 ? chartTickers[Math.min(chartTickerIdx, chartTickers.length - 1)] : null
-                      const tickerTrades = currentTkr ? result.trades.filter(t => t.ticker === currentTkr) : result.trades
-                      const count = tickerTrades.length
-                      return (
-                        <>
-                          <button className="backtest-nav-btn" onClick={() => navigateToTrade(tradeIndex - 1)} disabled={tradeIndex <= 0}>&larr;</button>
-                          <select className="backtest-nav-select" value={tradeIndex}
-                            onChange={e => navigateToTrade(Number(e.target.value))}>
-                            {tickerTrades.map((t, i) => <option key={i} value={i}>{t.entry_date}</option>)}
-                          </select>
-                          <button className="backtest-nav-btn" onClick={() => navigateToTrade(tradeIndex + 1)} disabled={tradeIndex >= count - 1}>&rarr;</button>
-                        </>
-                      )
-                    })()}
-                  </div>
-                )}
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
-              <div className="backtest-chart" style={{ position: 'relative', flex: 1, minHeight: '100px' }}>
-                <div ref={priceChartRef} style={{ width: '100%', height: '100%' }} />
-              </div>
-              {[
-                { id: 'volume',      ref: volChartRef,     visible: showVolume && (chartTickers.length > 0 || targetType === 'ticker') },
-                { id: 'breadth',     ref: breadthChartRef, visible: showBreadth && !(chartTickers.length > 0 || targetType === 'ticker') },
-                { id: 'breakout',    ref: breakoutChartRef, visible: showBreakout && !(chartTickers.length > 0 || targetType === 'ticker') },
-                { id: 'correlation', ref: corrChartRef,    visible: showCorrelation && !(chartTickers.length > 0 || targetType === 'ticker') },
-                { id: 'rv',          ref: rvChartRef,     visible: showRV },
-              ].map(pane => (
-                <div key={pane.id}>
-                  {pane.visible && <div style={{ height: '4px', background: '#93a1a1', flexShrink: 0 }} />}
-                  <div ref={pane.ref} style={{ height: pane.visible ? '120px' : 0, flexShrink: 0, overflow: 'hidden' }} />
-                </div>
-              ))}
-              </div>
-              </>
-            ) : resultTab === 'distribution' ? (
-              <>
-                <div className="backtest-hist-toggles">
-                  {(['mae', 'change', 'mfe'] as HistMetric[]).map(m => (
-                    <button key={m}
-                      className={`summary-tab ${histVisible.has(m) ? 'active' : ''}`}
-                      style={histVisible.has(m) ? { borderBottomColor: HIST_COLORS[m].stroke, color: HIST_COLORS[m].stroke } : {}}
-                      onClick={() => setHistVisible(prev => {
-                        const next = new Set(prev)
-                        if (next.has(m)) next.delete(m); else next.add(m)
-                        return next
-                      })}>{HIST_COLORS[m].label}</button>
-                  ))}
-                </div>
-                <div className="backtest-chart" ref={histContainerRef}>
-                  <canvas ref={histCanvasRef} style={{ display: 'block', width: '100%', height: '100%' }}
-                    onMouseMove={handleHistMouseMove} onMouseLeave={handleHistMouseLeave} />
-                </div>
-              </>
-            ) : resultTab === 'path' ? (
-              <div className="backtest-path-container">
-                <div className="backtest-chart" ref={pathContainerRef}>
-                  <canvas ref={pathCanvasRef} style={{ display: 'block', width: '100%', height: '100%' }} />
-                </div>
-                <div className="backtest-path-legend">
-                  {(() => {
-                    if (!result) return null
-                    const pathRankColor = (rank: number, total: number): string => {
-                      if (total <= 1) return 'rgb(50, 50, 255)'
-                      const t = rank / (total - 1)
-                      if (t <= 0.5) {
-                        const s = t * 2
-                        return `rgb(${Math.round(50 + 102 * s)}, 50, ${Math.round(255 - 53 * s)})`
-                      } else {
-                        const s = (t - 0.5) * 2
-                        return `rgb(${Math.round(152 + 103 * s)}, 50, ${Math.round(202 - 52 * s)})`
-                      }
-                    }
-                    const items = result.trades.map((t, i) => ({
-                      t, i, ret: (result.trade_paths[i] ?? []).slice(-1)[0] ?? 0
-                    }))
-                    // Color rank always by return (best=blue, worst=pink)
-                    const colorRanked = [...items].sort((a, b) => b.ret - a.ret)
-                    const colorMap = new Map(colorRanked.map((d, rank) => [d.i, pathRankColor(rank, colorRanked.length)]))
-                    // Sort by selected column
-                    const sorted = [...items].sort((a, b) => {
-                      let cmp = 0
-                      if (pathSortCol === 'ticker') cmp = (a.t.ticker ?? '').localeCompare(b.t.ticker ?? '')
-                      else if (pathSortCol === 'date') cmp = a.t.entry_date.localeCompare(b.t.entry_date)
-                      else cmp = a.ret - b.ret
-                      return pathSortAsc ? cmp : -cmp
-                    })
-                    const isMulti = result.trades.some(t => t.ticker)
-                    const toggleSort = (col: 'ticker' | 'date' | 'change') => {
-                      if (pathSortCol === col) setPathSortAsc(v => !v)
-                      else { setPathSortCol(col); setPathSortAsc(col === 'change' ? false : true) }
-                    }
-                    const arrow = (col: 'ticker' | 'date' | 'change') => pathSortCol === col ? (pathSortAsc ? ' \u25B2' : ' \u25BC') : ''
-                    return (
-                      <>
-                        <div className="path-legend-header">
-                          {isMulti && <span className="path-legend-col ticker" onClick={() => toggleSort('ticker')}>Ticker{arrow('ticker')}</span>}
-                          <span className="path-legend-col date" onClick={() => toggleSort('date')}>Date{arrow('date')}</span>
-                          <span className="path-legend-col change" onClick={() => toggleSort('change')}>Chg{arrow('change')}</span>
-                        </div>
-                        {sorted.map(({ t, i, ret }) => (
-                          <div key={i}
-                            className={`path-legend-row ${hoveredPath === i ? 'highlighted' : ''}`}
-                            style={{ color: colorMap.get(i) }}
-                            onMouseEnter={() => setHoveredPath(i)}
-                            onMouseLeave={() => setHoveredPath(null)}>
-                            {isMulti && <span className="path-legend-col ticker">{t.ticker}</span>}
-                            <span className="path-legend-col date">{t.entry_date.slice(2)}</span>
-                            <span className="path-legend-col change">{(ret * 100).toFixed(1)}%</span>
-                          </div>
-                        ))}
-                      </>
-                    )
-                  })()}
-                </div>
-              </div>
-            ) : resultTab === 'stats' ? (
-              <div style={{ padding: 16, overflow: 'auto' }}>
-                <table className="backtest-stats-table" style={{ fontSize: 13 }}>
-                  <thead>
-                    <tr>
-                      <th className="backtest-stats-th" style={{ fontSize: 11, padding: '4px 12px' }}></th>
-                      <th className="backtest-stats-th" style={{ fontSize: 11, padding: '4px 12px' }}>Filtered</th>
-                      <th className="backtest-stats-th" style={{ fontSize: 11, padding: '4px 12px' }}>All</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {statRows.map(r => (
-                      <tr key={r.label}>
-                        <td className="backtest-stats-td label" style={{ padding: '4px 12px' }}>{r.label}</td>
-                        <td className="backtest-stats-td" style={{ color: r.filtColor, padding: '4px 12px' }}><b>{r.filt}</b></td>
-                        <td className="backtest-stats-td" style={{ color: r.unfiltColor, padding: '4px 12px' }}><b>{r.unfilt}</b></td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            ) : (
-              <div className="summary-table-wrapper">
-                <table className="summary-table">
-                  <thead>
-                    <tr>
-                      {tradeColumns.map(col => (
-                        <th key={col.key} className="summary-th" onClick={() => handleSort(col.key)} style={{ cursor: 'pointer' }}>
-                          {col.label} {sortCol === col.key ? (sortAsc ? '\u25B2' : '\u25BC') : ''}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {sortedTrades.map((t, i) => {
-                      const isSkipped = t.skipped === true
-                      const isWinner = !isSkipped && t.change !== null && t.change > 0
-                      const rowBg = isSkipped ? 'rgba(147, 161, 161, 0.12)' : isWinner ? 'rgba(50, 50, 255, 0.06)' : 'rgba(255, 50, 150, 0.06)'
-                      return (
-                        <tr key={i} style={{ backgroundColor: rowBg }}>
-                          {isMultiTicker && <td className="summary-td" style={{ fontWeight: 'bold' }}>{t.ticker}</td>}
-                          <td className="summary-td">{t.entry_date}</td>
-                          <td className="summary-td">{isSkipped ? '--' : t.exit_date}</td>
-                          <td className="summary-td">{t.entry_price !== null ? '$' + t.entry_price.toFixed(2) : '--'}</td>
-                          <td className="summary-td">{isSkipped ? '--' : (t.exit_price !== null ? '$' + t.exit_price.toFixed(2) : '--')}</td>
-                          <td className="summary-td" style={{ color: isSkipped ? '#93a1a1' : isWinner ? 'rgb(50,50,255)' : 'rgb(255,50,150)', fontWeight: 'bold' }}>
-                            {isSkipped ? <span style={{ background: '#93a1a1', color: '#fff', padding: '1px 4px', borderRadius: 3, fontSize: 9 }}>SKIP</span> : pctFmt(t.change)}
-                          </td>
-                          <td className="summary-td">{isSkipped ? '--' : pctFmt(t.mfe)}</td>
-                          <td className="summary-td">{isSkipped ? '--' : pctFmt(t.mae)}</td>
-                          <td className="summary-td">{isSkipped ? '--' : t.bars_held}</td>
-                          <td className="summary-td" style={{ color: t.regime_pass ? 'rgb(50,50,255)' : 'rgb(255,50,150)', fontWeight: 'bold' }}>
-                            {t.regime_pass ? '\u2713' : '\u2717'}
-                          </td>
-                        </tr>
-                      )
-                    })}
-                  </tbody>
-                </table>
-                {sortedTrades.length === 0 && <div className="summary-empty">No trades found</div>}
+              </select>
+              {!isBool && f.condition !== 'increasing' && f.condition !== 'decreasing' && (
+                <input type="number" className="backtest-input" value={f.value}
+                  onChange={e => updateFilterField(i, fi, 'value', e.target.value)} />
+              )}
+              <button className="backtest-remove-btn" onClick={() => removeFilter(i, fi)}>X</button>
+            </div>
+          )
+        })}
+        <button className="control-btn" onClick={() => addFilter(i)}>+ Add Filter</button>
+      </div>
+    </div>
+  )
+
+  return (
+    <div className="backtest-panel">
+      <div className="backtest-config">
+        <div className="multi-leg-grid">
+          {/* Settings card — always first, same size as leg cards */}
+          <div className={isSingleLeg ? 'single-leg-card' : 'multi-leg-card'}>
+            {isMultiLeg && (
+              <div className="backtest-section" style={{
+                color: allocValid ? '#2E7D32' : '#C2185B',
+                background: allocValid ? 'rgba(46,125,50,0.06)' : 'rgba(194,24,91,0.06)',
+                padding: '6px 8px',
+              }}>
+                <span style={{ fontWeight: 600, fontSize: 12 }}>
+                  Total Allocation: {totalAlloc}% {allocValid ? '' : '(must equal 100%)'}
+                </span>
               </div>
             )}
+
+            <div className="backtest-section">
+              <label className="backtest-label">Portfolio Settings</label>
+              <div className="backtest-sizing-row">
+                <div className="backtest-sizing-field">
+                  <span className="backtest-hint">Max Lev %</span>
+                  <input type="number" className="backtest-input" value={maxLeverage}
+                    onChange={e => setMaxLeverage(Number(e.target.value))} />
+                </div>
+              </div>
+              <div className="backtest-pos-presets">
+                <span className="backtest-preset-label">Lev:</span>
+                {LEV_PRESETS.map(p => (
+                  <button key={p}
+                    className={`backtest-pos-preset ${maxLeverage === p ? 'active' : ''}`}
+                    onClick={() => setMaxLeverage(p)}>{p}%</button>
+                ))}
+              </div>
+            </div>
+
+            <div className="backtest-section">
+              <label className="backtest-label">Date Range</label>
+              <div className="backtest-filter-row">
+                <input type="date" className="backtest-input" value={startDate}
+                  min={dataRange?.min} max={endDate || dataRange?.max}
+                  onChange={e => setStartDate(e.target.value)} style={{ width: 130 }} />
+                <span className="backtest-hint">to</span>
+                <input type="date" className="backtest-input" value={endDate}
+                  min={startDate || dataRange?.min} max={dataRange?.max}
+                  onChange={e => setEndDate(e.target.value)} style={{ width: 130 }} />
+              </div>
+              {dataRange && (
+                <span className="backtest-hint">Data: {dataRange.min} to {dataRange.max}</span>
+              )}
+            </div>
+
+            <button className="control-btn primary" onClick={runBacktest}
+              disabled={loading || (isMultiLeg && !allocValid) || !allTargetsSet}>
+              {loading ? 'Running...' : 'Run Backtest'}
+            </button>
+            {error && <div className="backtest-error">{error}</div>}
           </div>
+
+          {/* Leg cards */}
+          {legs.map((leg, i) => renderLegCard(leg, i))}
+          {legs.length < 6 && (
+            <div className="multi-leg-card multi-leg-add" onClick={addLeg}>
+              <span>+ Add Leg</span>
+            </div>
+          )}
         </div>
       </div>
     </div>

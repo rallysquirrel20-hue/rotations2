@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { createChart, ColorType, CrosshairMode, LineType, IChartApi, ISeriesApi } from 'lightweight-charts';
+import { createChart, ColorType, CrosshairMode, LineType, IChartApi, ISeriesApi, PriceScaleMode } from 'lightweight-charts';
 import axios from 'axios';
 import { RangeScrollbar } from './RangeScrollbar';
 
@@ -51,7 +51,9 @@ const MIN_PANE_HEIGHT = 40;
 
 interface CandleConstituent {
   ticker: string;
+  first_date?: string;
   weight: number;
+  eod_weight: number;
   daily_return: number;
   contribution: number;
 }
@@ -93,11 +95,16 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const prevWrapperHeightRef = useRef<number | null>(null);
 
+  // Log scale toggle
+  const [logScale, setLogScale] = useState(false);
+
   // Candle detail overlay for basket view
   const [candleDetail, setCandleDetail] = useState<CandleDetail | null>(null);
   const [pinnedDetail, setPinnedDetail] = useState<CandleDetail | null>(null);
   const candleDetailCache = useRef<Map<string, CandleDetail>>(new Map());
   const lastFetchedDate = useRef<string | null>(null);
+  const [cdSortCol, setCdSortCol] = useState<'ticker' | 'first_date' | 'weight' | 'daily_return' | 'eod_weight' | 'contribution'>('contribution');
+  const [cdSortAsc, setCdSortAsc] = useState(false);
 
   // Clear saved range when data changes (new ticker/basket) so stale bar indices aren't reused
   const prevDataRef = useRef(data);
@@ -439,6 +446,16 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     };
   }, [data, showPivots, showTargets, props.isBasketView, props.basketName, props.apiBase, fetchCandleDetail, pinnedDetail]);
 
+  // Toggle log/linear on price chart
+  useEffect(() => {
+    const pc = charts.current.price;
+    if (pc) {
+      pc.priceScale('right').applyOptions({
+        mode: logScale ? PriceScaleMode.Logarithmic : PriceScaleMode.Normal,
+      });
+    }
+  }, [logScale]);
+
   // Resize charts whenever pane heights or visibility changes
   useEffect(() => {
     const refMap: Record<string, React.RefObject<HTMLDivElement>> = {
@@ -647,42 +664,62 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
       {/* Price pane: flex:1 takes all space not consumed by indicator panes */}
       <div style={{ flex: 1, minHeight: '100px', position: 'relative' }}>
         <div ref={pRef} style={{ width: '100%', height: '100%' }} />
+        <button className={`log-toggle-btn ${logScale ? 'active' : ''}`} onClick={() => setLogScale(v => !v)}>L</button>
         {(() => {
           if (!props.showCandleDetail) return null;
           const detail = pinnedDetail || candleDetail;
           if (!detail || !detail.constituents.length) return null;
+          const toggleSort = (col: typeof cdSortCol) => {
+            if (cdSortCol === col) setCdSortAsc(v => !v);
+            else { setCdSortCol(col); setCdSortAsc(col === 'ticker' || col === 'first_date'); }
+          };
+          const sorted = [...detail.constituents].sort((a, b) => {
+            let va: number | string, vb: number | string;
+            if (cdSortCol === 'ticker') { va = a.ticker; vb = b.ticker; }
+            else if (cdSortCol === 'first_date') { va = a.first_date || ''; vb = b.first_date || ''; }
+            else { va = a[cdSortCol]; vb = b[cdSortCol]; }
+            const cmp = typeof va === 'string' ? va.localeCompare(vb as string) : (va as number) - (vb as number);
+            return cdSortAsc ? cmp : -cmp;
+          });
+          const arrow = (col: typeof cdSortCol) => cdSortCol === col ? (cdSortAsc ? ' \u25b2' : ' \u25bc') : '';
           return (
-            <div className="candle-detail-overlay" style={pinnedDetail ? { pointerEvents: 'auto', borderColor: 'rgb(50, 50, 255)' } : undefined}>
+            <div className="candle-detail-overlay" style={{ ...(pinnedDetail ? { pointerEvents: 'auto' as const, borderColor: 'rgb(50, 50, 255)' } : {}), minWidth: 480 }}>
               <div className="candle-detail-title">
                 {detail.date}
                 {pinnedDetail
                   ? <span style={{ float: 'right', fontSize: '9px', color: 'rgb(50, 50, 255)', cursor: 'pointer' }} onClick={() => setPinnedDetail(null)}>PINNED (esc)</span>
                   : <span style={{ float: 'right', fontSize: '9px', opacity: 0.5 }}>click to pin</span>}
               </div>
-              <div className="candle-detail-row" style={{ fontWeight: 'bold', borderBottom: '1px solid #ccc', marginBottom: '2px', paddingBottom: '2px' }}>
-                <span className="ticker">Ticker</span>
-                <span className="weight">Weight</span>
-                <span className="ret">Return</span>
-                <span className="contrib">Contrib</span>
+              <div className="candle-detail-row const-header" style={{ fontWeight: 'bold', borderBottom: '1px solid #ccc', marginBottom: '2px', paddingBottom: '2px', cursor: 'pointer', userSelect: 'none' }}>
+                <span className="const-ticker" onClick={() => toggleSort('ticker')}>Ticker{arrow('ticker')}</span>
+                <span className="const-entry" onClick={() => toggleSort('first_date')}>Entry{arrow('first_date')}</span>
+                <span className="const-ew" onClick={() => toggleSort('weight')}>Ent.Wt{arrow('weight')}</span>
+                <span className="const-ret" onClick={() => toggleSort('daily_return')}>Return{arrow('daily_return')}</span>
+                <span className="const-cw" onClick={() => toggleSort('eod_weight')}>Cur.Wt{arrow('eod_weight')}</span>
+                <span className="const-contrib" onClick={() => toggleSort('contribution')}>Contrib{arrow('contribution')}</span>
               </div>
-              {detail.constituents.map(c => (
+              {sorted.map(c => (
                 <div key={c.ticker} className="candle-detail-row">
-                  <span className="ticker">{c.ticker}</span>
-                  <span className="weight">{(c.weight * 100).toFixed(1)}%</span>
-                  <span className="ret" style={{ color: c.daily_return >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)' }}>
+                  <span className="const-ticker">{c.ticker}</span>
+                  <span className="const-entry">{c.first_date ? c.first_date.slice(5) + '-' + c.first_date.slice(0, 4) : ''}</span>
+                  <span className="const-ew">{(c.weight * 100).toFixed(1)}%</span>
+                  <span className="const-ret" style={{ color: c.daily_return >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)' }}>
                     {(c.daily_return * 100).toFixed(2)}%
                   </span>
-                  <span className="contrib" style={{ color: c.contribution >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)' }}>
+                  <span className="const-cw">{(c.eod_weight * 100).toFixed(1)}%</span>
+                  <span className="const-contrib" style={{ color: c.contribution >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)' }}>
                     {(c.contribution * 100).toFixed(3)}%
                   </span>
                 </div>
               ))}
               {detail.basket_return !== undefined && (
                 <div className="candle-detail-row" style={{ borderTop: '1px solid #93a1a1', marginTop: '3px', paddingTop: '3px', fontWeight: 'bold' }}>
-                  <span className="ticker">Basket</span>
-                  <span className="weight"></span>
-                  <span className="ret"></span>
-                  <span className="contrib" style={{ color: detail.basket_return >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)' }}>
+                  <span className="const-ticker">Basket</span>
+                  <span className="const-entry"></span>
+                  <span className="const-ew"></span>
+                  <span className="const-ret"></span>
+                  <span className="const-cw"></span>
+                  <span className="const-contrib" style={{ color: detail.basket_return >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)' }}>
                     {(detail.basket_return * 100).toFixed(3)}%
                   </span>
                 </div>

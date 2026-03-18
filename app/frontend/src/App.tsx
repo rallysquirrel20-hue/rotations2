@@ -1063,16 +1063,9 @@ function App() {
               />
             ) : showBacktest ? (
               <BacktestPanel
+                apiBase={API_BASE}
                 target={activeTicker || selectedItem}
                 targetType={activeTicker || isTicker ? 'ticker' : 'basket'}
-                apiBase={API_BASE}
-                availableBaskets={backtestBaskets}
-                showPivots={showPivots}
-                showTargets={showTargets}
-                showVolume={showVolume && !isBasketView}
-                showBreadth={showBreadth && isBasketView}
-                showBreakout={showBreakout && isBasketView}
-                showCorrelation={showCorrelation && isBasketView}
                 exportTrigger={exportTrigger}
               />
             ) : showSummary ? (

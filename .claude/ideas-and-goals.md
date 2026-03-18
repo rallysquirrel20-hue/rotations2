@@ -5,8 +5,13 @@
 ### ~~1. Repo Consolidation~~ — COMPLETED (2026-03-16)
 ~~Create a single "rotations" repo combining rotations_app and rotations_signals with organized CLAUDE.md and agent files for efficient project setup and editing.~~
 
-### 2. Backtest Accuracy
-Test backtest feature for accuracy.
+### ~~2. Backtest Accuracy~~ — IN PROGRESS (2026-03-18)
+Test backtest feature for accuracy. Completed sub-goals:
+- Quarterly universe membership filtering: backtests now use shifting quarterly universes instead of only the current quarter. Trades are filtered to only include tickers that were in the basket at the entry date.
+- Constituents overlay expanded to 6 sortable columns (Ticker, Entry, Ent.Wt, Return, Cur.Wt, Contrib) across all 3 chart types (TVChart, BacktestPanel, MultiBacktestPanel). Multi-leg adds a Leg column.
+- Entry date shows current stint start (gap > 5 trading days = new stint), not first-ever appearance.
+- Overlay sizing: constrained to chart area bounds (top: 4px, bottom: just above x-axis), scrollable.
+- BENCHMARK_TIMING enabled for live loop per-step timing.
 
 ### ~~3. Equity Tab Improvements~~ — COMPLETED (2026-03-17)
 ~~Add constituent feature, scrolling/zooming, date range selector, chart colors, benchmark equity curves.~~
@@ -49,6 +54,10 @@ Remaining sub-goals:
 - Long-term portfolio stats (CAGR, Sharpe, Sortino, max DD duration)
 - Multi-leg stats: correlation/volatility impact of adding a basket to baseline
 
+**Also completed in this session (2026-03-18):**
+- Multi-leg buy hold defaults to off (clean chart on first load)
+- Constituents overlay expanded + sortable (see Goal 2)
+
 ### 10. Variable Position Sizing
 Add variable position sizing feature to backtest.
 
@@ -84,3 +93,5 @@ Export button properly functions with all features on the frontend, with titles 
 4. **Basket Returns** (2026-03-17): Cross-basket period returns and single-basket daily returns chart with live data overlay, date presets, group filters, basket picker, hover overlay, and PNG export. Backend `GET /api/baskets/returns` endpoint with regex input validation and anchor-row logic.
 5. **Optimize Basket Signals Build Time** (2026-03-17): Full rebuild dropped from ~30 min to 7 min 47s (467s). Six optimizations in `signals/rotations.py`: pre-computed returns matrices, correlation vectorization, breadth vectorization, equity OHLC cumprod, contributions merged into equity OHLC, extracted `_build_quarter_weights`.
 6. **Analogs Tab** (2026-03-18): Elevated Analogs from sub-mode in BasketSummary to top-level AnalogsPanel component with 5 tabs (Summary, Analogs, Comparison, Forward, Aggregate). Backend expanded with multi-timeframe fingerprints, cross-basket correlation, forward_series, and aggregate stats. Cleaned up all analog code from BasketSummary.
+7. **Backtest Quarterly Universe Filtering** (2026-03-18): Fixed survivorship bias in `basket_tickers` backtests. Both `run_backtest()` and `_build_leg_trades()` now use `_get_universe_history()` to load quarterly membership and filter trades to only tickers in the basket at entry date. Union of tickers across date range loaded for signal data.
+8. **Constituents Overlay Overhaul** (2026-03-18): Expanded all 3 constituents overlays (TVChart, BacktestPanel, MultiBacktestPanel) from 4 to 6-7 sortable columns. Added entry_weight to backend daily_positions. TVChart candle-detail endpoint now returns stint-based entry date and EOD drifted weight. Overlay constrained to chart bounds with scrollable content.

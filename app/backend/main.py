@@ -2093,12 +2093,43 @@ def get_basket_candle_detail(basket_name: str, date: str = None):
         # Sort by contribution descending
         day = day.sort_values('Contribution', ascending=False)
 
+        # Compute current stint entry date per ticker and end-of-day drifted weight
+        # For each ticker present on `target`, walk backwards through its sorted dates
+        # to find the start of the current continuous run (gap > 5 business days = new stint)
+        all_dates_sorted = sorted(df['Date'].unique())
+        date_to_idx = {d: i for i, d in enumerate(all_dates_sorted)}
+        target_idx = date_to_idx.get(target)
+        stint_entry = {}
+        for tkr, grp in df.groupby('Ticker'):
+            tkr_dates = sorted(grp['Date'].unique())
+            # Only care about dates up to and including target
+            tkr_dates = [d for d in tkr_dates if d <= target]
+            if not tkr_dates or tkr_dates[-1] != target:
+                continue
+            # Walk backwards from end to find where the current stint started
+            entry = tkr_dates[-1]
+            for i in range(len(tkr_dates) - 1, 0, -1):
+                gap = date_to_idx.get(tkr_dates[i], 0) - date_to_idx.get(tkr_dates[i - 1], 0)
+                if gap > 5:  # more than 5 trading days gap = new stint
+                    break
+                entry = tkr_dates[i - 1]
+            stint_entry[tkr] = entry
+
+        total_eod = (day['Weight_BOD'] * (1 + day['Daily_Return'])).sum()
+
         constituents = []
         for _, row in day.iterrows():
+            tkr = row['Ticker']
+            w_bod = float(row['Weight_BOD'])
+            d_ret = float(row['Daily_Return'])
+            eod_weight = (w_bod * (1 + d_ret)) / total_eod if total_eod > 0 else 0
+            se = stint_entry.get(tkr)
             constituents.append({
-                "ticker": row['Ticker'],
-                "weight": round(float(row['Weight_BOD']), 6),
-                "daily_return": round(float(row['Daily_Return']), 6),
+                "ticker": tkr,
+                "first_date": se.strftime('%Y-%m-%d') if se is not None and pd.notna(se) else None,
+                "weight": round(w_bod, 6),
+                "eod_weight": round(eod_weight, 6),
+                "daily_return": round(d_ret, 6),
                 "contribution": round(float(row['Contribution']), 6),
             })
 
@@ -2161,7 +2192,6 @@ class BacktestRequest(BaseModel):
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     position_size: float = 1.0
-    initial_equity: float = 100000
     max_leverage: float = 2.5
 
 class MultiBacktestLeg(BaseModel):
@@ -2176,7 +2206,6 @@ class MultiBacktestRequest(BaseModel):
     legs: List[MultiBacktestLeg]
     start_date: Optional[str] = None
     end_date: Optional[str] = None
-    initial_equity: float = 100000
     max_leverage: float = 2.5
 
 
@@ -2227,6 +2256,9 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
             'mae': round(float(closes.min()) / first_close - 1, 6) if first_close else 0,
             'bars_held': bars,
             'regime_pass': True,
+            'entry_weight': None,
+            'exit_weight': None,
+            'contribution': None,
         }
         return ([trade], df, ticker_closes, 'long')
 
@@ -2246,6 +2278,7 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
     is_multi_ticker = target_type == 'basket_tickers'
 
     # 1. Load target data
+    _quarter_bounds = None  # Set by basket_tickers path for membership filtering
     if target_type == 'basket':
         basket_file = _find_basket_parquet(target)
         if not basket_file:
@@ -2262,9 +2295,27 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
     elif target_type == 'basket_tickers':
         if not INDIVIDUAL_SIGNALS_FILE.exists():
             raise HTTPException(status_code=404, detail="Signals file not found")
-        basket_tickers = get_latest_universe_tickers(target)
-        if not basket_tickers:
-            basket_tickers = get_meta_file_tickers(target)
+        # Build quarterly universe history for membership filtering
+        _universe_history = _get_universe_history(target)
+        if _universe_history:
+            # Load union of all tickers across the backtest date range
+            if start_date and end_date:
+                basket_tickers = _get_universe_tickers_for_range(target, pd.Timestamp(start_date), pd.Timestamp(end_date))
+            elif start_date:
+                basket_tickers = _get_universe_tickers_for_range(target, pd.Timestamp(start_date), pd.Timestamp('2099-12-31'))
+            else:
+                # No date filter — union of ALL quarters
+                basket_tickers = list({t for tks in _universe_history.values() for t in tks})
+            # Build sorted quarter boundaries for fast date->tickers lookup
+            _quarter_bounds = sorted(
+                [(_quarter_str_to_date(q), set(tks)) for q, tks in _universe_history.items()],
+                key=lambda x: x[0]
+            )
+        else:
+            basket_tickers = get_latest_universe_tickers(target)
+            if not basket_tickers:
+                basket_tickers = get_meta_file_tickers(target)
+            _quarter_bounds = None
         if not basket_tickers:
             raise HTTPException(status_code=404, detail=f"No tickers found for basket {target}")
         base_cols = ['Ticker', 'Date', 'Close', is_col] + trade_cols
@@ -2348,6 +2399,24 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
     # Build trades from pre-computed data
     trades = []
     for _, row in entries.iterrows():
+        entry_date = row['Date']
+
+        # For basket_tickers: skip trades where ticker wasn't in the basket at entry date
+        if is_multi_ticker and _quarter_bounds:
+            ticker = row.get('Ticker', '')
+            # Find the active quarter for entry_date (latest quarter start <= entry_date)
+            active_tickers = None
+            for q_start, q_tickers in _quarter_bounds:
+                if q_start <= entry_date:
+                    active_tickers = q_tickers
+                else:
+                    break
+            if active_tickers is None:
+                # Entry date is before any quarter — use earliest quarter
+                active_tickers = _quarter_bounds[0][1]
+            if ticker not in active_tickers:
+                continue
+
         entry_price = row.get(f'{sig}_Entry_Price')
         exit_date = row.get(f'{sig}_Exit_Date')
         exit_price = row.get(f'{sig}_Exit_Price')
@@ -2358,8 +2427,6 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
         # Skip open trades (no exit)
         if pd.isna(exit_date) or pd.isna(exit_price):
             continue
-
-        entry_date = row['Date']
 
         # Compute bars held
         exit_dt = pd.Timestamp(exit_date)
@@ -2402,6 +2469,9 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
             'mae': safe_float(mae, 4),
             'bars_held': bars_held,
             'regime_pass': regime_pass,
+            'entry_weight': None,
+            'exit_weight': None,
+            'contribution': None,
         }
         if is_multi_ticker:
             trade_dict['ticker'] = row.get('Ticker', '')
@@ -2437,7 +2507,7 @@ def get_date_range(target_type: str, target: str):
         raise HTTPException(status_code=404, detail="No data found")
     return {"min": dates.min().strftime('%Y-%m-%d'), "max": dates.max().strftime('%Y-%m-%d')}
 
-def _build_buy_hold(target, target_type, start_date, end_date, initial_equity):
+def _build_buy_hold(target, target_type, start_date, end_date):
     """Build a buy-and-hold backtest result from the Close series."""
     if target_type == 'basket':
         basket_file = _find_basket_parquet(target)
@@ -2480,10 +2550,12 @@ def _build_buy_hold(target, target_type, start_date, end_date, initial_equity):
         'mae': round(float(closes.min()) / first_close - 1, 6) if first_close else 0,
         'bars_held': bars,
         'regime_pass': True,
+        'entry_weight': 1.0,
+        'exit_weight': 1.0,
+        'contribution': round(total_return, 6),
     }
     trade_path = [round(float(c) / first_close - 1, 6) for c in closes.values]
-    # Equity curve: simply scale by initial equity
-    eq_values = [round(initial_equity * float(c) / first_close, 2) for c in closes.values]
+    eq_values = [round(float(c) / first_close, 6) for c in closes.values]
     eq_dates = [d.strftime('%Y-%m-%d') for d in closes.index]
     stats = {
         'trades': 1, 'win_rate': 1.0 if total_return > 0 else 0.0,
@@ -2505,7 +2577,7 @@ def _build_buy_hold(target, target_type, start_date, end_date, initial_equity):
 def run_backtest(req: BacktestRequest):
     sig = req.entry_signal
     if sig == 'Buy_Hold':
-        return _build_buy_hold(req.target, req.target_type, req.start_date, req.end_date, req.initial_equity)
+        return _build_buy_hold(req.target, req.target_type, req.start_date, req.end_date)
     is_col = SIGNAL_IS_COL.get(sig)
     if not is_col:
         raise HTTPException(status_code=400, detail=f"Unknown signal: {sig}")
@@ -2522,6 +2594,7 @@ def run_backtest(req: BacktestRequest):
     is_multi_ticker = req.target_type == 'basket_tickers'
 
     # 1. Load target data
+    _quarter_bounds = None  # Set by basket_tickers path for membership filtering
     if req.target_type == 'basket':
         basket_file = _find_basket_parquet(req.target)
         if not basket_file:
@@ -2540,9 +2613,23 @@ def run_backtest(req: BacktestRequest):
         # Load individual ticker signals for all tickers in the basket
         if not INDIVIDUAL_SIGNALS_FILE.exists():
             raise HTTPException(status_code=404, detail="Signals file not found")
-        basket_tickers = get_latest_universe_tickers(req.target)
-        if not basket_tickers:
-            basket_tickers = get_meta_file_tickers(req.target)
+        # Build quarterly universe history for membership filtering
+        _universe_history = _get_universe_history(req.target)
+        if _universe_history:
+            if req.start_date and req.end_date:
+                basket_tickers = _get_universe_tickers_for_range(req.target, pd.Timestamp(req.start_date), pd.Timestamp(req.end_date))
+            elif req.start_date:
+                basket_tickers = _get_universe_tickers_for_range(req.target, pd.Timestamp(req.start_date), pd.Timestamp('2099-12-31'))
+            else:
+                basket_tickers = list({t for tks in _universe_history.values() for t in tks})
+            _quarter_bounds = sorted(
+                [(_quarter_str_to_date(q), set(tks)) for q, tks in _universe_history.items()],
+                key=lambda x: x[0]
+            )
+        else:
+            basket_tickers = get_latest_universe_tickers(req.target)
+            if not basket_tickers:
+                basket_tickers = get_meta_file_tickers(req.target)
         if not basket_tickers:
             raise HTTPException(status_code=404, detail=f"No tickers found for basket {req.target}")
         base_cols = ['Ticker', 'Date', 'Close', is_col] + trade_cols
@@ -2634,6 +2721,22 @@ def run_backtest(req: BacktestRequest):
     # 6. Build trades from pre-computed data
     trades = []
     for _, row in entries.iterrows():
+        entry_date = row['Date']
+
+        # For basket_tickers: skip trades where ticker wasn't in the basket at entry date
+        if is_multi_ticker and _quarter_bounds:
+            ticker = row.get('Ticker', '')
+            active_tickers = None
+            for q_start, q_tickers in _quarter_bounds:
+                if q_start <= entry_date:
+                    active_tickers = q_tickers
+                else:
+                    break
+            if active_tickers is None:
+                active_tickers = _quarter_bounds[0][1]
+            if ticker not in active_tickers:
+                continue
+
         entry_price = row.get(f'{sig}_Entry_Price')
         exit_date = row.get(f'{sig}_Exit_Date')
         exit_price = row.get(f'{sig}_Exit_Price')
@@ -2644,8 +2747,6 @@ def run_backtest(req: BacktestRequest):
         # Skip open trades (no exit)
         if pd.isna(exit_date) or pd.isna(exit_price):
             continue
-
-        entry_date = row['Date']
 
         # Compute bars held
         exit_dt = pd.Timestamp(exit_date)
@@ -2693,6 +2794,9 @@ def run_backtest(req: BacktestRequest):
             'mae': safe_float(mae, 4),
             'bars_held': bars_held,
             'regime_pass': regime_pass,
+            'entry_weight': None,
+            'exit_weight': None,
+            'contribution': None,
         }
         if is_multi_ticker:
             trade_dict['ticker'] = row.get('Ticker', '')
@@ -2739,7 +2843,7 @@ def run_backtest(req: BacktestRequest):
     paired = sorted(zip(trades, trade_paths), key=lambda p: p[0]['exit_date'])
     sorted_trades = [p[0] for p in paired]
     sorted_paths = [p[1] for p in paired]
-    initial = req.initial_equity
+    initial = 1.0
     pos_size = req.position_size
     max_lev = req.max_leverage
     is_long = direction == 'long'
@@ -2790,6 +2894,9 @@ def run_backtest(req: BacktestRequest):
 
     for date in all_dates:
         # Process exits first (frees capital before new entries)
+        # Compute pre-exit equity for exit weight calculation (only if filtered exits exist)
+        filt_exits_today = [idx for idx in exit_map.get(date, []) if idx in open_filt]
+        pre_exit_eq_filt = mtm_equity(open_filt, cash_filt, date) if filt_exits_today else 0
         for idx in exit_map.get(date, []):
             t = trade_map[idx]
             ret = t['change'] or 0.0
@@ -2798,7 +2905,12 @@ def run_backtest(req: BacktestRequest):
                 cash_all += a['alloc'] * (1 + ret)
             if idx in open_filt:
                 a = open_filt.pop(idx)
-                cash_filt += a['alloc'] * (1 + ret)
+                exit_val = a['alloc'] * (1 + ret)
+                cash_filt += exit_val
+                ew = a.get('entry_weight', 0)
+                trade_map[idx]['entry_weight'] = ew
+                trade_map[idx]['exit_weight'] = round(exit_val / pre_exit_eq_filt, 4) if pre_exit_eq_filt > 0 else 0
+                trade_map[idx]['contribution'] = round(ew * ret, 4)
 
         # Process entries (allocate capital)
         for idx in entry_map.get(date, []):
@@ -2807,7 +2919,7 @@ def run_backtest(req: BacktestRequest):
             if eq_est <= 0:
                 continue
             wanted = eq_est * pos_size * max_lev
-            exposure = sum(info['alloc'] for info in open_all.values())
+            exposure = eq_est - cash_all  # MTM exposure (appreciated positions count at current value)
             room = max(0, eq_est * max_lev - exposure)
             alloc = min(wanted, room)
             if alloc > 0:
@@ -2818,13 +2930,16 @@ def run_backtest(req: BacktestRequest):
                 eq_est_f = mtm_equity(open_filt, cash_filt, date)
                 if eq_est_f > 0:
                     wanted_f = eq_est_f * pos_size * max_lev
-                    exposure_f = sum(info['alloc'] for info in open_filt.values())
+                    exposure_f = eq_est_f - cash_filt  # MTM exposure
                     room_f = max(0, eq_est_f * max_lev - exposure_f)
                     alloc_f = min(wanted_f, room_f)
                     if alloc_f > 0:
+                        entry_wt = round(alloc_f / eq_est_f, 4)
                         open_filt[idx] = {'alloc': alloc_f, 'entry_price': t['entry_price'] or 0,
-                                           'ticker': t.get('ticker', '')}
+                                           'ticker': t.get('ticker', ''),
+                                           'entry_weight': entry_wt}
                         cash_filt -= alloc_f
+                        trade_map[idx]['entry_weight'] = entry_wt
 
         # Record daily mark-to-market equity
         equity_all = mtm_equity(open_all, cash_all, date)
@@ -2858,12 +2973,14 @@ def run_backtest(req: BacktestRequest):
                     current_val = info['alloc']
                     daily_ret = 0.0
                 weight = current_val / equity_filt if equity_filt > 0 else 0
-                contribution = weight * daily_ret if equity_filt > 0 else 0
+                entry_wt = info.get('entry_weight', 0)
+                contribution = entry_wt * daily_ret if equity_filt > 0 else 0
                 positions.append({
                     'trade_idx': tidx,
                     'ticker': tkr or None,
                     'entry_date': t.get('entry_date', ''),
-                    'alloc': round(info['alloc'], 2),
+                    'alloc': info['alloc'],
+                    'entry_weight': info.get('entry_weight', 0),
                     'weight': round(weight, 4),
                     'daily_return': round(daily_ret, 4),
                     'contribution': round(contribution, 6),
@@ -2961,15 +3078,59 @@ def run_backtest(req: BacktestRequest):
 @app.post("/api/backtest/multi")
 def run_multi_backtest(req: MultiBacktestRequest):
     """Run a multi-leg backtest and return combined equity curves + per-leg stats."""
-    initial = req.initial_equity
+    initial = 1.0
     max_lev = req.max_leverage
 
-    # ---- helpers (same compute_stats logic as single endpoint) ----
-    def compute_stats(trade_list, equity_vals):
-        if not trade_list:
-            return {'trades': 0, 'win_rate': 0, 'avg_winner': 0, 'avg_loser': 0,
-                    'ev': 0, 'profit_factor': 0, 'max_dd': 0, 'avg_bars': 0}
-        returns = [t['change'] for t in trade_list if t['change'] is not None]
+    # ---- helpers ----
+    def compute_stats(trade_list, all_trades_count, equity_vals):
+        """Compute portfolio + trade stats from a trade list and equity curve.
+        all_trades_count: total trades that met signal criteria (before leverage/cash filtering).
+        trade_list: trades that were actually taken (regime_pass=True and allocated capital).
+        """
+        empty = {
+            'portfolio': {
+                'strategy_return': 0, 'cagr': 0, 'volatility': 0, 'max_dd': 0,
+                'sharpe': 0, 'sortino': 0,
+            },
+            'trade': {
+                'trades_met_criteria': all_trades_count,
+                'trades_taken': 0, 'trades_skipped': 0,
+                'win_rate': 0, 'avg_winner': 0, 'avg_loser': 0,
+                'ev': 0, 'profit_factor': 0,
+                'avg_time_winner': 0, 'avg_time_loser': 0,
+            },
+        }
+        if not equity_vals or len(equity_vals) < 2:
+            return empty
+
+        # ---- Portfolio stats from equity curve ----
+        eq = np.array(equity_vals, dtype=float)
+        daily_rets = np.diff(eq) / eq[:-1]
+        daily_rets = daily_rets[np.isfinite(daily_rets)]
+
+        strategy_return = eq[-1] / eq[0] - 1 if eq[0] > 0 else 0
+        years = len(daily_rets) / 252 if len(daily_rets) > 0 else 0
+        cagr = (eq[-1] / eq[0]) ** (1 / years) - 1 if years > 0 and eq[0] > 0 and eq[-1] > 0 else 0
+        volatility = float(np.std(daily_rets) * np.sqrt(252)) if len(daily_rets) > 1 else 0
+        mean_daily = float(np.mean(daily_rets)) if len(daily_rets) > 0 else 0
+        std_daily = float(np.std(daily_rets)) if len(daily_rets) > 1 else 0
+        sharpe = (mean_daily / std_daily * np.sqrt(252)) if std_daily > 0 else 0
+        downside = daily_rets[daily_rets < 0]
+        downside_std = float(np.std(downside)) if len(downside) > 1 else 0
+        sortino = (mean_daily / downside_std * np.sqrt(252)) if downside_std > 0 else 0
+
+        max_dd = 0.0
+        peak = eq[0]
+        for v in eq:
+            peak = max(peak, v)
+            if peak > 0:
+                dd = (peak - v) / peak
+                max_dd = max(max_dd, dd)
+
+        # ---- Trade stats ----
+        taken = [t for t in trade_list if t.get('_was_taken')]
+        skipped = all_trades_count - len(taken)
+        returns = [t['change'] for t in taken if t['change'] is not None]
         winners = [r for r in returns if r > 0]
         losers = [r for r in returns if r <= 0]
         total = len(returns)
@@ -2980,24 +3141,33 @@ def run_multi_backtest(req: MultiBacktestRequest):
         gross_profit = sum(winners)
         gross_loss = abs(sum(losers))
         profit_factor = gross_profit / gross_loss if gross_loss > 0 else (999 if gross_profit > 0 else 0)
-        max_dd = 0.0
-        if equity_vals:
-            peak = equity_vals[0]
-            for v in equity_vals:
-                peak = max(peak, v)
-                if peak > 0:
-                    dd = (peak - v) / peak
-                    max_dd = max(max_dd, dd)
-        avg_bars = sum(t['bars_held'] for t in trade_list) / len(trade_list) if trade_list else 0
+
+        winner_trades = [t for t in taken if t['change'] is not None and t['change'] > 0]
+        loser_trades = [t for t in taken if t['change'] is not None and t['change'] <= 0]
+        avg_time_winner = sum(t['bars_held'] for t in winner_trades) / len(winner_trades) if winner_trades else 0
+        avg_time_loser = sum(t['bars_held'] for t in loser_trades) / len(loser_trades) if loser_trades else 0
+
         return {
-            'trades': total,
-            'win_rate': round(win_rate, 4),
-            'avg_winner': round(avg_winner, 4),
-            'avg_loser': round(avg_loser, 4),
-            'ev': round(ev, 4),
-            'profit_factor': round(profit_factor, 2),
-            'max_dd': round(max_dd, 4),
-            'avg_bars': round(avg_bars, 1),
+            'portfolio': {
+                'strategy_return': round(strategy_return, 4),
+                'cagr': round(float(cagr), 4),
+                'volatility': round(volatility, 4),
+                'max_dd': round(max_dd, 4),
+                'sharpe': round(float(sharpe), 2),
+                'sortino': round(float(sortino), 2),
+            },
+            'trade': {
+                'trades_met_criteria': all_trades_count,
+                'trades_taken': total,
+                'trades_skipped': max(0, skipped),
+                'win_rate': round(win_rate, 4),
+                'avg_winner': round(avg_winner, 4),
+                'avg_loser': round(avg_loser, 4),
+                'ev': round(ev, 4),
+                'profit_factor': round(profit_factor, 2),
+                'avg_time_winner': round(avg_time_winner, 1),
+                'avg_time_loser': round(avg_time_loser, 1),
+            },
         }
 
     # ---- build trades for each leg ----
@@ -3113,12 +3283,17 @@ def run_multi_backtest(req: MultiBacktestRequest):
 
         for di, date in enumerate(all_dates):
             # Process exits
+            alloc_exits_today = [idx for idx in exit_map.get(date, []) if idx in open_alloc]
+            pre_exit_eq_alloc = mtm_equity(open_alloc, cash_alloc, date) if alloc_exits_today else 0
             for idx in exit_map.get(date, []):
                 t = trade_map[idx]
                 ret = t['change'] or 0.0
                 if idx in open_alloc:
                     a = open_alloc.pop(idx)
-                    cash_alloc += a['alloc'] * (1 + ret)
+                    exit_val = a['alloc'] * (1 + ret)
+                    cash_alloc += exit_val
+                    # Store alloc for post-processing (recompute vs combined equity)
+                    trade_map[idx]['_alloc'] = a['alloc']
                 if idx in open_solo:
                     a = open_solo.pop(idx)
                     cash_solo += a['alloc'] * (1 + ret)
@@ -3132,18 +3307,21 @@ def run_multi_backtest(req: MultiBacktestRequest):
                 eq_est = mtm_equity(open_alloc, cash_alloc, date)
                 if eq_est > 0:
                     wanted = eq_est * pos_size * max_lev
-                    exposure = sum(info['alloc'] for info in open_alloc.values())
+                    exposure = eq_est - cash_alloc  # MTM exposure
                     cap = eq_est * max_lev
                     room = max(0, cap - exposure)
                     alloc = min(wanted, room)
                     if alloc > 0:
-                        open_alloc[idx] = {'alloc': alloc, 'entry_price': t['entry_price'] or 0, 'ticker': t.get('ticker', '')}
+                        entry_wt = round(alloc / eq_est, 4)
+                        open_alloc[idx] = {'alloc': alloc, 'entry_price': t['entry_price'] or 0, 'ticker': t.get('ticker', ''),
+                                           'entry_weight': entry_wt}
                         cash_alloc -= alloc
+                        trade_map[idx]['_was_taken'] = True
                 # Standalone path: same leverage multiplier on position sizing
                 eq_est_s = mtm_equity(open_solo, cash_solo, date)
                 if eq_est_s > 0:
                     wanted_s = eq_est_s * pos_size * max_lev
-                    exposure_s = sum(info['alloc'] for info in open_solo.values())
+                    exposure_s = eq_est_s - cash_solo  # MTM exposure
                     cap_s = eq_est_s * max_lev
                     room_s = max(0, cap_s - exposure_s)
                     alloc_s = min(wanted_s, room_s)
@@ -3182,13 +3360,15 @@ def run_multi_backtest(req: MultiBacktestRequest):
                         current_val = info['alloc']
                         daily_ret = 0.0
                     weight = current_val / eq_now if eq_now > 0 else 0
-                    contribution = weight * daily_ret if eq_now > 0 else 0
+                    entry_wt = info.get('entry_weight', 0)
+                    contribution = entry_wt * daily_ret if eq_now > 0 else 0
                     positions['positions'].append({
                         'trade_idx': idx_p,
                         'ticker': tkr or leg.target,
                         'entry_date': t_p.get('entry_date', ''),
                         'leg_target': leg.target,
-                        'alloc': round(info['alloc'], 2),
+                        'alloc': info['alloc'],
+                        'entry_weight': info.get('entry_weight', 0),
                         'weight': round(weight, 4),
                         'daily_return': round(daily_ret, 4),
                         'contribution': round(contribution, 6),
@@ -3203,7 +3383,7 @@ def run_multi_backtest(req: MultiBacktestRequest):
 
         # Per-leg stats (from standalone curve — what the user sees)
         filtered_trades = [t for t in sorted_trades if t['regime_pass']]
-        stats = compute_stats(filtered_trades, eq_solo_vals)
+        stats = compute_stats(filtered_trades, len(sorted_trades), eq_solo_vals)
         per_leg_stats.append(stats)
 
         # Build trade paths for this leg
@@ -3242,12 +3422,45 @@ def run_multi_backtest(req: MultiBacktestRequest):
                     if i < len(per_leg_equity[li]))
         combined_equity.append(round(total, 2))
 
-    # Fix daily_positions: set combined equity and total exposure for each date
+    # Combined stats (must run BEFORE _was_taken cleanup)
+    all_filtered_trades = []
+    all_total_trades = 0
+    for lr in leg_responses:
+        all_filtered_trades.extend([t for t in lr['trades'] if t['regime_pass']])
+        all_total_trades += len(lr['trades'])
+    combined_stats = compute_stats(all_filtered_trades, all_total_trades, combined_equity)
+
+    # Fix trade entry/exit weights: recompute relative to combined equity (not per-leg)
+    ceq_by_date = dict(zip([pd.Timestamp(d).strftime('%Y-%m-%d') for d in all_dates], combined_equity))
+    for lr in leg_responses:
+        for t in lr['trades']:
+            t.pop('_was_taken', None)
+            alloc = t.pop('_alloc', None)
+            if alloc is not None:
+                entry_eq = ceq_by_date.get(t['entry_date'], 0)
+                exit_eq = ceq_by_date.get(t['exit_date'], 0)
+                ret = t['change'] or 0.0
+                exit_val = alloc * (1 + ret)
+                t['entry_weight'] = round(alloc / entry_eq, 4) if entry_eq > 0 else 0
+                t['exit_weight'] = round(exit_val / exit_eq, 4) if exit_eq > 0 else 0
+                t['contribution'] = round(t['entry_weight'] * ret, 4)
+
+    # Fix daily_positions: recompute ALL weights relative to combined equity
     for di, dp in daily_positions.items():
         if di < len(combined_equity):
-            dp['equity'] = combined_equity[di]
+            ceq = combined_equity[di]
+            dp['equity'] = ceq
             total_alloc = sum(p['alloc'] for p in dp['positions'])
-            dp['exposure_pct'] = round(total_alloc / combined_equity[di], 4) if combined_equity[di] > 0 else 0
+            dp['exposure_pct'] = round(total_alloc / ceq, 4) if ceq > 0 else 0
+            if ceq > 0:
+                for p in dp['positions']:
+                    alloc = p['alloc']
+                    dr = p.get('daily_return', 0)
+                    current_val = alloc * (1 + dr)
+                    p['weight'] = round(current_val / ceq, 4)
+                    entry_eq = ceq_by_date.get(p.get('entry_date', ''), ceq)
+                    p['entry_weight'] = round(alloc / entry_eq, 4) if entry_eq > 0 else 0
+                    p['contribution'] = round(p['entry_weight'] * dr, 6) if dr else 0
 
     # ---- buy-hold curve from first basket leg (or first leg overall) ----
     bh_vals = []
@@ -3307,11 +3520,42 @@ def run_multi_backtest(req: MultiBacktestRequest):
     else:
         bh_vals = [round(initial, 2)] * len(all_dates)
 
-    # Combined stats
-    all_filtered_trades = []
-    for lr, leg in zip(leg_results, req.legs):
-        all_filtered_trades.extend([t for t in lr['trades'] if t['regime_pass']])
-    combined_stats = compute_stats(all_filtered_trades, combined_equity)
+    # Inter-leg correlation (daily returns of standalone equity curves)
+    leg_correlations = {}
+    if len(per_leg_standalone) > 1:
+        # Compute daily returns for each leg's standalone curve
+        leg_daily_rets = []
+        for eq_vals in per_leg_standalone:
+            eq_arr = np.array(eq_vals, dtype=float)
+            dr = np.diff(eq_arr) / eq_arr[:-1]
+            dr[~np.isfinite(dr)] = 0.0
+            leg_daily_rets.append(dr)
+        # Pairwise correlation matrix
+        n_legs = len(leg_daily_rets)
+        min_len = min(len(dr) for dr in leg_daily_rets)
+        if min_len > 10:
+            ret_matrix = np.column_stack([dr[:min_len] for dr in leg_daily_rets])
+            corr_matrix = np.corrcoef(ret_matrix, rowvar=False)
+            for i in range(n_legs):
+                target_i = leg_responses[i]['target']
+                leg_correlations[target_i] = {}
+                for j in range(n_legs):
+                    if i != j:
+                        target_j = leg_responses[j]['target']
+                        leg_correlations[target_i][target_j] = round(float(corr_matrix[i, j]), 4)
+
+    # Per-leg contribution to combined portfolio
+    if len(per_leg_equity) > 1 and combined_equity and combined_equity[-1] > 0:
+        for i, lr in enumerate(leg_responses):
+            leg_end = per_leg_equity[i][-1] if per_leg_equity[i] else 0
+            alloc_frac = req.legs[i].allocation_pct
+            leg_return = leg_end / (initial * alloc_frac) - 1 if (initial * alloc_frac) > 0 else 0
+            lr['stats']['portfolio']['contribution'] = round(alloc_frac * leg_return, 4)
+            lr['stats']['portfolio']['allocation'] = round(alloc_frac, 4)
+    else:
+        for lr in leg_responses:
+            lr['stats']['portfolio']['contribution'] = lr['stats']['portfolio']['strategy_return']
+            lr['stats']['portfolio']['allocation'] = 1.0
 
     eq_date_strs = [pd.Timestamp(d).strftime('%Y-%m-%d') for d in all_dates]
 
@@ -3329,6 +3573,7 @@ def run_multi_backtest(req: MultiBacktestRequest):
         "date_range": date_range,
         "daily_positions": daily_positions,
         "skipped_entries": skipped_entries,
+        "leg_correlations": leg_correlations if leg_correlations else None,
     }
 
 

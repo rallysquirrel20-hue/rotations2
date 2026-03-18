@@ -41,6 +41,9 @@ interface Trade {
   bars_held: number
   regime_pass: boolean
   skipped?: boolean
+  entry_weight: number | null
+  exit_weight: number | null
+  contribution: number | null
 }
 
 interface DailyPosition {
@@ -49,6 +52,7 @@ interface DailyPosition {
   entry_date: string
   leg_target: string
   alloc: number
+  entry_weight: number
   weight: number
   daily_return: number
   contribution: number
@@ -215,7 +219,6 @@ export function MultiBacktestPanel({ apiBase, onClose }: MultiBacktestPanelProps
   }, [legs.map(l => l.target + l.targetType).join(','), apiBase])
 
   // ── Shared settings ──
-  const [initialEquity, setInitialEquity] = useState(100000)
   const [maxLeverage, setMaxLeverage] = useState(250)
   const [startDate, setStartDate] = useState('')
   const [endDate, setEndDate] = useState('')
@@ -227,6 +230,10 @@ export function MultiBacktestPanel({ apiBase, onClose }: MultiBacktestPanelProps
   const [showResults, setShowResults] = useState(false)
   const [resultTab, setResultTab] = useState<ResultTab>('equity')
 
+  // ── Log scale toggles ──
+  const [eqLogScale, setEqLogScale] = useState(false)
+  const [pathLogScale, setPathLogScale] = useState(false)
+
   // ── Equity chart state ──
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -237,7 +244,7 @@ export function MultiBacktestPanel({ apiBase, onClose }: MultiBacktestPanelProps
   const [hoveredPath, setHoveredPath] = useState<number | null>(null)
   const [pathSortCol, setPathSortCol] = useState<'leg' | 'ticker' | 'date' | 'change'>('change')
   const [pathSortAsc, setPathSortAsc] = useState(false)
-  const [showBuyHold, setShowBuyHold] = useState(true)
+  const [showBuyHold, setShowBuyHold] = useState(false)
   const [visibleLegs, setVisibleLegs] = useState<Set<number>>(new Set())
   const [showConstituents, setShowConstituents] = useState(false)
 
@@ -251,6 +258,9 @@ export function MultiBacktestPanel({ apiBase, onClose }: MultiBacktestPanelProps
   // Constituents hover/pin
   const [eqHoverIdx, setEqHoverIdx] = useState<number | null>(null)
   const [eqPinnedIdx, setEqPinnedIdx] = useState<number | null>(null)
+  const [constSortCol, setConstSortCol] = useState<'ticker' | 'leg_target' | 'entry_date' | 'entry_weight' | 'daily_return' | 'weight' | 'contribution'>('weight')
+  const [constSortAsc, setConstSortAsc] = useState(false)
+  const [constMaxH, setConstMaxH] = useState<number | undefined>(undefined)
 
   // ── Allocation validation ──
   const totalAlloc = legs.reduce((s, l) => s + l.allocationPct, 0)
@@ -277,7 +287,6 @@ export function MultiBacktestPanel({ apiBase, onClose }: MultiBacktestPanelProps
           })),
           start_date: startDate || null,
           end_date: endDate || null,
-          initial_equity: initialEquity,
           max_leverage: maxLeverage / 100,
         }),
       })
@@ -296,7 +305,7 @@ export function MultiBacktestPanel({ apiBase, onClose }: MultiBacktestPanelProps
     } finally {
       setLoading(false)
     }
-  }, [apiBase, legs, startDate, endDate, initialEquity, maxLeverage, allocValid, allTargetsSet])
+  }, [apiBase, legs, startDate, endDate, maxLeverage, allocValid, allTargetsSet])
 
   // ── ResizeObserver for equity canvas container ──
   useEffect(() => {
@@ -398,7 +407,12 @@ export function MultiBacktestPanel({ apiBase, onClose }: MultiBacktestPanelProps
 
     eqScaleRef.current = { padLeft: pad.left, plotW, n, startIdx: eqViewRef.current.start }
     const xScale = (i: number) => pad.left + (n > 1 ? (i / (n - 1)) * plotW : plotW / 2)
-    const yScale = (v: number) => pad.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH
+    const logT = (v: number) => Math.log(Math.max(1 + v, 1e-8))
+    const logYMin = eqLogScale ? logT(yMin) : 0
+    const logYMax = eqLogScale ? logT(yMax) : 0
+    const yScale = eqLogScale
+      ? (v: number) => pad.top + plotH - ((logT(v) - logYMin) / (logYMax - logYMin)) * plotH
+      : (v: number) => pad.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH
 
     ctx.clearRect(0, 0, dims.w, dims.h)
     ctx.fillStyle = '#fdf6e3'
@@ -408,7 +422,9 @@ export function MultiBacktestPanel({ apiBase, onClose }: MultiBacktestPanelProps
     ctx.strokeStyle = '#eee8d5'; ctx.lineWidth = 1
     const nTicks = 6
     for (let i = 0; i <= nTicks; i++) {
-      const v = yMin + (yMax - yMin) * (i / nTicks)
+      const v = eqLogScale
+        ? Math.exp(logYMin + (logYMax - logYMin) * (i / nTicks)) - 1
+        : yMin + (yMax - yMin) * (i / nTicks)
       const y = yScale(v)
       ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(dims.w - pad.right, y); ctx.stroke()
       ctx.fillStyle = '#657b83'; ctx.font = '10px monospace'; ctx.textAlign = 'left'
@@ -471,7 +487,7 @@ export function MultiBacktestPanel({ apiBase, onClose }: MultiBacktestPanelProps
         ctx.fillText(`${item.label} ${item.value}`, lx + 24, iy + 3)
       })
     }
-  }, [eqWindowed, resultTab, dims, showBuyHold, visibleLegs, result])
+  }, [eqWindowed, resultTab, dims, showBuyHold, visibleLegs, result, eqLogScale])
 
   // ── Combined trade paths (all legs merged with leg index) ──
   const allPaths = useMemo(() => {
@@ -521,13 +537,20 @@ export function MultiBacktestPanel({ apiBase, onClose }: MultiBacktestPanelProps
     const plotW = pathDims.w - pad.left - pad.right
     const plotH = pathDims.h - pad.top - pad.bottom
     const xScale = (i: number) => pad.left + (i / (maxBars - 1)) * plotW
-    const yScale = (v: number) => pad.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH
+    const logT = (v: number) => Math.log(Math.max(1 + v, 1e-8))
+    const logYMin = pathLogScale ? logT(yMin) : 0
+    const logYMax = pathLogScale ? logT(yMax) : 0
+    const yScale = pathLogScale
+      ? (v: number) => pad.top + plotH - ((logT(v) - logYMin) / (logYMax - logYMin)) * plotH
+      : (v: number) => pad.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH
 
     // Grid
     ctx.strokeStyle = '#e9ecef'; ctx.lineWidth = 1
     const nTicks = 6
     for (let i = 0; i <= nTicks; i++) {
-      const v = yMin + (yMax - yMin) * (i / nTicks)
+      const v = pathLogScale
+        ? Math.exp(logYMin + (logYMax - logYMin) * (i / nTicks)) - 1
+        : yMin + (yMax - yMin) * (i / nTicks)
       const y = yScale(v)
       ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pathDims.w - pad.right, y); ctx.stroke()
       ctx.fillStyle = '#6c757d'; ctx.font = '10px monospace'; ctx.textAlign = 'left'
@@ -575,7 +598,7 @@ export function MultiBacktestPanel({ apiBase, onClose }: MultiBacktestPanelProps
       }
     }
     ctx.globalAlpha = 1
-  }, [allPaths, resultTab, pathDims, hoveredPath, result])
+  }, [allPaths, resultTab, pathDims, hoveredPath, result, pathLogScale])
 
   // ── Wheel zoom + drag pan ──
   useEffect(() => {
@@ -640,6 +663,16 @@ export function MultiBacktestPanel({ apiBase, onClose }: MultiBacktestPanelProps
       window.removeEventListener('mouseup', handleMouseUp)
     }
   }, [result, resultTab])
+
+  // Track chart container height for constituents overlay max-height
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const ro = new ResizeObserver(() => setConstMaxH(el.clientHeight - 8))
+    ro.observe(el)
+    setConstMaxH(el.clientHeight - 8)
+    return () => ro.disconnect()
+  }, [])
 
   // ── Constituents overlay: hover, pin, escape ──
   useEffect(() => {
@@ -775,6 +808,7 @@ export function MultiBacktestPanel({ apiBase, onClose }: MultiBacktestPanelProps
                   </div>
                   <div className="backtest-chart" ref={containerRef} style={{ position: 'relative' }}>
                     <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: '100%', cursor: 'grab' }} />
+                    <button className={`log-toggle-btn ${eqLogScale ? 'active' : ''}`} onClick={() => setEqLogScale(v => !v)}>L</button>
                     {showConstituents && (() => {
                       const activeIdx = eqPinnedIdx ?? eqHoverIdx
                       if (activeIdx == null) return null
@@ -784,6 +818,20 @@ export function MultiBacktestPanel({ apiBase, onClose }: MultiBacktestPanelProps
                       const showCrosshair = localIdx >= 0 && localIdx < n
                       const snapshot = result?.daily_positions?.[activeIdx]
                       const date = result?.combined.equity_curve.dates[activeIdx]
+                      const toggleSort = (col: typeof constSortCol) => {
+                        if (constSortCol === col) setConstSortAsc(v => !v)
+                        else { setConstSortCol(col); setConstSortAsc(col === 'ticker' || col === 'leg_target' || col === 'entry_date') }
+                      }
+                      const sortedPositions = snapshot ? [...snapshot.positions].sort((a, b) => {
+                        let va: number | string, vb: number | string
+                        if (constSortCol === 'ticker') { va = (a.ticker || a.leg_target || ''); vb = (b.ticker || b.leg_target || '') }
+                        else if (constSortCol === 'leg_target') { va = a.leg_target || ''; vb = b.leg_target || '' }
+                        else if (constSortCol === 'entry_date') { va = a.entry_date || ''; vb = b.entry_date || '' }
+                        else { va = a[constSortCol] ?? 0; vb = b[constSortCol] ?? 0 }
+                        const cmp = typeof va === 'string' ? va.localeCompare(vb as string) : (va as number) - (vb as number)
+                        return constSortAsc ? cmp : -cmp
+                      }) : []
+                      const arrow = (col: typeof constSortCol) => constSortCol === col ? (constSortAsc ? ' \u25b2' : ' \u25bc') : ''
                       return (
                         <>
                           {showCrosshair && (
@@ -794,38 +842,49 @@ export function MultiBacktestPanel({ apiBase, onClose }: MultiBacktestPanelProps
                             }} />
                           )}
                           {snapshot && date && (
-                            <div className="candle-detail-overlay" style={eqPinnedIdx != null ? { pointerEvents: 'auto', borderColor: 'rgb(50,50,255)' } : undefined}>
+                            <div style={{ position: 'absolute', top: 4, left: 8, bottom: 54, pointerEvents: 'none', zIndex: 200, display: 'flex', flexDirection: 'column' }}>
+                            <div className="candle-detail-overlay" style={{ ...(eqPinnedIdx != null ? { pointerEvents: 'auto' as const, borderColor: 'rgb(50,50,255)' } : {}), minWidth: 540, position: 'relative', top: 'auto', left: 'auto', maxHeight: '100%' }}>
                               <div className="candle-detail-title">
                                 {date} &mdash; {dollarFmt(snapshot.equity)}
                                 {eqPinnedIdx != null
                                   ? <span style={{ marginLeft: 8, fontSize: 9, color: 'rgb(50,50,255)' }}>PINNED (esc)</span>
                                   : <span style={{ marginLeft: 8, fontSize: 9, color: '#93a1a1' }}>click to pin</span>}
                               </div>
-                              <div className="candle-detail-row" style={{ fontWeight: 'bold', borderBottom: '1px solid #ccc' }}>
-                                <span className="ticker">Ticker</span>
-                                <span className="weight">Weight</span>
-                                <span className="ret">Return</span>
-                                <span className="contrib">Contrib</span>
+                              <div className="candle-detail-row const-header" style={{ fontWeight: 'bold', borderBottom: '1px solid #ccc', cursor: 'pointer', userSelect: 'none' }}>
+                                <span className="const-ticker" onClick={() => toggleSort('ticker')}>Ticker{arrow('ticker')}</span>
+                                <span className="const-leg" onClick={() => toggleSort('leg_target')}>Leg{arrow('leg_target')}</span>
+                                <span className="const-entry" onClick={() => toggleSort('entry_date')}>Entry{arrow('entry_date')}</span>
+                                <span className="const-ew" onClick={() => toggleSort('entry_weight')}>Ent.Wt{arrow('entry_weight')}</span>
+                                <span className="const-ret" onClick={() => toggleSort('daily_return')}>Return{arrow('daily_return')}</span>
+                                <span className="const-cw" onClick={() => toggleSort('weight')}>Cur.Wt{arrow('weight')}</span>
+                                <span className="const-contrib" onClick={() => toggleSort('contribution')}>Contrib{arrow('contribution')}</span>
                               </div>
-                              {snapshot.positions.map((p, i) => (
+                              {sortedPositions.map((p, i) => (
                                 <div key={i} className="candle-detail-row">
-                                  <span className="ticker" style={{ fontSize: 10 }}>{p.ticker || p.leg_target}</span>
-                                  <span className="weight">{(p.weight * 100).toFixed(1)}%</span>
-                                  <span className="ret" style={{ color: p.daily_return >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)' }}>
+                                  <span className="const-ticker">{p.ticker || p.leg_target}</span>
+                                  <span className="const-leg" style={{ fontSize: 9 }}>{p.leg_target}</span>
+                                  <span className="const-entry">{p.entry_date?.slice(5)}</span>
+                                  <span className="const-ew">{((p.entry_weight ?? 0) * 100).toFixed(1)}%</span>
+                                  <span className="const-ret" style={{ color: p.daily_return >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)' }}>
                                     {(p.daily_return * 100).toFixed(2)}%</span>
-                                  <span className="contrib" style={{ color: p.contribution >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)' }}>
+                                  <span className="const-cw">{(p.weight * 100).toFixed(1)}%</span>
+                                  <span className="const-contrib" style={{ color: p.contribution >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)' }}>
                                     {(p.contribution * 100).toFixed(3)}%</span>
                                 </div>
                               ))}
                               <div className="candle-detail-row" style={{ borderTop: '1px solid #93a1a1', fontWeight: 'bold' }}>
-                                <span className="ticker">Total</span>
-                                <span className="weight">{(snapshot.exposure_pct * 100).toFixed(1)}%</span>
-                                <span className="ret"></span>
-                                <span className="contrib" style={{
+                                <span className="const-ticker">Total</span>
+                                <span className="const-leg"></span>
+                                <span className="const-entry"></span>
+                                <span className="const-ew"></span>
+                                <span className="const-ret"></span>
+                                <span className="const-cw">{(snapshot.exposure_pct * 100).toFixed(1)}%</span>
+                                <span className="const-contrib" style={{
                                   color: snapshot.positions.reduce((s, p) => s + p.contribution, 0) >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)'
                                 }}>
                                   {(snapshot.positions.reduce((s, p) => s + p.contribution, 0) * 100).toFixed(3)}%</span>
                               </div>
+                            </div>
                             </div>
                           )}
                         </>
@@ -838,8 +897,9 @@ export function MultiBacktestPanel({ apiBase, onClose }: MultiBacktestPanelProps
               {/* ── Path tab ── */}
               {resultTab === 'path' && (
                 <div className="backtest-path-container">
-                  <div className="backtest-chart" ref={pathContainerRef}>
+                  <div className="backtest-chart" ref={pathContainerRef} style={{ position: 'relative' }}>
                     <canvas ref={pathCanvasRef} style={{ display: 'block', width: '100%', height: '100%' }} />
+                    <button className={`log-toggle-btn ${pathLogScale ? 'active' : ''}`} onClick={() => setPathLogScale(v => !v)}>L</button>
                   </div>
                   <div className="backtest-path-legend" style={{ width: 320, minWidth: 320 }}>
                     {(() => {
@@ -965,11 +1025,11 @@ export function MultiBacktestPanel({ apiBase, onClose }: MultiBacktestPanelProps
                     <table className="summary-table">
                       <thead>
                         <tr>
-                          {['legTarget', 'ticker', 'entry_date', 'exit_date', 'entry_price', 'exit_price', 'change', 'bars_held'].map(col => (
+                          {['legTarget', 'ticker', 'entry_date', 'exit_date', 'entry_price', 'exit_price', 'change', 'entry_weight', 'exit_weight', 'contribution', 'bars_held'].map(col => (
                             <th key={col} className="summary-th"
                               onClick={() => { setSortCol(col); setSortAsc(sortCol === col ? !sortAsc : true) }}
                               style={{ cursor: 'pointer' }}>
-                              {col === 'legTarget' ? 'Leg' : col.replace(/_/g, ' ')}
+                              {col === 'legTarget' ? 'Leg' : col === 'entry_weight' ? 'Ent.Wt' : col === 'exit_weight' ? 'Ex.Wt' : col === 'contribution' ? 'Contrib' : col.replace(/_/g, ' ')}
                               {sortCol === col && (sortAsc ? ' \u2191' : ' \u2193')}
                             </th>
                           ))}
@@ -994,6 +1054,14 @@ export function MultiBacktestPanel({ apiBase, onClose }: MultiBacktestPanelProps
                               fontWeight: 600,
                             }}>
                               {t.skipped ? 'SKIP' : pctFmt(t.change)}
+                            </td>
+                            <td className="summary-td">{t.skipped ? '--' : pctFmt(t.entry_weight)}</td>
+                            <td className="summary-td">{t.skipped ? '--' : pctFmt(t.exit_weight)}</td>
+                            <td className="summary-td" style={{
+                              color: !t.skipped && t.contribution != null ? (t.contribution >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)') : undefined,
+                              fontWeight: !t.skipped && t.contribution != null ? 600 : undefined,
+                            }}>
+                              {t.skipped ? '--' : pctFmt(t.contribution)}
                             </td>
                             <td className="summary-td">{t.skipped ? '--' : t.bars_held}</td>
                           </tr>

@@ -1,5 +1,5 @@
 # Dependency Tree
-Updated: 2026-03-18 (incremental — Buy_Hold signal, searchable target combo, multi-leg grid/paths, pct-return equity curves, leverage multiplier)
+Updated: 2026-03-18 (incremental — quarterly universe filtering in backtest, entry_weight/eod_weight, sortable constituents overlay, BENCHMARK_TIMING=True)
 Files scanned: 15
 Functions indexed: 228
 
@@ -27,7 +27,7 @@ Functions indexed: 228
 | signals/rotations.py | 6206 | 143 | Main pipeline: universe, signals, baskets, live, reports |
 | signals/rotations_old_outputs.py | 2177 | 35 | Extracted Group B report cells (Excel, correlations, charts, PDFs) |
 | signals/databento_test.py | 624 | 16 | Databento API connectivity tests |
-| app/backend/main.py | 3406 | 43 | FastAPI REST endpoints + WebSocket |
+| app/backend/main.py | 3500 | 43 | FastAPI REST endpoints + WebSocket |
 | signals/test_all_optimizations.py | 75 | 1 | Compares old vs new breadth/contributions/correlation values after rebuild |
 | signals/test_correlation_optimization.py | 207 | 5 | Step-by-step test harness: backup, compare, check returns_matrix, test API, restore |
 | app/backend/signals_engine.py | 534 | 2 | Live signal computation (parallel impl) |

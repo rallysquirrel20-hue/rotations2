@@ -813,6 +813,7 @@ html, body, #root {
   flex: 1;
   min-height: 0;
   min-width: 0;
+  position: relative;
 }
 
 /* Date controls bar for correlation and returns tabs */
@@ -971,8 +972,9 @@ html, body, #root {
 /* Candle detail overlay */
 .candle-detail-overlay {
   position: absolute;
-  top: 8px;
+  top: 4px;
   left: 8px;
+  max-height: calc(100% - 8px);
   background: rgba(253, 246, 227, 0.95);
   border: 1px solid var(--border-color);
   font-family: var(--font-mono, monospace);
@@ -980,7 +982,6 @@ html, body, #root {
   padding: 6px 8px;
   pointer-events: none;
   z-index: 200;
-  max-height: 60%;
   overflow-y: auto;
   min-width: 200px;
 }
@@ -997,10 +998,19 @@ html, body, #root {
   gap: 8px;
   line-height: 1.5;
 }
-.candle-detail-row .ticker { flex: 0 0 50px; }
+.candle-detail-row .ticker { flex: 0 0 80px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .candle-detail-row .weight { flex: 0 0 50px; text-align: right; }
 .candle-detail-row .ret { flex: 0 0 55px; text-align: right; }
 .candle-detail-row .contrib { flex: 0 0 55px; text-align: right; }
+/* Constituents overlay columns (backtest) */
+.candle-detail-row .const-ticker { flex: 0 0 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.candle-detail-row .const-leg { flex: 0 0 70px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.candle-detail-row .const-entry { flex: 0 0 80px; text-align: right; }
+.candle-detail-row .const-ew { flex: 0 0 48px; text-align: right; }
+.candle-detail-row .const-ret { flex: 0 0 55px; text-align: right; }
+.candle-detail-row .const-cw { flex: 0 0 48px; text-align: right; }
+.candle-detail-row .const-contrib { flex: 0 0 55px; text-align: right; }
+.candle-detail-row.const-header span:hover { text-decoration: underline; }
 
 /* Quarter Universe Range Selector */
 .quarter-range-label {
@@ -1328,6 +1338,8 @@ html, body, #root {
   flex: 1;
   min-height: 0;
   min-width: 0;
+  position: relative;
+  overflow: hidden;
 }
 
 .backtest-chart-nav {
@@ -1643,6 +1655,34 @@ html, body, #root {
 .analogs-agg-table td { padding: 4px 8px; border-bottom: 1px solid var(--border-color); }
 .analogs-agg-table tr:hover { background: var(--bg-sidebar); }
 .analogs-agg-subrow td { background: var(--bg-main); color: var(--base01); }
+
+/* Log scale toggle button (TV-style) */
+.log-toggle-btn {
+  position: absolute;
+  bottom: 4px;
+  right: 4px;
+  width: 20px;
+  height: 20px;
+  font-size: 11px;
+  font-weight: bold;
+  font-family: 'Fira Code', 'Cascadia Code', Consolas, monospace;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  border: 1px solid var(--base1);
+  background: var(--bg-sidebar);
+  color: var(--base01);
+  z-index: 10;
+  padding: 0;
+  line-height: 1;
+}
+.log-toggle-btn:hover { border-color: var(--base01); }
+.log-toggle-btn.active {
+  background: var(--base01);
+  color: var(--bg-main);
+  border-color: var(--base01);
+}
 
 /* Global Blocky style */
 * { border-radius: 0 !important; box-shadow: none !important; }

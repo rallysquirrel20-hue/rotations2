@@ -335,6 +335,7 @@ function ReturnsChart({ data, quarterDateRange }: { data: CumulativeReturnsData;
   const [hoveredTicker, setHoveredTicker] = useState<string | null>(null)
   const [dims, setDims] = useState({ w: 800, h: 400 })
   const [presetMode, setPresetMode] = useState<'Q' | 'Y'>('Q')
+  const [logScale, setLogScale] = useState(false)
 
   // Date range state — default to quarter range if active, else 1Y lookback
   const allDates = data.dates
@@ -487,7 +488,12 @@ function ReturnsChart({ data, quarterDateRange }: { data: CumulativeReturnsData;
 
     const numDates = windowedData.dates.length
     const xScale = (i: number) => pad.left + (numDates > 1 ? (i / (numDates - 1)) * plotW : plotW / 2)
-    const yScale = (v: number) => pad.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH
+    const logT = (v: number) => Math.log(Math.max(1 + v, 1e-8))
+    const logYMin = logScale ? logT(yMin) : 0
+    const logYMax = logScale ? logT(yMax) : 0
+    const yScale = logScale
+      ? (v: number) => pad.top + plotH - ((logT(v) - logYMin) / (logYMax - logYMin)) * plotH
+      : (v: number) => pad.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH
 
     ctx.clearRect(0, 0, dims.w, dims.h)
     ctx.fillStyle = '#fdf6e3'
@@ -498,7 +504,9 @@ function ReturnsChart({ data, quarterDateRange }: { data: CumulativeReturnsData;
     ctx.lineWidth = 1
     const nTicks = 6
     for (let i = 0; i <= nTicks; i++) {
-      const v = yMin + (yMax - yMin) * (i / nTicks)
+      const v = logScale
+        ? Math.exp(logYMin + (logYMax - logYMin) * (i / nTicks)) - 1
+        : yMin + (yMax - yMin) * (i / nTicks)
       const y = yScale(v)
       ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(dims.w - pad.right, y); ctx.stroke()
       ctx.fillStyle = '#6c757d'; ctx.font = '10px sans-serif'; ctx.textAlign = 'left'
@@ -538,7 +546,7 @@ function ReturnsChart({ data, quarterDateRange }: { data: CumulativeReturnsData;
       ctx.stroke()
       ctx.globalAlpha = 1
     })
-  }, [windowedData, dims, hoveredTicker, sortedSeries])
+  }, [windowedData, dims, hoveredTicker, sortedSeries, logScale])
 
   return (
     <div className="returns-container">
@@ -570,6 +578,7 @@ function ReturnsChart({ data, quarterDateRange }: { data: CumulativeReturnsData;
       <div className="returns-right">
         <div className="returns-chart" ref={containerRef}>
           <canvas ref={canvasRef} style={{ width: '100%', height: '100%' }} />
+          <button className={`log-toggle-btn ${logScale ? 'active' : ''}`} onClick={() => setLogScale(v => !v)}>L</button>
         </div>
       </div>
       <div className="returns-legend-right">

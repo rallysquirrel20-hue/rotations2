@@ -99,6 +99,7 @@ export function AnalogsPanel({ apiBase, exportTrigger }: AnalogsPanelProps) {
   const [compDims, setCompDims] = useState({ w: 800, h: 400 })
   const [fwdDims, setFwdDims] = useState({ w: 800, h: 400 })
   const [fwdHovered, setFwdHovered] = useState<string | null>(null)
+  const [fwdLogScale, setFwdLogScale] = useState(false)
   const [summarySortCol, setSummarySortCol] = useState<string>('returns')
   const [summarySortAsc, setSummarySortAsc] = useState(false)
   const [summaryShowRanks, setSummaryShowRanks] = useState(false)
@@ -472,12 +473,19 @@ export function AnalogsPanel({ apiBase, exportTrigger }: AnalogsPanelProps) {
     yMin -= yPad; yMax += yPad
 
     const xScale = (i: number) => pad.left + (i / (nDates - 1 || 1)) * plotW
-    const yScale = (v: number) => pad.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH
+    const logT = (v: number) => Math.log(Math.max(1 + v, 1e-8))
+    const logYMin = fwdLogScale ? logT(yMin) : 0
+    const logYMax = fwdLogScale ? logT(yMax) : 0
+    const yScale = fwdLogScale
+      ? (v: number) => pad.top + plotH - ((logT(v) - logYMin) / (logYMax - logYMin)) * plotH
+      : (v: number) => pad.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH
 
     // Grid + Y axis
     ctx.strokeStyle = '#e9ecef'; ctx.lineWidth = 1
     for (let i = 0; i <= 5; i++) {
-      const v = yMin + (yMax - yMin) * (i / 5)
+      const v = fwdLogScale
+        ? Math.exp(logYMin + (logYMax - logYMin) * (i / 5)) - 1
+        : yMin + (yMax - yMin) * (i / 5)
       const y = yScale(v)
       ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(w - pad.right, y); ctx.stroke()
       ctx.fillStyle = '#6c757d'; ctx.font = '9px monospace'; ctx.textAlign = 'right'
@@ -531,7 +539,7 @@ export function AnalogsPanel({ apiBase, exportTrigger }: AnalogsPanelProps) {
     // Title
     ctx.fillStyle = '#586e75'; ctx.font = 'bold 10px monospace'; ctx.textAlign = 'left'
     ctx.fillText(`FORWARD RETURNS: Analog #${selectedAnalog + 1} (${analog.start} — ${analog.end})`, pad.left, 14)
-  }, [tab, data, selectedAnalog, fwdDims, sortedSlugs, fwdHovered, renderTick])
+  }, [tab, data, selectedAnalog, fwdDims, sortedSlugs, fwdHovered, renderTick, fwdLogScale])
 
   // Forward tab hover handler
   const handleFwdMouse = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -816,12 +824,15 @@ export function AnalogsPanel({ apiBase, exportTrigger }: AnalogsPanelProps) {
         {tab === 'forward' && (
           <div ref={fwdContainerRef} style={{ flex: 1, minHeight: 200, position: 'relative' }}>
             {selectedAnalog !== null ? (
+              <>
               <canvas
                 ref={fwdCanvasRef}
                 style={{ width: '100%', height: '100%', display: 'block' }}
                 onMouseMove={handleFwdMouse}
                 onMouseLeave={() => setFwdHovered(null)}
               />
+              <button className={`log-toggle-btn ${fwdLogScale ? 'active' : ''}`} onClick={() => setFwdLogScale(v => !v)}>L</button>
+              </>
             ) : (
               <div style={{ padding: 16, fontSize: 12, color: 'var(--base01)', fontStyle: 'italic' }}>
                 Select an analog from the Analogs tab to view forward returns
