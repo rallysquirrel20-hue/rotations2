@@ -1009,39 +1009,7 @@ function ContributionChart({ basketName, apiBase, quarterDateRange }: { basketNa
   )
 }
 
-type BasketReturnMode = 'cross' | 'daily' | 'analogs'
-
-interface AnalogItem {
-  start: string
-  end: string
-  similarity: number
-  similarity_breakdown: {
-    returns: number
-    breadth: number
-    breakout: number
-    correlation: number
-    volatility: number
-  }
-  returns: Record<string, number | null>
-  forward: Record<string, Record<string, number | null> | null>
-}
-
-interface AnalogsData {
-  current: {
-    start: string
-    end: string
-    returns: Record<string, number | null>
-    metrics: {
-      uptrend_pct: Record<string, number | null>
-      breakout_pct: Record<string, number | null>
-      correlation_pct: Record<string, number | null>
-      rv_ema: Record<string, number | null>
-    }
-  } | null
-  analogs: AnalogItem[]
-  date_range: { min: string; max: string }
-  message?: string
-}
+type BasketReturnMode = 'cross' | 'daily'
 type BasketReturnGroup = 'all' | 'themes' | 'sectors' | 'industries'
 
 interface BasketReturnItem {
@@ -1099,8 +1067,6 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
   const [dailyBasket, setDailyBasket] = useState('')
   const [dailyDates, setDailyDates] = useState<string[]>([])
   const [dailyReturns, setDailyReturns] = useState<number[]>([])
-  // Analogs data
-  const [analogsData, setAnalogsData] = useState<AnalogsData | null>(null)
   // Available baskets for daily mode picker
   const [availableBaskets, setAvailableBaskets] = useState<string[]>([])
   // Basket search state
@@ -1108,9 +1074,6 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
   const [basketSearchOpen, setBasketSearchOpen] = useState(false)
   const basketSearchRef = useRef<HTMLInputElement>(null)
   const [basketSearchHighlight, setBasketSearchHighlight] = useState(0)
-  // Refs for analog mini canvases
-  const analogCanvasRefs = useRef<Map<number, HTMLCanvasElement>>(new Map())
-
   const filteredBaskets = useMemo(() => {
     if (!basketSearch.trim()) return availableBaskets
     const q = basketSearch.toLowerCase()
@@ -1152,12 +1115,6 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
           }
         })
         .catch(() => setBaskets([]))
-        .finally(() => setLoading(false))
-    } else if (mode === 'analogs') {
-      const params = new URLSearchParams({ start: startDate, end: endDate, mode: 'analogs', group })
-      axios.get(`${apiBase}/baskets/returns?${params}`)
-        .then(res => setAnalogsData(res.data))
-        .catch(() => setAnalogsData(null))
         .finally(() => setLoading(false))
     } else {
       if (!dailyBasket) { setLoading(false); return }
@@ -1201,8 +1158,6 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
       name = startDate === endDate
         ? `cross_basket_returns_${group}_${fmtDate(endDate)}`
         : `cross_basket_returns_${group}_${fmtDate(startDate)}_${fmtDate(endDate)}`
-    } else if (mode === 'analogs') {
-      name = `regime_analogs_${group}_${fmtDate(startDate)}_${fmtDate(endDate)}`
     } else {
       const bName = dailyBasket || 'unknown'
       name = startDate === endDate
@@ -1317,18 +1272,6 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
     if (mode === 'cross') {
       const items = baskets.map(b => ({ name: b.name, ret: b.return }))
       drawBarChart(ctx, dims.w, dims.h, items, hoveredIdx, true)
-    } else if (mode === 'analogs') {
-      // Draw current period chart
-      if (analogsData?.current) {
-        const entries = Object.entries(analogsData.current.returns)
-          .filter(([, v]) => v !== null)
-          .map(([k, v]) => ({ name: k, ret: v as number }))
-          .sort((a, b) => a.ret - b.ret)
-        drawBarChart(ctx, dims.w, dims.h, entries, hoveredIdx, true)
-        // Title
-        ctx.fillStyle = '#586e75'; ctx.font = 'bold 11px monospace'; ctx.textAlign = 'left'
-        ctx.fillText(`CURRENT: ${analogsData.current.start} to ${analogsData.current.end}`, 65, 24)
-      }
     } else {
       const n = dailyReturns.length
       if (n === 0) return
@@ -1387,66 +1330,7 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
         }
       }
     }
-  }, [baskets, dailyReturns, dailyDates, dims, hoveredIdx, mode, analogsData])
-
-  // Render mini bar charts for analog cards
-  useEffect(() => {
-    if (mode !== 'analogs' || !analogsData?.analogs.length || !analogsData?.current) return
-    const basketOrder = Object.entries(analogsData.current.returns)
-      .filter(([, v]) => v !== null)
-      .map(([k, v]) => ({ name: k, ret: v as number }))
-      .sort((a, b) => a.ret - b.ret)
-      .map(s => s.name)
-
-    analogsData.analogs.forEach((analog, ai) => {
-      const canvas = analogCanvasRefs.current.get(ai)
-      if (!canvas) return
-      const ctx = canvas.getContext('2d')
-      if (!ctx) return
-      const rect = canvas.getBoundingClientRect()
-      const dpr = window.devicePixelRatio || 1
-      const w = rect.width
-      const h = 80
-      canvas.width = w * dpr
-      canvas.height = h * dpr
-      ctx.scale(dpr, dpr)
-      ctx.clearRect(0, 0, w, h)
-      ctx.fillStyle = '#fdf6e3'
-      ctx.fillRect(0, 0, w, h)
-
-      const items = basketOrder
-        .filter(k => analog.returns[k] !== null && analog.returns[k] !== undefined)
-        .map(k => ({ name: k, ret: analog.returns[k] as number }))
-      const n = items.length
-      if (n === 0) return
-      const pad = { top: 4, right: 4, bottom: 4, left: 4 }
-      const plotW = w - pad.left - pad.right
-      const plotH = h - pad.top - pad.bottom
-      const barW = Math.max(2, (plotW / n) * 0.75)
-      const gap = (plotW - barW * n) / (n + 1)
-
-      let yMin = 0, yMax = 0
-      items.forEach(b => { yMin = Math.min(yMin, b.ret); yMax = Math.max(yMax, b.ret) })
-      const yPad = (yMax - yMin) * 0.1 || 0.005
-      yMin -= yPad; yMax += yPad
-      const yScale = (v: number) => pad.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH
-      const zeroY = yScale(0)
-
-      ctx.strokeStyle = '#adb5bd'; ctx.lineWidth = 0.5; ctx.setLineDash([2, 2])
-      ctx.beginPath(); ctx.moveTo(pad.left, zeroY); ctx.lineTo(w - pad.right, zeroY); ctx.stroke()
-      ctx.setLineDash([])
-
-      for (let i = 0; i < n; i++) {
-        const x = pad.left + gap + i * (barW + gap)
-        const val = items[i].ret
-        const bTop = val >= 0 ? yScale(val) : zeroY
-        const bBot = val >= 0 ? zeroY : yScale(val)
-        const barHeight = Math.max(1, bBot - bTop)
-        ctx.fillStyle = val >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)'
-        ctx.fillRect(x, bTop, barW, barHeight)
-      }
-    })
-  }, [analogsData, mode])
+  }, [baskets, dailyReturns, dailyDates, dims, hoveredIdx, mode])
 
   // Mouse hover
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -1455,12 +1339,8 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
     const scaleX = dims.w / rect.width
     const mx = (e.clientX - rect.left) * scaleX
 
-    if (mode === 'cross' || mode === 'analogs') {
-      const items = mode === 'cross'
-        ? baskets.map(b => ({ name: b.name, ret: b.return }))
-        : analogsData?.current
-          ? Object.entries(analogsData.current.returns).filter(([, v]) => v !== null).map(([k, v]) => ({ name: k, ret: v as number })).sort((a, b) => a.ret - b.ret)
-          : []
+    if (mode === 'cross') {
+      const items = baskets.map(b => ({ name: b.name, ret: b.return }))
       const n = items.length
       if (!n) return
       const pad = { left: 60, right: 50 }
@@ -1489,19 +1369,8 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
     }
   }
 
-  // Sorted items for analogs hover
-  const analogsSorted = useMemo(() => {
-    if (!analogsData?.current) return []
-    return Object.entries(analogsData.current.returns)
-      .filter(([, v]) => v !== null)
-      .map(([k, v]) => ({ name: k, ret: v as number }))
-      .sort((a, b) => a.ret - b.ret)
-  }, [analogsData])
-
   const hovered = hoveredIdx !== null ? (mode === 'cross' && baskets[hoveredIdx]
     ? { name: baskets[hoveredIdx].name.replace(/_/g, ' '), ret: baskets[hoveredIdx].return, group: baskets[hoveredIdx].group }
-    : mode === 'analogs' && analogsSorted[hoveredIdx]
-      ? { name: analogsSorted[hoveredIdx].name.replace(/_/g, ' '), ret: analogsSorted[hoveredIdx].ret, group: 'current' }
     : mode === 'daily' && dailyDates[hoveredIdx] !== undefined
       ? { name: dailyDates[hoveredIdx], ret: dailyReturns[hoveredIdx], group: dailyBasket.replace(/_/g, ' ') }
       : null
@@ -1533,18 +1402,18 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
       {/* Controls bar */}
       <div className="analysis-date-controls">
         {/* Mode toggle */}
-        {(['cross', 'daily', 'analogs'] as BasketReturnMode[]).map(m => (
+        {(['cross', 'daily'] as BasketReturnMode[]).map(m => (
           <button
             key={m}
             className={`basket-returns-preset-btn ${mode === m ? 'active' : ''}`}
             style={{ padding: '3px 8px', fontSize: '10px' }}
             onClick={() => setMode(m)}
           >
-            {m === 'cross' ? 'CROSS' : m === 'daily' ? 'SINGLE' : 'ANALOGS'}
+            {m === 'cross' ? 'CROSS' : 'SINGLE'}
           </button>
         ))}
-        {/* Group filter (cross + analogs mode) */}
-        {(mode === 'cross' || mode === 'analogs') && (
+        {/* Group filter (cross mode) */}
+        {mode === 'cross' && (
           <>
             <span style={{ color: 'var(--border-color)', margin: '0 1px' }}>|</span>
             {(['all', 'themes', 'sectors', 'industries'] as BasketReturnGroup[]).map(g => (
@@ -1606,115 +1475,29 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
         <input type="date" className="date-input" value={endDate} min={dateBounds.min} max={dateBounds.max} onChange={e => { setEndDate(e.target.value); setActivePreset('') }} />
       </div>
       {/* Chart area */}
-      {mode !== 'analogs' ? (
-        <div style={{ flex: 1, minHeight: 0, position: 'relative' }} ref={containerRef}>
-          <canvas
-            ref={canvasRef}
-            style={{ width: '100%', height: '100%' }}
-            onMouseMove={handleMouseMove}
-            onMouseLeave={() => setHoveredIdx(null)}
-          />
-          {hovered && (
-            <div className="candle-detail-overlay" style={{ minWidth: 140 }}>
-              <div className="candle-detail-title">{hovered.name}</div>
-              <div className="candle-detail-row">
-                <span>Return</span>
-                <span className="ret" style={{ color: hovered.ret >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)' }}>
-                  {(hovered.ret * 100).toFixed(2)}%
-                </span>
-              </div>
-              <div className="candle-detail-row">
-                <span>Group</span>
-                <span className="ret">{hovered.group}</span>
-              </div>
+      <div style={{ flex: 1, minHeight: 0, position: 'relative' }} ref={containerRef}>
+        <canvas
+          ref={canvasRef}
+          style={{ width: '100%', height: '100%' }}
+          onMouseMove={handleMouseMove}
+          onMouseLeave={() => setHoveredIdx(null)}
+        />
+        {hovered && (
+          <div className="candle-detail-overlay" style={{ minWidth: 140 }}>
+            <div className="candle-detail-title">{hovered.name}</div>
+            <div className="candle-detail-row">
+              <span>Return</span>
+              <span className="ret" style={{ color: hovered.ret >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)' }}>
+                {(hovered.ret * 100).toFixed(2)}%
+              </span>
             </div>
-          )}
-        </div>
-      ) : (
-        <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-          {/* Current period chart — 35% height */}
-          <div style={{ flex: '0 0 35%', position: 'relative', borderBottom: '2px solid var(--border-color)' }} ref={containerRef}>
-            <canvas
-              ref={canvasRef}
-              style={{ width: '100%', height: '100%' }}
-              onMouseMove={handleMouseMove}
-              onMouseLeave={() => setHoveredIdx(null)}
-            />
-            {hovered && (
-              <div className="candle-detail-overlay" style={{ minWidth: 140 }}>
-                <div className="candle-detail-title">{hovered.name}</div>
-                <div className="candle-detail-row">
-                  <span>Return</span>
-                  <span className="ret" style={{ color: hovered.ret >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)' }}>
-                    {(hovered.ret * 100).toFixed(2)}%
-                  </span>
-                </div>
-              </div>
-            )}
+            <div className="candle-detail-row">
+              <span>Group</span>
+              <span className="ret">{hovered.group}</span>
+            </div>
           </div>
-          {/* Analog cards — scrollable */}
-          <div style={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
-            {analogsData?.message && (
-              <div style={{ padding: 16, fontSize: 12, color: 'var(--base01)', fontStyle: 'italic' }}>{analogsData.message}</div>
-            )}
-            {analogsData?.analogs.map((analog, ai) => {
-              // Sort baskets same order as current chart
-              const basketOrder = analogsSorted.map(s => s.name)
-              const analogItems = basketOrder
-                .filter(k => analog.returns[k] !== null && analog.returns[k] !== undefined)
-                .map(k => ({ name: k, ret: analog.returns[k] as number }))
-
-              // Forward return averages
-              const fwdAvg = (hz: string) => {
-                const fwd = analog.forward[hz]
-                if (!fwd) return null
-                const vals = Object.values(fwd).filter((v): v is number => v !== null)
-                if (vals.length === 0) return null
-                return vals.reduce((a, b) => a + b, 0) / vals.length
-              }
-
-              return (
-                <div key={ai} className="analog-card">
-                  <div className="analog-card-header">
-                    <span style={{ fontSize: 11, fontWeight: 'bold', color: 'var(--text-bold)' }}>
-                      #{ai + 1}: {analog.start} — {analog.end}
-                    </span>
-                    <span className="analog-similarity">{(analog.similarity * 100).toFixed(0)}% MATCH</span>
-                  </div>
-                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 4 }}>
-                    {Object.entries(analog.similarity_breakdown).map(([k, v]) => {
-                      const labels: Record<string, string> = { returns: 'Ret', breadth: 'Brd', breakout: 'BO', correlation: 'Cor', volatility: 'Vol' }
-                      return (
-                        <span key={k} style={{ fontSize: 9, padding: '1px 4px', border: '1px solid var(--border-color)', color: 'var(--text-main)' }}>
-                          {labels[k] || k} {(v * 100).toFixed(0)}%
-                        </span>
-                      )
-                    })}
-                  </div>
-                  {/* Mini bar chart */}
-                  <canvas
-                    ref={el => { if (el) analogCanvasRefs.current.set(ai, el); else analogCanvasRefs.current.delete(ai) }}
-                    style={{ width: '100%', height: 80 }}
-                  />
-                  <div className="analog-forward-row">
-                    {['1M', '3M', '6M'].map(hz => {
-                      const avg = fwdAvg(hz)
-                      return (
-                        <span key={hz} style={{ color: avg === null ? 'var(--base01)' : avg >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)' }}>
-                          +{hz}: {avg !== null ? (avg * 100).toFixed(1) + '% avg' : 'N/A'}
-                        </span>
-                      )
-                    })}
-                  </div>
-                </div>
-              )
-            })}
-            {analogsData && analogsData.analogs.length === 0 && !analogsData.message && (
-              <div style={{ padding: 16, fontSize: 12, color: 'var(--base01)', fontStyle: 'italic' }}>No analogs found</div>
-            )}
-          </div>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   )
 }

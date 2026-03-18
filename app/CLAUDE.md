@@ -57,7 +57,7 @@ The backend auto-loads `.env` from the local `backend/` directory first, falling
 
 API endpoints:
 - `GET /api/baskets` — Lists all baskets (Themes, Sectors, Industries)
-- `GET /api/baskets/returns` — Cross-basket or single-basket returns. Query params: `mode` (`period` for ranked bar chart across all baskets, `daily` for a single basket's day-by-day return series), `start`/`end` (date range), `group` (`all`/`themes`/`sectors`/`industries`, period mode only), `basket` (basket slug, daily mode only). Both modes append today's live close from `LIVE_BASKET_SIGNALS_FILE` before computing returns.
+- `GET /api/baskets/returns` — Cross-basket, single-basket, or analogs returns. Query params: `mode` (`period` for ranked bar chart, `daily` for single basket day-by-day, `analogs` for regime analog matching), `start`/`end` (date range), `group` (`all`/`themes`/`sectors`/`industries`), `basket` (slug, daily mode), `threshold` (min similarity, analogs mode). The `analogs` mode returns: multi-timeframe returns, cross-basket correlation, `forward_series`, aggregate stats, per-basket `ranks`, and `basket_count`.
 - `GET /api/baskets/{name}` — Basket OHLCV data, signals, correlation, weighted tickers
 - `GET /api/baskets/{name}/summary` — Open signals, 21-day correlation matrix, 1-year cumulative returns
 - `GET /api/baskets/{name}/contributions` — Per-constituent return contribution data for a date range
@@ -83,7 +83,7 @@ Called by `main.py` to recompute signals when merging live Databento bars with h
 
 ### Frontend (`frontend/`)
 
-**`App.tsx`** — Main orchestration component. Manages view switching (Themes/Sectors/Industries/Tickers), date range filtering, and WebSocket lifecycle. Uses `window.location.hostname` for dynamic API host detection (enables mobile-to-PC access).
+**`App.tsx`** — Main orchestration component. Manages view switching (Themes/Sectors/Industries/Tickers), date range filtering, and WebSocket lifecycle. Uses `window.location.hostname` for dynamic API host detection (enables mobile-to-PC access). Header buttons: **Intrabasket**, **Cross-Basket**, **Backtest**, **Analogs**, **Export** (5 total, mutually exclusive panels).
 
 **`TVChart.tsx`** — Multi-pane chart using `lightweight-charts`. Synchronized crosshairs and time scales across panes:
 - **Price pane**: Candlesticks + resistance pivots (pink) + support pivots (blue) + upper/lower targets
@@ -100,10 +100,14 @@ Panes are drag-resizable (min 40px, default 80px). Supports live WebSocket updat
   - **Correlation tab**: Canvas-rendered heatmap of 21-day correlation matrix with date picker
   - **Returns tab**: Canvas-rendered cumulative returns line chart with quarter/year presets and hover interaction
   - **Contribution tab**: Canvas-rendered per-constituent return contribution chart via `GET /api/baskets/{name}/contributions`
-- **Cross-Basket Analysis** — Cross-basket comparison via `BasketReturnsChart` component:
-  - **Cross mode**: Ranked bar chart comparing period returns across all baskets, filterable by group (ALL/T/S/I)
-  - **Single mode**: Daily return bar chart for one basket selected via searchable dropdown
-  - Date presets (1D, 1W, 1M, 3M, 6M, YTD, 1Y, 3Y, 5Y, ALL), live intraday overlay, canvas PNG export
+- **Cross-Basket Analysis** — Cross-basket comparison via `BasketReturnsChart` component. Modes: `cross` (ranked bar chart, filterable by ALL/T/S/I) and `daily` (single basket day-by-day via searchable dropdown). Date presets, live intraday overlay, canvas PNG export.
+
+**`AnalogsPanel.tsx`** — Self-contained analogs analysis panel activated by the **Analogs** header button. Matches the current market environment fingerprint against historical periods using Spearman rank correlation across multiple factors. Five tabs:
+  - **Summary**: Ranking table showing raw value → rank transformation per factor per basket (the fingerprint)
+  - **Analogs**: Scrollable card list of matched historical periods with similarity scores, breakdown badges, mini bar charts
+  - **Comparison**: Side-by-side bar charts (current vs selected analog) with per-factor similarity breakdown
+  - **Forward**: Cumulative forward returns line chart per basket from selected analog's end date
+  - **Aggregate**: Stats table (mean/median/min/max/std) at 1M/3M/6M horizons with expandable per-basket rows
 
 ### Styling
 

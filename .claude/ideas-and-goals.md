@@ -26,8 +26,28 @@ Test backtest feature for accuracy.
 ### ~~8. Backtest Pane Title~~ — COMPLETED (2026-03-16)
 ~~Fix visual asymmetry; include backtest variables in title.~~ Header height aligned to 41px matching sidebar accordion rows. Leverage preset buttons added. Position size and leverage preset rows with labels for symmetry.
 
-### 9. Multi-Basket Backtesting
-Add ability to test using multiple baskets or the constituent tickers of multiple baskets.
+### 9. Multi-Basket Backtesting — IN PROGRESS (2026-03-18)
+Multi-leg backtest overhaul. Completed sub-goals:
+- Searchable target picker (baskets + tickers) for single-leg and multi-leg
+- Size/lev buttons uniform width, equity/size/lev inputs equal spacing
+- Single-leg half-width card; multi-leg 2-column grid (up to 6 legs)
+- Buy & Hold as entry signal option (basket or ticker)
+- Fixed constituents overlay (single-leg: added daily_positions; multi-leg: fixed keying + position detail)
+- Per-leg independent visibility toggle
+- Per-leg curves show standalone full-portfolio returns (not allocation-weighted)
+- Equity curves indexed to 0% return, rebased on timeframe change
+- Strategy toggle buttons + timeframe buttons match cross-basket aesthetic
+- All header rows 42px (matching accordion)
+- Path tab added to multi-leg with Leg/Ticker/Date/Chg columns
+- Path tab columns properly spaced (240px legend)
+- Leverage multiplies position sizes (entry = equity × pos_size × max_lev)
+- Removed Equity $ input (charts show % returns)
+
+Remaining sub-goals:
+- All relevant regime filters (cross-basket source filtering)
+- Trades tab: show position size at entry, contribution to port, weight at exit
+- Long-term portfolio stats (CAGR, Sharpe, Sortino, max DD duration)
+- Multi-leg stats: correlation/volatility impact of adding a basket to baseline
 
 ### 10. Variable Position Sizing
 Add variable position sizing feature to backtest.
@@ -47,6 +67,15 @@ Add variable position sizing feature to backtest.
 ### ~~15. Optimize Basket Signals Build Time~~ — COMPLETED (2026-03-17)
 ~~Basket signals build and amend process is too slow — adding new themes or industries takes way too long. Needs performance optimization.~~ Full rebuild dropped from ~30 min to 7 min 47s (467s), averaging 16.9s per basket. Six optimizations: pre-computed returns matrices, correlation vectorization (numpy z-score variance decomposition), breadth vectorization (searchsorted + groupby), equity OHLC cumprod path, contributions merged into equity OHLC, extracted shared `_build_quarter_weights`.
 
+### 16. Export Button
+Export button properly functions with all features on the frontend, with titles / good aesthetic for charts.
+
+### ~~17. Analogs Tab (Cross-Basket Analysis)~~ — COMPLETED (2026-03-18)
+~~Add an "Analogs" tab to the cross-basket analysis panel.~~
+- **17a.** ~~Add all relevant factors (same list as backtesting filters)~~ — Multi-timeframe return fingerprints (1Q/1Y/3Y/5Y) with cross-basket rolling correlation
+- **17b.** ~~Add historical ranking system~~ — Value-to-rank fingerprint process with Summary tab showing ranking table
+- **17c.** ~~Cross-asset future returns tab (similar to intrabasket returns and backtest path tabs)~~ — Forward tab (cumulative line chart, 252 days per analog) + Aggregate tab (mean/median/min/max/std at 1M/3M/6M)
+
 ## Completed
 
 1. **BTFD/STFR trend guard — verify fix** (2026-03-13): Signals rebuilt (`signals_500.parquet`), zero co-fires confirmed. ~191K spurious BTFD/STFR signals eliminated. Also fixed a latent numpy float32 serialization bug in the ticker-signals endpoint exposed by the rebuild.
@@ -54,3 +83,4 @@ Add variable position sizing feature to backtest.
 3. **Repo Consolidation** (2026-03-16): Consolidated rotations_signals and rotations_app into a single monorepo "rotations" at rallysquirrel20-hue/rotations. 44 files, 23,736 lines. Structure: signals/, app/backend/, app/frontend/. All agent definitions updated with relative paths.
 4. **Basket Returns** (2026-03-17): Cross-basket period returns and single-basket daily returns chart with live data overlay, date presets, group filters, basket picker, hover overlay, and PNG export. Backend `GET /api/baskets/returns` endpoint with regex input validation and anchor-row logic.
 5. **Optimize Basket Signals Build Time** (2026-03-17): Full rebuild dropped from ~30 min to 7 min 47s (467s). Six optimizations in `signals/rotations.py`: pre-computed returns matrices, correlation vectorization, breadth vectorization, equity OHLC cumprod, contributions merged into equity OHLC, extracted `_build_quarter_weights`.
+6. **Analogs Tab** (2026-03-18): Elevated Analogs from sub-mode in BasketSummary to top-level AnalogsPanel component with 5 tabs (Summary, Analogs, Comparison, Forward, Aggregate). Backend expanded with multi-timeframe fingerprints, cross-basket correlation, forward_series, and aggregate stats. Cleaned up all analog code from BasketSummary.

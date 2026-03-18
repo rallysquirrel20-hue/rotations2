@@ -541,7 +541,7 @@ logger.info(f"DATA_STORAGE: {DATA_STORAGE} (exists={DATA_STORAGE.exists()})")
 logger.info(f"INDIVIDUAL_SIGNALS_FILE: {INDIVIDUAL_SIGNALS_FILE} (exists={INDIVIDUAL_SIGNALS_FILE.exists()})")
 
 @app.get("/api/baskets/returns")
-def get_basket_returns(start: str = None, end: str = None, mode: str = "period", basket: str = None, group: str = "all", top_n: int = 10):
+def get_basket_returns(start: str = None, end: str = None, mode: str = "period", basket: str = None, group: str = "all", top_n: int = 10, threshold: float = 0.0):
     """Cross-basket period returns or single-basket daily returns time series."""
     t_names = list(THEMATIC_CONFIG.keys())
     s_names = ["Communication_Services", "Consumer_Discretionary", "Consumer_Staples", "Energy", "Financials", "Health_Care", "Industrials", "Information_Technology", "Materials", "Real_Estate", "Utilities"]
@@ -728,6 +728,33 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
                 first_valid = np.argmax(~mask)
                 mat[:first_valid, j] = np.nan
 
+        # Cross-basket rolling correlation (21-day mean pairwise correlation)
+        daily_ret = close_mat[1:] / close_mat[:-1] - 1  # (T-1, B)
+        corr_window = 21
+        cross_corr_series = np.full(T, np.nan)
+        if T > corr_window + 1 and B >= 2:
+            for i in range(corr_window - 1, daily_ret.shape[0]):
+                window_slice = daily_ret[i - corr_window + 1:i + 1]  # (21, B)
+                valid_cols = ~np.isnan(window_slice).any(axis=0)
+                if valid_cols.sum() < 2:
+                    continue
+                ws = window_slice[:, valid_cols]
+                mu = ws.mean(axis=0, keepdims=True)
+                std = ws.std(axis=0, keepdims=True)
+                std[std == 0] = 1.0
+                z = (ws - mu) / std
+                n_valid = valid_cols.sum()
+                corr_mat_local = (z.T @ z) / (corr_window - 1)
+                # Average upper triangle
+                upper_sum = 0.0
+                count = 0
+                for ci in range(n_valid):
+                    for cj in range(ci + 1, n_valid):
+                        upper_sum += corr_mat_local[ci, cj]
+                        count += 1
+                if count > 0:
+                    cross_corr_series[i + 1] = upper_sum / count  # +1 because daily_ret is shifted by 1
+
         # Find current period indices
         if not start or not end:
             return {"current": None, "analogs": [], "date_range": date_range, "message": "start and end required"}
@@ -804,8 +831,53 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
         rho_cor = spearman_vec(cur_cor_ranks, rr_cor)
         rho_rv = spearman_vec(cur_rv_ranks, rr_rv)
 
-        # Overall similarity: average of 5 metrics
-        rho_avg = (rho_ret + rho_upt + rho_bkt + rho_cor + rho_rv) / 5.0
+        # Multi-timeframe return fingerprints
+        MULTI_TF = {"1Q": 63, "1Y": 252, "3Y": 756, "5Y": 1260}
+        rho_tf_list = []
+        cur_tf_returns = {}  # for current.metrics
+        for tf_label, W_t in MULTI_TF.items():
+            if end_idx < W_t:
+                continue  # not enough history for this timeframe
+            cur_tf_ret = close_mat[end_idx] / close_mat[max(0, end_idx - W_t)] - 1
+            cur_tf_ranks = rank_vec(cur_tf_ret)
+            cur_tf_returns[tf_label] = cur_tf_ret
+            # Vectorized: compute roll_tf as matrix (N_windows, B) then rank
+            roll_tf_mat = np.full((N_windows, B), np.nan)
+            for i in range(N_windows):
+                e = i + W
+                s_tf = e - W_t
+                if s_tf >= 0 and e < T:
+                    roll_tf_mat[i] = close_mat[e] / close_mat[s_tf] - 1
+            rr_tf = rank_matrix(roll_tf_mat)
+            rho_tf = spearman_vec(cur_tf_ranks, rr_tf)
+            rho_tf_list.append(rho_tf)
+
+        # Cross-basket correlation similarity
+        rho_xc = np.zeros(N_windows)
+        cur_xc = cross_corr_series[end_idx] if not np.isnan(cross_corr_series[end_idx]) else None
+        if cur_xc is not None:
+            valid_xc = cross_corr_series[~np.isnan(cross_corr_series)]
+            xc_range = float(valid_xc.max() - valid_xc.min()) if len(valid_xc) > 1 else 1.0
+            if xc_range == 0:
+                xc_range = 1.0
+            for i in range(N_windows):
+                e = i + W
+                if e < T and not np.isnan(cross_corr_series[e]):
+                    rho_xc[i] = 1.0 - abs(cur_xc - cross_corr_series[e]) / xc_range
+                else:
+                    rho_xc[i] = 0.0
+            has_xc = True
+        else:
+            has_xc = False
+
+        # Overall similarity: average of all metrics
+        n_metrics = 5 + len(rho_tf_list) + (1 if has_xc else 0)
+        rho_avg = (rho_ret + rho_upt + rho_bkt + rho_cor + rho_rv)
+        for rho_tf in rho_tf_list:
+            rho_avg = rho_avg + rho_tf
+        if has_xc:
+            rho_avg = rho_avg + rho_xc
+        rho_avg = rho_avg / n_metrics
 
         # Exclude current window ± W/2 days
         half_w = W // 2
@@ -834,6 +906,16 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
         # Current period data
         current_returns = {}
         current_metrics = {"uptrend_pct": {}, "breakout_pct": {}, "correlation_pct": {}, "rv_ema": {}}
+        current_ranks = {"returns": {}, "uptrend_pct": {}, "breakout_pct": {}, "correlation_pct": {}, "rv_ema": {}}
+        # Build multi-TF rank vectors
+        cur_tf_rank_vecs = {}
+        for tf_label in MULTI_TF:
+            if tf_label in cur_tf_returns:
+                cur_tf_rank_vecs[tf_label] = rank_vec(cur_tf_returns[tf_label])
+        for tf_label in MULTI_TF:
+            current_metrics[f"returns_{tf_label}"] = {}
+            current_ranks[f"returns_{tf_label}"] = {}
+        current_metrics["cross_basket_corr"] = round(float(cur_xc), 4) if cur_xc is not None else None
         for j, slug in enumerate(ordered_slugs):
             r = cur_ret[j]
             current_returns[slug] = round(float(r), 6) if not np.isnan(r) else None
@@ -841,6 +923,20 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
             current_metrics["breakout_pct"][slug] = round(float(breakout_mat[end_idx, j]), 2) if not np.isnan(breakout_mat[end_idx, j]) else None
             current_metrics["correlation_pct"][slug] = round(float(corr_mat[end_idx, j]), 2) if not np.isnan(corr_mat[end_idx, j]) else None
             current_metrics["rv_ema"][slug] = round(float(rv_mat[end_idx, j]), 6) if not np.isnan(rv_mat[end_idx, j]) else None
+            # Ranks (1-based, B = worst)
+            current_ranks["returns"][slug] = int(cur_ret_ranks[j])
+            current_ranks["uptrend_pct"][slug] = int(cur_upt_ranks[j])
+            current_ranks["breakout_pct"][slug] = int(cur_bkt_ranks[j])
+            current_ranks["correlation_pct"][slug] = int(cur_cor_ranks[j])
+            current_ranks["rv_ema"][slug] = int(cur_rv_ranks[j])
+            for tf_label in MULTI_TF:
+                if tf_label in cur_tf_returns:
+                    v = cur_tf_returns[tf_label][j]
+                    current_metrics[f"returns_{tf_label}"][slug] = round(float(v), 6) if not np.isnan(v) else None
+                    current_ranks[f"returns_{tf_label}"][slug] = int(cur_tf_rank_vecs[tf_label][j])
+                else:
+                    current_metrics[f"returns_{tf_label}"][slug] = None
+                    current_ranks[f"returns_{tf_label}"][slug] = None
 
         analogs = []
         HORIZONS = {"1M": 21, "3M": 63, "6M": 126}
@@ -864,8 +960,14 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
                 "correlation": round(float(rho_cor[sel_idx]), 4),
                 "volatility": round(float(rho_rv[sel_idx]), 4),
             }
+            tf_active = [tfl for tfl in MULTI_TF if tfl in cur_tf_returns]
+            for ti, tfl in enumerate(tf_active):
+                if ti < len(rho_tf_list):
+                    breakdown[f"ret_{tfl}"] = round(float(rho_tf_list[ti][sel_idx]), 4)
+            if has_xc:
+                breakdown["cross_corr"] = round(float(rho_xc[sel_idx]), 4)
 
-            # Forward returns
+            # Forward returns (point-in-time)
             forward = {}
             for hz_label, hz_days in HORIZONS.items():
                 fwd_idx = a_end + hz_days
@@ -882,6 +984,20 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
                             fwd[slug] = round(float(c_fwd / c_end - 1), 6)
                     forward[hz_label] = fwd
 
+            # Forward series: daily cumulative returns per basket (up to 252 days)
+            max_fwd = min(252, T - a_end - 1)
+            fwd_dates = []
+            fwd_baskets = {slug: [] for slug in ordered_slugs}
+            for d in range(1, max_fwd + 1):
+                fwd_dates.append(date_idx[a_end + d].strftime('%Y-%m-%d'))
+                for j, slug in enumerate(ordered_slugs):
+                    c_base = close_mat[a_end, j]
+                    c_fwd = close_mat[a_end + d, j]
+                    if np.isnan(c_base) or np.isnan(c_fwd) or c_base == 0:
+                        fwd_baskets[slug].append(None)
+                    else:
+                        fwd_baskets[slug].append(round(float(c_fwd / c_base - 1), 6))
+
             analogs.append({
                 "start": a_start_date,
                 "end": a_end_date,
@@ -889,7 +1005,54 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
                 "similarity_breakdown": breakdown,
                 "returns": a_returns,
                 "forward": forward,
+                "forward_series": {"dates": fwd_dates, "baskets": fwd_baskets},
             })
+
+        # Filter by threshold
+        if threshold > 0:
+            analogs = [a for a in analogs if a["similarity"] >= threshold]
+
+        # Aggregate stats across analogs
+        AGG_HORIZONS = {"1M": 21, "3M": 63, "6M": 126}
+        aggregate = {}
+        for hz_label, hz_days in AGG_HORIZONS.items():
+            # Collect per-basket forward returns at this horizon
+            per_basket = {slug: [] for slug in ordered_slugs}
+            all_vals = []
+            for a in analogs:
+                fwd = a["forward"].get(hz_label)
+                if fwd is None:
+                    continue
+                for slug in ordered_slugs:
+                    v = fwd.get(slug)
+                    if v is not None:
+                        per_basket[slug].append(v)
+                        all_vals.append(v)
+            if all_vals:
+                arr = np.array(all_vals)
+                aggregate[hz_label] = {
+                    "mean": round(float(np.mean(arr)), 6),
+                    "median": round(float(np.median(arr)), 6),
+                    "min": round(float(np.min(arr)), 6),
+                    "max": round(float(np.max(arr)), 6),
+                    "std": round(float(np.std(arr)), 6),
+                    "count": len(all_vals),
+                    "per_basket": {},
+                }
+                for slug in ordered_slugs:
+                    vals = per_basket[slug]
+                    if vals:
+                        ba = np.array(vals)
+                        aggregate[hz_label]["per_basket"][slug] = {
+                            "mean": round(float(np.mean(ba)), 6),
+                            "median": round(float(np.median(ba)), 6),
+                            "min": round(float(np.min(ba)), 6),
+                            "max": round(float(np.max(ba)), 6),
+                            "std": round(float(np.std(ba)), 6),
+                            "count": len(vals),
+                        }
+            else:
+                aggregate[hz_label] = None
 
         return {
             "current": {
@@ -897,8 +1060,11 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
                 "end": end,
                 "returns": current_returns,
                 "metrics": current_metrics,
+                "ranks": current_ranks,
+                "basket_count": B,
             },
             "analogs": analogs,
+            "aggregate": aggregate,
             "date_range": date_range,
         }
 
@@ -1271,7 +1437,7 @@ def get_ticker_data(ticker: str):
     except Exception: raise HTTPException(status_code=500)
 
 
-SIGNAL_TYPES = ['Breakout', 'Breakdown', 'Up_Rot', 'Down_Rot', 'BTFD', 'STFR']
+SIGNAL_TYPES = ['Breakout', 'Breakdown', 'Up_Rot', 'Down_Rot', 'BTFD', 'STFR', 'Buy_Hold']
 SIGNAL_PAIRS = [('Breakout', 'Breakdown'), ('Up_Rot', 'Down_Rot'), ('BTFD', 'STFR')]
 # The Is_ columns in the parquet use different names for rotations
 SIGNAL_IS_COL = {
@@ -1283,6 +1449,7 @@ BACKTEST_DIRECTION = {
     "Up_Rot": "long", "Down_Rot": "short",
     "Breakout": "long", "Breakdown": "short",
     "BTFD": "long", "STFR": "short",
+    "Buy_Hold": "long",
 }
 
 
@@ -1342,6 +1509,8 @@ def get_basket_summary(basket_name: str, start: str = None, end: str = None):
                        'Resistance_Pivot', 'Support_Pivot', 'Upper_Target', 'Lower_Target',
                        'BTFD_Triggered', 'STFR_Triggered']
         for st in SIGNAL_TYPES:
+            if st not in SIGNAL_IS_COL:
+                continue
             cols_needed.append(SIGNAL_IS_COL[st])
             for suf in STAT_SUFFIXES:
                 cols_needed.append(f'{st}_{suf}')
@@ -2016,6 +2185,51 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
     Returns (trades, df, ticker_closes, direction).
     """
     sig = entry_signal
+
+    # Buy & Hold: single trade spanning the full date range
+    if sig == 'Buy_Hold':
+        if target_type == 'basket':
+            basket_file = _find_basket_parquet(target)
+            if not basket_file:
+                raise HTTPException(status_code=404, detail=f"Basket file not found for {target}")
+            df = pd.read_parquet(basket_file, columns=['Date', 'Close'])
+        elif target_type == 'basket_tickers':
+            raise HTTPException(status_code=400, detail="Buy & Hold not supported for basket_tickers — use basket mode")
+        else:
+            if not INDIVIDUAL_SIGNALS_FILE.exists():
+                raise HTTPException(status_code=404, detail="Signals file not found")
+            df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
+                                 columns=['Ticker', 'Date', 'Close'],
+                                 filters=[('Ticker', '==', target)])
+        df['Date'] = pd.to_datetime(df['Date'])
+        df = df.sort_values('Date').reset_index(drop=True)
+        if start_date:
+            df = df[df['Date'] >= pd.Timestamp(start_date)]
+        if end_date:
+            df = df[df['Date'] <= pd.Timestamp(end_date)]
+        closes = df.drop_duplicates('Date').set_index('Date')['Close'].sort_index()
+        ticker_closes = {'': closes}
+        if closes.empty:
+            return ([], df, ticker_closes, 'long')
+        first_close = float(closes.iloc[0])
+        last_close = float(closes.iloc[-1])
+        total_return = last_close / first_close - 1 if first_close else 0
+        entry_date = closes.index[0]
+        exit_date = closes.index[-1]
+        bars = max(1, int(np.busday_count(entry_date.date(), exit_date.date())))
+        trade = {
+            'entry_date': entry_date.strftime('%Y-%m-%d'),
+            'exit_date': exit_date.strftime('%Y-%m-%d'),
+            'entry_price': round(first_close, 2),
+            'exit_price': round(last_close, 2),
+            'change': round(total_return, 6),
+            'mfe': round(float(closes.max()) / first_close - 1, 6) if first_close else 0,
+            'mae': round(float(closes.min()) / first_close - 1, 6) if first_close else 0,
+            'bars_held': bars,
+            'regime_pass': True,
+        }
+        return ([trade], df, ticker_closes, 'long')
+
     is_col = SIGNAL_IS_COL.get(sig)
     if not is_col:
         raise HTTPException(status_code=400, detail=f"Unknown signal: {sig}")
@@ -2223,9 +2437,75 @@ def get_date_range(target_type: str, target: str):
         raise HTTPException(status_code=404, detail="No data found")
     return {"min": dates.min().strftime('%Y-%m-%d'), "max": dates.max().strftime('%Y-%m-%d')}
 
+def _build_buy_hold(target, target_type, start_date, end_date, initial_equity):
+    """Build a buy-and-hold backtest result from the Close series."""
+    if target_type == 'basket':
+        basket_file = _find_basket_parquet(target)
+        if not basket_file:
+            raise HTTPException(status_code=404, detail=f"Basket file not found for {target}")
+        df = pd.read_parquet(basket_file, columns=['Date', 'Close'])
+    elif target_type == 'basket_tickers':
+        raise HTTPException(status_code=400, detail="Buy & Hold not supported for basket_tickers mode — use basket mode")
+    else:
+        if not INDIVIDUAL_SIGNALS_FILE.exists():
+            raise HTTPException(status_code=404, detail="Signals file not found")
+        df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
+                             columns=['Ticker', 'Date', 'Close'],
+                             filters=[('Ticker', '==', target)])
+    df['Date'] = pd.to_datetime(df['Date'])
+    df = df.sort_values('Date').reset_index(drop=True)
+    date_range = {"min": df['Date'].min().strftime('%Y-%m-%d'), "max": df['Date'].max().strftime('%Y-%m-%d')}
+    if start_date:
+        df = df[df['Date'] >= pd.Timestamp(start_date)]
+    if end_date:
+        df = df[df['Date'] <= pd.Timestamp(end_date)]
+    if df.empty:
+        return {"trades": [], "trade_paths": [], "equity_curve": {"dates": [], "filtered": [], "unfiltered": [], "buy_hold": []},
+                "stats": {"filtered": {}, "unfiltered": {}}, "date_range": date_range}
+    closes = df.drop_duplicates('Date').set_index('Date')['Close'].sort_index()
+    first_close = float(closes.iloc[0])
+    last_close = float(closes.iloc[-1])
+    total_return = last_close / first_close - 1 if first_close else 0
+    entry_date = closes.index[0]
+    exit_date = closes.index[-1]
+    bars = max(1, int(np.busday_count(entry_date.date(), exit_date.date())))
+    # Single trade
+    trade = {
+        'entry_date': entry_date.strftime('%Y-%m-%d'),
+        'exit_date': exit_date.strftime('%Y-%m-%d'),
+        'entry_price': round(first_close, 2),
+        'exit_price': round(last_close, 2),
+        'change': round(total_return, 6),
+        'mfe': round(float(closes.max()) / first_close - 1, 6) if first_close else 0,
+        'mae': round(float(closes.min()) / first_close - 1, 6) if first_close else 0,
+        'bars_held': bars,
+        'regime_pass': True,
+    }
+    trade_path = [round(float(c) / first_close - 1, 6) for c in closes.values]
+    # Equity curve: simply scale by initial equity
+    eq_values = [round(initial_equity * float(c) / first_close, 2) for c in closes.values]
+    eq_dates = [d.strftime('%Y-%m-%d') for d in closes.index]
+    stats = {
+        'trades': 1, 'win_rate': 1.0 if total_return > 0 else 0.0,
+        'avg_winner': total_return if total_return > 0 else 0,
+        'avg_loser': total_return if total_return <= 0 else 0,
+        'ev': total_return, 'profit_factor': float('inf') if total_return > 0 else 0,
+        'max_dd': round(float((closes / closes.cummax() - 1).min()), 6),
+        'avg_bars': bars,
+    }
+    return {
+        "trades": [trade], "trade_paths": [trade_path],
+        "equity_curve": {"dates": eq_dates, "filtered": eq_values, "unfiltered": eq_values, "buy_hold": eq_values},
+        "stats": {"filtered": stats, "unfiltered": stats},
+        "date_range": date_range,
+    }
+
+
 @app.post("/api/backtest")
 def run_backtest(req: BacktestRequest):
     sig = req.entry_signal
+    if sig == 'Buy_Hold':
+        return _build_buy_hold(req.target, req.target_type, req.start_date, req.end_date, req.initial_equity)
     is_col = SIGNAL_IS_COL.get(sig)
     if not is_col:
         raise HTTPException(status_code=400, detail=f"Unknown signal: {sig}")
@@ -2505,6 +2785,7 @@ def run_backtest(req: BacktestRequest):
     eq_dates = []
     eq_all_vals = []
     eq_filt_vals = []
+    daily_positions = {}
     blew_up = None
 
     for date in all_dates:
@@ -2525,7 +2806,7 @@ def run_backtest(req: BacktestRequest):
             eq_est = mtm_equity(open_all, cash_all, date)
             if eq_est <= 0:
                 continue
-            wanted = eq_est * pos_size
+            wanted = eq_est * pos_size * max_lev
             exposure = sum(info['alloc'] for info in open_all.values())
             room = max(0, eq_est * max_lev - exposure)
             alloc = min(wanted, room)
@@ -2536,7 +2817,7 @@ def run_backtest(req: BacktestRequest):
             if t['regime_pass']:
                 eq_est_f = mtm_equity(open_filt, cash_filt, date)
                 if eq_est_f > 0:
-                    wanted_f = eq_est_f * pos_size
+                    wanted_f = eq_est_f * pos_size * max_lev
                     exposure_f = sum(info['alloc'] for info in open_filt.values())
                     room_f = max(0, eq_est_f * max_lev - exposure_f)
                     alloc_f = min(wanted_f, room_f)
@@ -2548,6 +2829,7 @@ def run_backtest(req: BacktestRequest):
         # Record daily mark-to-market equity
         equity_all = mtm_equity(open_all, cash_all, date)
         equity_filt = mtm_equity(open_filt, cash_filt, date)
+        di = len(eq_dates)
         eq_dates.append(pd.Timestamp(date).strftime('%Y-%m-%d'))
         eq_all_vals.append(round(equity_all, 2))
         eq_filt_vals.append(round(equity_filt, 2))
@@ -2555,6 +2837,43 @@ def run_backtest(req: BacktestRequest):
             blew_up = {"date": eq_dates[-1], "trade_index": -1, "equity": "unfiltered"}
         if equity_filt <= 0 and blew_up is None:
             blew_up = {"date": eq_dates[-1], "trade_index": -1, "equity": "filtered"}
+
+        # Track daily positions for constituents overlay
+        if open_filt:
+            positions = []
+            for tidx, info in open_filt.items():
+                t = trade_map.get(tidx, {})
+                tkr = info.get('ticker', '')
+                ep = info['entry_price']
+                cs = ticker_closes.get(tkr)
+                if cs is not None and ep and ep > 0:
+                    cv = cs.asof(date)
+                    if pd.notna(cv):
+                        current_val = info['alloc'] * (float(cv) / ep) if is_long else info['alloc'] * (2 - float(cv) / ep)
+                        daily_ret = float(cv) / ep - 1 if is_long else 1 - float(cv) / ep
+                    else:
+                        current_val = info['alloc']
+                        daily_ret = 0.0
+                else:
+                    current_val = info['alloc']
+                    daily_ret = 0.0
+                weight = current_val / equity_filt if equity_filt > 0 else 0
+                contribution = weight * daily_ret if equity_filt > 0 else 0
+                positions.append({
+                    'trade_idx': tidx,
+                    'ticker': tkr or None,
+                    'entry_date': t.get('entry_date', ''),
+                    'alloc': round(info['alloc'], 2),
+                    'weight': round(weight, 4),
+                    'daily_return': round(daily_ret, 4),
+                    'contribution': round(contribution, 6),
+                })
+            exposure = sum(info['alloc'] for info in open_filt.values())
+            daily_positions[di] = {
+                'exposure_pct': round(exposure / equity_filt, 4) if equity_filt > 0 else 0,
+                'equity': round(equity_filt, 2),
+                'positions': positions,
+            }
 
     # Build buy-and-hold curve (aligned to equity curve dates)
     if is_multi_ticker:
@@ -2632,6 +2951,7 @@ def run_backtest(req: BacktestRequest):
         "equity_curve": {"dates": eq_dates, "filtered": eq_filt_vals, "unfiltered": eq_all_vals, "buy_hold": bh_vals},
         "stats": {"filtered": stats_filtered, "unfiltered": stats_unfiltered},
         "date_range": date_range,
+        "daily_positions": daily_positions if daily_positions else None,
     }
     if blew_up:
         resp["blew_up"] = blew_up
@@ -2730,7 +3050,8 @@ def run_multi_backtest(req: MultiBacktestRequest):
     }
 
     # ---- per-leg equity curves (allocated capital, mark-to-market) ----
-    per_leg_equity = []      # list of lists (one per leg)
+    per_leg_equity = []      # allocated (for combined sum)
+    per_leg_standalone = []  # standalone full-portfolio (for per-leg chart display)
     per_leg_stats = []
     leg_responses = []       # final leg response dicts
     skipped_entries = []
@@ -2744,7 +3065,10 @@ def run_multi_backtest(req: MultiBacktestRequest):
         is_long = direction == 'long'
         alloc_frac = leg.allocation_pct
         pos_size = leg.position_size
-        leg_initial = initial * alloc_frac
+        # Leverage multiplies position sizes: entry = equity * pos_size * max_lev
+        # and sets max exposure per leg: alloc * max_lev (combined), full * max_lev (standalone)
+        leg_initial = initial * alloc_frac       # starting capital for combined
+        leg_standalone = initial                  # starting capital for standalone
 
         # Sort trades by entry date
         sorted_trades = sorted(trades, key=lambda t: t['entry_date'])
@@ -2779,71 +3103,126 @@ def run_multi_backtest(req: MultiBacktestRequest):
                     total += info['alloc'] * (2 - cp / ep)
             return total
 
-        cash = leg_initial
-        open_pos = {}
-        eq_vals = []
+        # Two parallel simulations: allocated (for combined) and standalone (for per-leg display)
+        cash_alloc = leg_initial
+        cash_solo = leg_standalone
+        open_alloc = {}
+        open_solo = {}
+        eq_vals = []        # allocated (for combined sum)
+        eq_solo_vals = []   # standalone (for per-leg chart)
 
-        for date in all_dates:
-            # Process exits first
+        for di, date in enumerate(all_dates):
+            # Process exits
             for idx in exit_map.get(date, []):
                 t = trade_map[idx]
                 ret = t['change'] or 0.0
-                if idx in open_pos:
-                    a = open_pos.pop(idx)
-                    cash += a['alloc'] * (1 + ret)
+                if idx in open_alloc:
+                    a = open_alloc.pop(idx)
+                    cash_alloc += a['alloc'] * (1 + ret)
+                if idx in open_solo:
+                    a = open_solo.pop(idx)
+                    cash_solo += a['alloc'] * (1 + ret)
 
             # Process entries
             for idx in entry_map.get(date, []):
                 t = trade_map[idx]
                 if not t['regime_pass']:
                     continue
-                eq_est = mtm_equity(open_pos, cash, date)
-                if eq_est <= 0:
-                    skipped_entries.append({
-                        'leg': li, 'date': pd.Timestamp(date).strftime('%Y-%m-%d'),
-                        'reason': 'equity_zero',
-                    })
-                    continue
-                wanted = eq_est * pos_size
-                exposure = sum(info['alloc'] for info in open_pos.values())
-                leg_lev_cap = eq_est * max_lev
-                room = max(0, leg_lev_cap - exposure)
-                alloc = min(wanted, room)
-                if alloc > 0:
-                    open_pos[idx] = {
-                        'alloc': alloc,
-                        'entry_price': t['entry_price'] or 0,
-                        'ticker': t.get('ticker', ''),
-                    }
-                    cash -= alloc
+                # Allocated path: position = equity * pos_size * max_lev, capped by leg allocation * max_lev
+                eq_est = mtm_equity(open_alloc, cash_alloc, date)
+                if eq_est > 0:
+                    wanted = eq_est * pos_size * max_lev
+                    exposure = sum(info['alloc'] for info in open_alloc.values())
+                    cap = eq_est * max_lev
+                    room = max(0, cap - exposure)
+                    alloc = min(wanted, room)
+                    if alloc > 0:
+                        open_alloc[idx] = {'alloc': alloc, 'entry_price': t['entry_price'] or 0, 'ticker': t.get('ticker', '')}
+                        cash_alloc -= alloc
+                # Standalone path: same leverage multiplier on position sizing
+                eq_est_s = mtm_equity(open_solo, cash_solo, date)
+                if eq_est_s > 0:
+                    wanted_s = eq_est_s * pos_size * max_lev
+                    exposure_s = sum(info['alloc'] for info in open_solo.values())
+                    cap_s = eq_est_s * max_lev
+                    room_s = max(0, cap_s - exposure_s)
+                    alloc_s = min(wanted_s, room_s)
+                    if alloc_s > 0:
+                        open_solo[idx] = {'alloc': alloc_s, 'entry_price': t['entry_price'] or 0, 'ticker': t.get('ticker', '')}
+                        cash_solo -= alloc_s
+                    else:
+                        skipped_entries.append({'leg': li, 'date': pd.Timestamp(date).strftime('%Y-%m-%d'), 'reason': 'leverage_limit'})
                 else:
-                    skipped_entries.append({
-                        'leg': li, 'date': pd.Timestamp(date).strftime('%Y-%m-%d'),
-                        'reason': 'leverage_limit',
-                    })
+                    skipped_entries.append({'leg': li, 'date': pd.Timestamp(date).strftime('%Y-%m-%d'), 'reason': 'equity_zero'})
 
-            # Record daily equity
-            equity = mtm_equity(open_pos, cash, date)
+            # Record daily equity (both paths)
+            equity = mtm_equity(open_alloc, cash_alloc, date)
             eq_vals.append(round(equity, 2))
+            equity_solo = mtm_equity(open_solo, cash_solo, date)
+            eq_solo_vals.append(round(equity_solo, 2))
 
-            # Track daily positions for constituents overlay
-            date_str = pd.Timestamp(date).strftime('%Y-%m-%d')
-            if open_pos:
-                pos_list = daily_positions.setdefault(date_str, [])
-                for idx, info in open_pos.items():
-                    pos_list.append({
-                        'leg': li,
-                        'ticker': info.get('ticker', leg.target),
+            # Track daily positions for constituents overlay (keyed by date index)
+            if open_alloc:
+                eq_now = equity
+                positions = daily_positions.get(di, {'exposure_pct': 0, 'equity': 0, 'positions': []})
+                for idx_p, info in open_alloc.items():
+                    t_p = trade_map.get(idx_p, {})
+                    tkr = info.get('ticker', '')
+                    ep = info['entry_price']
+                    cs = ticker_closes.get(tkr)
+                    if cs is not None and ep and ep > 0:
+                        cv = cs.asof(date)
+                        if pd.notna(cv):
+                            current_val = info['alloc'] * (float(cv) / ep) if is_long else info['alloc'] * (2 - float(cv) / ep)
+                            daily_ret = float(cv) / ep - 1 if is_long else 1 - float(cv) / ep
+                        else:
+                            current_val = info['alloc']
+                            daily_ret = 0.0
+                    else:
+                        current_val = info['alloc']
+                        daily_ret = 0.0
+                    weight = current_val / eq_now if eq_now > 0 else 0
+                    contribution = weight * daily_ret if eq_now > 0 else 0
+                    positions['positions'].append({
+                        'trade_idx': idx_p,
+                        'ticker': tkr or leg.target,
+                        'entry_date': t_p.get('entry_date', ''),
+                        'leg_target': leg.target,
                         'alloc': round(info['alloc'], 2),
-                        'direction': direction,
+                        'weight': round(weight, 4),
+                        'daily_return': round(daily_ret, 4),
+                        'contribution': round(contribution, 6),
                     })
+                positions['equity'] = round(eq_now, 2)
+                exposure = sum(info['alloc'] for info in open_alloc.values())
+                positions['exposure_pct'] = round(exposure / eq_now, 4) if eq_now > 0 else 0
+                daily_positions[di] = positions
 
-        per_leg_equity.append(eq_vals)
+        per_leg_equity.append(eq_vals)        # allocated (for combined sum)
+        per_leg_standalone.append(eq_solo_vals)  # standalone (for per-leg chart)
 
-        # Per-leg stats (filtered trades only — regime_pass == True)
+        # Per-leg stats (from standalone curve — what the user sees)
         filtered_trades = [t for t in sorted_trades if t['regime_pass']]
-        stats = compute_stats(filtered_trades, eq_vals)
+        stats = compute_stats(filtered_trades, eq_solo_vals)
         per_leg_stats.append(stats)
+
+        # Build trade paths for this leg
+        leg_trade_paths = []
+        for t in sorted_trades:
+            ep = t['entry_price']
+            tkr = t.get('ticker', '')
+            if ep is None or ep == 0:
+                leg_trade_paths.append([])
+                continue
+            ed = pd.Timestamp(t['entry_date'])
+            xd = pd.Timestamp(t['exit_date'])
+            cs = ticker_closes.get(tkr)
+            if cs is None:
+                leg_trade_paths.append([])
+                continue
+            segment = cs[(cs.index >= ed) & (cs.index <= xd)]
+            path = [round(float(c) / ep - 1, 6) for c in segment.values]
+            leg_trade_paths.append(path)
 
         leg_responses.append({
             'target': leg.target,
@@ -2852,6 +3231,7 @@ def run_multi_backtest(req: MultiBacktestRequest):
             'allocation_pct': leg.allocation_pct,
             'direction': direction,
             'trades': sorted_trades,
+            'trade_paths': leg_trade_paths,
             'stats': stats,
         })
 
@@ -2861,6 +3241,13 @@ def run_multi_backtest(req: MultiBacktestRequest):
         total = sum(per_leg_equity[li][i] for li in range(len(leg_results))
                     if i < len(per_leg_equity[li]))
         combined_equity.append(round(total, 2))
+
+    # Fix daily_positions: set combined equity and total exposure for each date
+    for di, dp in daily_positions.items():
+        if di < len(combined_equity):
+            dp['equity'] = combined_equity[di]
+            total_alloc = sum(p['alloc'] for p in dp['positions'])
+            dp['exposure_pct'] = round(total_alloc / combined_equity[di], 4) if combined_equity[di] > 0 else 0
 
     # ---- buy-hold curve from first basket leg (or first leg overall) ----
     bh_vals = []
@@ -2934,7 +3321,7 @@ def run_multi_backtest(req: MultiBacktestRequest):
             "equity_curve": {
                 "dates": eq_date_strs,
                 "combined": combined_equity,
-                "per_leg": per_leg_equity,
+                "per_leg": per_leg_standalone,
                 "buy_hold": bh_vals,
             },
             "stats": combined_stats,

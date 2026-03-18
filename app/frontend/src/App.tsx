@@ -3,6 +3,7 @@ import axios from 'axios'
 import { TVChart } from './components/TVChart'
 import { BasketSummary } from './components/BasketSummary'
 import { BacktestPanel } from './components/BacktestPanel'
+import { AnalogsPanel } from './components/AnalogsPanel'
 
 // DYNAMIC API BASE:
 // Automatically uses the hostname of the machine you are browsing from.
@@ -139,6 +140,7 @@ function App() {
   const [summaryData, setSummaryData] = useState<BasketSummaryData | null>(null)
   const [summaryLoading, setSummaryLoading] = useState(false)
   const [showBacktest, setShowBacktest] = useState(false)
+  const [showAnalogs, setShowAnalogs] = useState(false)
   const [backtestBaskets, setBacktestBaskets] = useState<string[]>([])
   const contentStackRef = useRef<HTMLDivElement>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
@@ -974,7 +976,7 @@ function App() {
                   else {
                     if (isBasketView && selectedItem) setIntraBasketTarget(selectedItem)
                     else setIntraBasketTarget('')
-                    setShowSummary('intra'); setShowBacktest(false)
+                    setShowSummary('intra'); setShowBacktest(false); setShowAnalogs(false)
                   }
                 }}
               >
@@ -983,18 +985,25 @@ function App() {
               <button
                 className={`control-btn ${showSummary === 'cross' ? 'primary' : ''}`}
                 style={{ order: 2 }}
-                onClick={() => { setShowSummary(prev => prev === 'cross' ? false : 'cross'); setShowBacktest(false) }}
+                onClick={() => { setShowSummary(prev => prev === 'cross' ? false : 'cross'); setShowBacktest(false); setShowAnalogs(false) }}
               >
                 Cross-Basket
               </button>
               <button
                 className={`control-btn ${showBacktest ? 'primary' : ''}`}
                 style={{ order: 3 }}
-                onClick={() => { setShowBacktest(prev => !prev); setShowSummary(false) }}
+                onClick={() => { setShowBacktest(prev => !prev); setShowSummary(false); setShowAnalogs(false) }}
               >
                 Backtest
               </button>
-              <button className="control-btn" style={{ order: 4 }} onClick={() => setExportTrigger(p => p + 1)}>Export</button>
+              <button
+                className={`control-btn ${showAnalogs ? 'primary' : ''}`}
+                style={{ order: 4 }}
+                onClick={() => { setShowAnalogs(prev => !prev); setShowSummary(false); setShowBacktest(false) }}
+              >
+                Analogs
+              </button>
+              <button className="control-btn" style={{ order: 5 }} onClick={() => setExportTrigger(p => p + 1)}>Export</button>
             </div>
             <div className="header-right-stack">
               {quarterKeys.length > 0 && (
@@ -1046,7 +1055,13 @@ function App() {
             </div>
           </div>
           <div className="content-stack" ref={contentStackRef}>
-            {showBacktest ? (
+            {showAnalogs ? (
+              <AnalogsPanel
+                apiBase={API_BASE}
+                exportTrigger={exportTrigger}
+                allBaskets={baskets}
+              />
+            ) : showBacktest ? (
               <BacktestPanel
                 target={activeTicker || selectedItem}
                 targetType={activeTicker || isTicker ? 'ticker' : 'basket'}

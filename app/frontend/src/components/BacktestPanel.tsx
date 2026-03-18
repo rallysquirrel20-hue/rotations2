@@ -80,11 +80,12 @@ interface BacktestPanelProps {
   exportTrigger?: number
 }
 
-const ENTRY_SIGNALS = ['Up_Rot', 'Down_Rot', 'Breakout', 'Breakdown', 'BTFD', 'STFR']
+const ENTRY_SIGNALS = ['Up_Rot', 'Down_Rot', 'Breakout', 'Breakdown', 'BTFD', 'STFR', 'Buy_Hold']
 const EXIT_MAP: Record<string, string> = {
   Up_Rot: 'Down_Rot', Down_Rot: 'Up_Rot',
   Breakout: 'Breakdown', Breakdown: 'Breakout',
   BTFD: 'Breakdown', STFR: 'Breakout',
+  Buy_Hold: 'End of Period',
 }
 
 const PCT_METRICS = ['Uptrend_Pct', 'Breakout_Pct', 'Correlation_Pct', 'RV_EMA']
@@ -99,7 +100,7 @@ type HistMetric = 'change' | 'mfe' | 'mae'
 const LIGHT_PINK = 'rgb(255, 183, 226)'
 const LIGHT_BLUE = 'rgb(179, 222, 255)'
 
-const LONG_SIGNALS = new Set(['Up_Rot', 'Breakout', 'BTFD'])
+const LONG_SIGNALS = new Set(['Up_Rot', 'Breakout', 'BTFD', 'Buy_Hold'])
 
 const BENCHMARK_COLORS: Record<string, string> = {
   Breakout: '#1565C0',
@@ -150,15 +151,59 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
 
   // Basket selector for single-leg mode (allows testing any basket regardless of sidebar selection)
   const [allBaskets, setAllBaskets] = useState<Record<string, string[]>>({})
+  const [allTickers, setAllTickers] = useState<string[]>([])
   const [selectedTarget, setSelectedTarget] = useState(target)
   const [selectedTargetType, setSelectedTargetType] = useState(targetType)
 
+  // Searchable target picker state
+  const [targetSearchOpen, setTargetSearchOpen] = useState(false)
+  const [targetSearchQuery, setTargetSearchQuery] = useState('')
+  const [targetSearchHighlight, setTargetSearchHighlight] = useState(0)
+  const [targetSearchFilter, setTargetSearchFilter] = useState<'all' | 'Themes' | 'Sectors' | 'Industries' | 'Tickers'>('all')
+  const targetSearchRef = useRef<HTMLInputElement>(null)
+
   useEffect(() => {
     fetch(`${apiBase}/baskets`).then(r => r.json()).then(setAllBaskets).catch(() => {})
+    fetch(`${apiBase}/tickers`).then(r => r.json()).then(setAllTickers).catch(() => {})
   }, [apiBase])
 
   // Sync with props when they change (user navigated to different item)
   useEffect(() => { setSelectedTarget(target); setSelectedTargetType(targetType) }, [target, targetType])
+
+  // Searchable target results — show all when no query, filter when typing
+  const targetSearchResults = useMemo(() => {
+    const results: { name: string; category: string; displayName: string }[] = []
+    const q = targetSearchQuery.toLowerCase().trim()
+    const add = (items: string[], category: string) => {
+      if (targetSearchFilter !== 'all' && targetSearchFilter !== category) return
+      for (const item of items) {
+        const display = item.replace(/_/g, ' ')
+        if (!q || item.toLowerCase().includes(q) || display.toLowerCase().includes(q)) {
+          results.push({ name: item, category, displayName: display })
+        }
+      }
+    }
+    add(allBaskets.Themes || [], 'Themes')
+    add(allBaskets.Sectors || [], 'Sectors')
+    add(allBaskets.Industries || [], 'Industries')
+    add(allTickers, 'Tickers')
+    return q ? results.slice(0, 25) : results
+  }, [targetSearchQuery, targetSearchFilter, allBaskets, allTickers])
+
+  const handleTargetSearchSelect = useCallback((r: { name: string; category: string }) => {
+    setTargetSearchOpen(false)
+    setTargetSearchQuery('')
+    setTargetSearchHighlight(0)
+    setSelectedTarget(r.name)
+    setSelectedTargetType(r.category === 'Tickers' ? 'ticker' : 'basket')
+  }, [])
+
+  const handleTargetSearchKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (e.key === 'Escape') { setTargetSearchOpen(false); setTargetSearchQuery(''); targetSearchRef.current?.blur() }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); setTargetSearchHighlight(prev => Math.min(prev + 1, targetSearchResults.length - 1)) }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); setTargetSearchHighlight(prev => Math.max(prev - 1, 0)) }
+    else if (e.key === 'Enter' && targetSearchResults.length > 0) { handleTargetSearchSelect(targetSearchResults[targetSearchHighlight]) }
+  }, [targetSearchResults, targetSearchHighlight, handleTargetSearchSelect])
 
   // Config state
   const [entrySignal, setEntrySignal] = useState('Breakout')
@@ -327,7 +372,7 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
     setBenchmarks({})
     const gen = ++benchmarkGenRef.current
     try {
-      const effectiveType = (selectedTargetType === 'basket' && useConstituents) ? 'basket_tickers' : selectedTargetType
+      const effectiveType = (selectedTargetType === 'basket' && useConstituents && entrySignal !== 'Buy_Hold') ? 'basket_tickers' : selectedTargetType
       const body = {
         target: selectedTarget,
         target_type: effectiveType,
@@ -361,7 +406,8 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
 
       const mainPromise = axios.post(`${apiBase}/backtest`, body)
 
-      const benchPromises = ENTRY_SIGNALS.map(sig =>
+      const benchSignals = ENTRY_SIGNALS.filter(s => s !== 'Buy_Hold')
+      const benchPromises = benchSignals.map(sig =>
         axios.post(`${apiBase}/backtest`, { ...benchBody, entry_signal: sig })
           .then(r => ({ sig, curve: r.data.equity_curve.unfiltered as number[] }))
           .catch(err => { console.error(`Benchmark ${sig} failed:`, err?.response?.data?.detail || err?.message); return null })
@@ -498,15 +544,21 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
     const { start: s, end: e } = eqViewRef.current
     const cs = Math.max(0, Math.min(s, dates.length - 1))
     const ce = Math.max(cs, Math.min(e, dates.length - 1))
+    // Rebase all series to 0% return from visible window start
+    const rebase = (arr: number[]) => {
+      const slice = arr.slice(cs, ce + 1)
+      const base = slice[0] || 1
+      return slice.map(v => v / base - 1)
+    }
     const windowedBench: Record<string, number[]> = {}
     for (const [sig, curve] of Object.entries(benchmarks)) {
-      windowedBench[sig] = curve.slice(cs, ce + 1)
+      windowedBench[sig] = rebase(curve)
     }
     return {
       dates: dates.slice(cs, ce + 1),
-      filtered: filtered.slice(cs, ce + 1),
-      unfiltered: unfiltered.slice(cs, ce + 1),
-      buy_hold: buy_hold ? buy_hold.slice(cs, ce + 1) : [],
+      filtered: rebase(filtered),
+      unfiltered: rebase(unfiltered),
+      buy_hold: buy_hold ? rebase(buy_hold) : [],
       benchmarks: windowedBench,
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -530,8 +582,8 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
     const plotW = dims.w - pad.left - pad.right
     const plotH = dims.h - pad.top - pad.bottom
 
-    // Y range from visible series only
-    let yMin = initialEquity, yMax = initialEquity
+    // Y range from visible series (percentage returns)
+    let yMin = 0, yMax = 0
     if (showFiltered) for (const v of filtered) { yMin = Math.min(yMin, v); yMax = Math.max(yMax, v) }
     if (showBuyHold && buy_hold) for (const v of buy_hold) { yMin = Math.min(yMin, v); yMax = Math.max(yMax, v) }
     for (const sig of ENTRY_SIGNALS) {
@@ -539,7 +591,7 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
         for (const v of wBench[sig]) { yMin = Math.min(yMin, v); yMax = Math.max(yMax, v) }
       }
     }
-    const yPad = (yMax - yMin) * 0.1 || initialEquity * 0.1
+    const yPad = (yMax - yMin) * 0.1 || 0.05
     yMin -= yPad; yMax += yPad
 
     const n = dates.length
@@ -560,11 +612,11 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
       const y = yScale(v)
       ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(dims.w - pad.right, y); ctx.stroke()
       ctx.fillStyle = '#657b83'; ctx.font = '10px monospace'; ctx.textAlign = 'left'
-      ctx.fillText(dollarFmt(v), dims.w - pad.right + 5, y + 3)
+      ctx.fillText((v * 100).toFixed(1) + '%', dims.w - pad.right + 5, y + 3)
     }
 
-    // Breakeven line at initial equity
-    const beY = yScale(initialEquity)
+    // Zero line (breakeven)
+    const beY = yScale(0)
     ctx.strokeStyle = '#93a1a1'; ctx.lineWidth = 1; ctx.setLineDash([4, 4])
     ctx.beginPath(); ctx.moveTo(pad.left, beY); ctx.lineTo(dims.w - pad.right, beY); ctx.stroke()
     ctx.setLineDash([])
@@ -607,24 +659,18 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
       drawLine(filtered, '#8BC34A', 2.5)
     }
 
-    // Legend
+    // Legend (values are already percentage returns)
     const legendItems: { label: string; value: string; color: string }[] = []
     if (showFiltered) {
-      const v = filtered[n - 1]
-      const ret = (v - initialEquity) / initialEquity
-      legendItems.push({ label: 'Filtered', value: `${dollarFmt(v)} (${pctFmt(ret)})`, color: '#8BC34A' })
+      legendItems.push({ label: 'Filtered', value: pctFmt(filtered[n - 1]), color: '#8BC34A' })
     }
     for (const sig of ENTRY_SIGNALS) {
       if (showBenchmark[sig] && wBench[sig] && wBench[sig].length > 0) {
-        const v = wBench[sig][wBench[sig].length - 1]
-        const ret = (v - initialEquity) / initialEquity
-        legendItems.push({ label: sig.replace('_', ' '), value: `${dollarFmt(v)} (${pctFmt(ret)})`, color: BENCHMARK_COLORS[sig] })
+        legendItems.push({ label: sig.replace('_', ' '), value: pctFmt(wBench[sig][wBench[sig].length - 1]), color: BENCHMARK_COLORS[sig] })
       }
     }
     if (showBuyHold && buy_hold && buy_hold.length > 0) {
-      const v = buy_hold[buy_hold.length - 1]
-      const ret = (v - initialEquity) / initialEquity
-      legendItems.push({ label: 'Buy&Hold', value: `${dollarFmt(v)} (${pctFmt(ret)})`, color: '#93a1a1' })
+      legendItems.push({ label: 'Buy&Hold', value: pctFmt(buy_hold[buy_hold.length - 1]), color: '#93a1a1' })
     }
 
     if (legendItems.length > 0) {
@@ -644,7 +690,7 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
       })
     }
 
-  }, [eqWindowed, resultTab, dims, initialEquity, showFiltered, showBuyHold, showBenchmark])
+  }, [eqWindowed, resultTab, dims, showFiltered, showBuyHold, showBenchmark])
 
   // Equity curve: wheel zoom + click-drag pan
   useEffect(() => {
@@ -1415,21 +1461,64 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
             </div>
           </div>
 
+         <div className="multi-leg-grid single-leg-grid">
+          <div className="single-leg-card">
+
           <div className="backtest-section">
             <label className="backtest-label">Target</label>
-            <select className="backtest-select" value={selectedTarget}
-              onChange={e => {
-                setSelectedTarget(e.target.value)
-                setSelectedTargetType('basket')
-              }}>
-              {/* Current sidebar selection */}
-              {selectedTargetType === 'ticker' && <option value={target}>{target} (ticker)</option>}
-              {Object.entries(allBaskets).map(([group, names]) => (
-                <optgroup key={group} label={group}>
-                  {Array.isArray(names) && names.map(n => <option key={n} value={n}>{n.replace(/_/g, ' ')}</option>)}
-                </optgroup>
-              ))}
-            </select>
+            <div className="bt-search-container">
+              <div className="bt-search-input-wrapper" onClick={() => { setTargetSearchOpen(true); setTimeout(() => targetSearchRef.current?.focus(), 0) }}>
+                {targetSearchOpen ? (
+                  <input
+                    ref={targetSearchRef}
+                    className="bt-search-input"
+                    value={targetSearchQuery}
+                    onChange={e => { setTargetSearchQuery(e.target.value); setTargetSearchHighlight(0) }}
+                    onKeyDown={handleTargetSearchKeyDown}
+                    onBlur={() => setTimeout(() => setTargetSearchOpen(false), 200)}
+                    placeholder={selectedTarget.replace(/_/g, ' ')}
+                    autoFocus
+                  />
+                ) : (
+                  <div className="bt-search-display">
+                    <span className="bt-search-display-name">{selectedTarget.replace(/_/g, ' ')}</span>
+                    <span className="bt-search-display-tag">{selectedTargetType === 'ticker' ? 'Ticker' : 'Basket'}</span>
+                  </div>
+                )}
+              </div>
+              {targetSearchOpen && (
+                <div className="bt-search-dropdown">
+                  <div className="search-filters">
+                    {(['all', 'Themes', 'Sectors', 'Industries', 'Tickers'] as const).map(f => (
+                      <button
+                        key={f}
+                        className={`search-filter-btn ${targetSearchFilter === f ? 'active' : ''}`}
+                        onMouseDown={e => { e.preventDefault(); setTargetSearchFilter(f) }}
+                      >
+                        {f === 'all' ? 'All' : f}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="search-results">
+                    {targetSearchResults.map((r, i) => (
+                      <div
+                        key={`${r.category}-${r.name}`}
+                        className={`search-result-item ${i === targetSearchHighlight ? 'highlighted' : ''}`}
+                        ref={i === targetSearchHighlight ? el => el?.scrollIntoView({ block: 'nearest' }) : undefined}
+                        onMouseDown={() => handleTargetSearchSelect(r)}
+                        onMouseEnter={() => setTargetSearchHighlight(i)}
+                      >
+                        <span className="search-result-name">{r.displayName}</span>
+                        <span className="search-result-tag">{r.category}</span>
+                      </div>
+                    ))}
+                    {targetSearchResults.length === 0 && (
+                      <div className="search-result-empty">No matches</div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
 
           <div className="backtest-section">
@@ -1440,7 +1529,7 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
             <span className="backtest-hint">Exit: {EXIT_MAP[entrySignal]?.replace(/_/g, ' ')}</span>
           </div>
 
-          {selectedTargetType === 'basket' && (
+          {selectedTargetType === 'basket' && entrySignal !== 'Buy_Hold' && (
             <div className="backtest-section">
               <label className="backtest-label">Trade Source</label>
               <div className="backtest-pos-presets">
@@ -1454,16 +1543,17 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
 
           <div className="backtest-section">
             <label className="backtest-label">Position Sizing</label>
-            <div className="backtest-filter-row">
-              <span className="backtest-hint">Equity $</span>
-              <input type="number" className="backtest-input" value={initialEquity}
-                onChange={e => setInitialEquity(Number(e.target.value))} style={{ width: 100 }} />
-              <span className="backtest-hint">Size %</span>
-              <input type="number" className="backtest-input" value={positionSize}
-                onChange={e => setPositionSize(Number(e.target.value))} style={{ width: 60 }} />
-              <span className="backtest-hint">Max Lev %</span>
-              <input type="number" className="backtest-input" value={maxLeverage}
-                onChange={e => setMaxLeverage(Number(e.target.value))} style={{ width: 60 }} />
+            <div className="backtest-sizing-row">
+              <div className="backtest-sizing-field">
+                <span className="backtest-hint">Size %</span>
+                <input type="number" className="backtest-input" value={positionSize}
+                  onChange={e => setPositionSize(Number(e.target.value))} />
+              </div>
+              <div className="backtest-sizing-field">
+                <span className="backtest-hint">Max Lev %</span>
+                <input type="number" className="backtest-input" value={maxLeverage}
+                  onChange={e => setMaxLeverage(Number(e.target.value))} />
+              </div>
             </div>
             <div className="backtest-pos-presets">
               <span className="backtest-preset-label">Size:</span>
@@ -1552,6 +1642,9 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
             {loading ? 'Running...' : 'Run Backtest'}
           </button>
           {error && <div className="backtest-error">{error}</div>}
+
+          </div>{/* single-leg-card */}
+         </div>{/* multi-leg-grid */}
         </div>
       </div>
     )
@@ -1590,9 +1683,9 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
   return (
     <div className="backtest-panel">
       <div className="backtest-results-header">
-        <button className="control-btn" onClick={() => setShowResults(false)}>Back</button>
+        <button className="summary-tab" onClick={() => setShowResults(false)}>Back</button>
         <span className="backtest-results-title">
-          {target.replace(/_/g, ' ')}{isMultiTicker ? ' Tickers' : ''} -- {entrySignal.replace(/_/g, ' ')} Backtest
+          {selectedTarget.replace(/_/g, ' ')}{isMultiTicker ? ' Tickers' : ''} -- {entrySignal.replace(/_/g, ' ')} Backtest
         </span>
         {result?.date_range && (
           <span className="backtest-hint">
@@ -1621,40 +1714,32 @@ export function BacktestPanel({ target, targetType, apiBase, availableBaskets, e
           <div className="backtest-content">
             {resultTab === 'equity' ? (
               <>
-                <div className="backtest-eq-toggles">
-                  <button
-                    style={showFiltered
-                      ? { background: '#8BC34A', borderColor: '#8BC34A', color: '#fff', border: '1px solid', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontWeight: 600, fontSize: 11 }
-                      : { background: 'transparent', borderColor: '#ccc', color: '#657b83', border: '1px solid', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontSize: 11 }}
-                    onClick={() => setShowFiltered(v => !v)}>Filtered</button>
-                  {(['Breakout', 'Up_Rot', 'BTFD'] as const).map(sig => (
-                    <button key={sig}
-                      style={showBenchmark[sig]
-                        ? { background: BENCHMARK_COLORS[sig], borderColor: BENCHMARK_COLORS[sig], color: '#fff', border: '1px solid', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontWeight: 600, fontSize: 11 }
-                        : { background: 'transparent', borderColor: '#ccc', color: '#657b83', border: '1px solid', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontSize: 11 }}
-                      onClick={() => setShowBenchmark(prev => ({ ...prev, [sig]: !prev[sig] }))}>{sig.replace('_', ' ')}</button>
-                  ))}
-                  {(['Breakdown', 'Down_Rot', 'STFR'] as const).map(sig => (
-                    <button key={sig}
-                      style={showBenchmark[sig]
-                        ? { background: BENCHMARK_COLORS[sig], borderColor: BENCHMARK_COLORS[sig], color: '#fff', border: '1px solid', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontWeight: 600, fontSize: 11 }
-                        : { background: 'transparent', borderColor: '#ccc', color: '#657b83', border: '1px solid', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontSize: 11 }}
-                      onClick={() => setShowBenchmark(prev => ({ ...prev, [sig]: !prev[sig] }))}>{sig.replace('_', ' ')}</button>
-                  ))}
-                  <button
-                    style={showBuyHold
-                      ? { background: '#93a1a1', borderColor: '#93a1a1', color: '#fff', border: '1px solid', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontWeight: 600, fontSize: 11 }
-                      : { background: 'transparent', borderColor: '#ccc', color: '#657b83', border: '1px solid', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontSize: 11 }}
-                    onClick={() => setShowBuyHold(v => !v)}>Buy &amp; Hold</button>
-                  <button
-                    style={showConstituents
-                      ? { background: '#d33682', borderColor: '#d33682', color: '#fff', border: '1px solid', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontWeight: 600, fontSize: 11 }
-                      : { background: 'transparent', borderColor: '#ccc', color: '#657b83', border: '1px solid', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontSize: 11 }}
-                    onClick={() => { setShowConstituents(v => !v); setEqPinnedIdx(null); setEqHoverIdx(null) }}>Constituents</button>
-                  <span className="eq-range-spacer" />
-                  <div className="eq-range-btns">
+                <div className="analysis-date-controls">
+                  <div className="bt-strat-btns">
+                    <button className={`bt-strat-btn ${showFiltered ? 'active' : ''}`}
+                      style={showFiltered ? { background: '#8BC34A', borderColor: '#8BC34A', color: '#fff' } : undefined}
+                      onClick={() => setShowFiltered(v => !v)}>Filtered</button>
+                    {(['Breakout', 'Up_Rot', 'BTFD'] as const).map(sig => (
+                      <button key={sig} className={`bt-strat-btn ${showBenchmark[sig] ? 'active' : ''}`}
+                        style={showBenchmark[sig] ? { background: BENCHMARK_COLORS[sig], borderColor: BENCHMARK_COLORS[sig], color: '#fff' } : undefined}
+                        onClick={() => setShowBenchmark(prev => ({ ...prev, [sig]: !prev[sig] }))}>{sig.replace('_', ' ')}</button>
+                    ))}
+                    {(['Breakdown', 'Down_Rot', 'STFR'] as const).map(sig => (
+                      <button key={sig} className={`bt-strat-btn ${showBenchmark[sig] ? 'active' : ''}`}
+                        style={showBenchmark[sig] ? { background: BENCHMARK_COLORS[sig], borderColor: BENCHMARK_COLORS[sig], color: '#fff' } : undefined}
+                        onClick={() => setShowBenchmark(prev => ({ ...prev, [sig]: !prev[sig] }))}>{sig.replace('_', ' ')}</button>
+                    ))}
+                    <button className={`bt-strat-btn ${showBuyHold ? 'active' : ''}`}
+                      style={showBuyHold ? { background: '#93a1a1', borderColor: '#93a1a1', color: '#fff' } : undefined}
+                      onClick={() => setShowBuyHold(v => !v)}>Buy Hold</button>
+                    <button className={`bt-strat-btn ${showConstituents ? 'active' : ''}`}
+                      style={showConstituents ? { background: '#d33682', borderColor: '#d33682', color: '#fff' } : undefined}
+                      onClick={() => { setShowConstituents(v => !v); setEqPinnedIdx(null); setEqHoverIdx(null) }}>Const</button>
+                  </div>
+                  <div style={{ flex: 1 }} />
+                  <div className="basket-returns-presets">
                     {(['1Y', '3Y', '5Y', 'YTD', 'All'] as const).map(p => (
-                      <button key={p} className="control-btn eq-range-btn" onClick={() => setEqPreset(p)}>{p}</button>
+                      <button key={p} className="basket-returns-preset-btn" onClick={() => setEqPreset(p)}>{p}</button>
                     ))}
                   </div>
                 </div>
