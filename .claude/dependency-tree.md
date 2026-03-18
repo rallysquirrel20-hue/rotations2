@@ -1,5 +1,5 @@
 # Dependency Tree
-Updated: 2026-03-18 (incremental — quarterly universe filtering in backtest, entry_weight/eod_weight, sortable constituents overlay, BENCHMARK_TIMING=True)
+Updated: 2026-03-18 (incremental — backtest stats overhaul, unified BacktestPanel, initial_equity removal, position sizing fixes, leverage enforcement, contribution calculation fixes, entry date format change)
 Files scanned: 15
 Functions indexed: 228
 
@@ -27,7 +27,7 @@ Functions indexed: 228
 | signals/rotations.py | 6206 | 143 | Main pipeline: universe, signals, baskets, live, reports |
 | signals/rotations_old_outputs.py | 2177 | 35 | Extracted Group B report cells (Excel, correlations, charts, PDFs) |
 | signals/databento_test.py | 624 | 16 | Databento API connectivity tests |
-| app/backend/main.py | 3500 | 43 | FastAPI REST endpoints + WebSocket |
+| app/backend/main.py | 3646 | 43 | FastAPI REST endpoints + WebSocket |
 | signals/test_all_optimizations.py | 75 | 1 | Compares old vs new breadth/contributions/correlation values after rebuild |
 | signals/test_correlation_optimization.py | 207 | 5 | Step-by-step test harness: backup, compare, check returns_matrix, test API, restore |
 | app/backend/signals_engine.py | 534 | 2 | Live signal computation (parallel impl) |
@@ -97,8 +97,8 @@ Functions indexed: 228
 | `EMA_MULT` | 2.0/11.0 | signals/rotations.py | 1227 | Range EMA alpha |
 | `RV_EMA_ALPHA` | 2.0/11.0 | signals/rotations.py | 1228 | RV EMA span=10 alpha |
 | `SIGNALS` | ['Up_Rot','Down_Rot','Breakout','Breakdown','BTFD','STFR'] | signals/rotations.py | 1225 | Signal type list |
-| `SIGNAL_TYPES` | ['Breakout','Breakdown','Up_Rot','Down_Rot','BTFD','STFR','Buy_Hold'] | app/backend/main.py | 1447 | Backtest signal type list (includes Buy_Hold) |
-| `BACKTEST_DIRECTION` | {Up_Rot:'long', Down_Rot:'short', Breakout:'long', Breakdown:'short', BTFD:'long', STFR:'short', Buy_Hold:'long'} | app/backend/main.py | 1455 | Signal-to-direction map (includes Buy_Hold) |
+| `SIGNAL_TYPES` | ['Breakout','Breakdown','Up_Rot','Down_Rot','BTFD','STFR','Buy_Hold'] | app/backend/main.py | 1440 | Backtest signal type list (includes Buy_Hold) |
+| `BACKTEST_DIRECTION` | {Up_Rot:'long', Down_Rot:'short', Breakout:'long', Breakdown:'short', BTFD:'long', STFR:'short', Buy_Hold:'long'} | app/backend/main.py | 1448 | Signal-to-direction map (includes Buy_Hold) |
 
 ---
 
@@ -111,7 +111,7 @@ These functions exist in BOTH signals/rotations.py AND app/backend/signals_engin
 | `_build_signals_from_df` | L1804-1940 (numba-accelerated) | L85-343 (pure Python) | rotations.py uses `@numba.njit` for passes 1-5; signals_engine.py uses Python loops with set-based tracking |
 | `_build_signals_next_row` | L1943-2131 | L346-534 | Near-identical logic; both are Python; used for incremental 1-bar updates |
 | `RollingStatsAccumulator` | L1274-1351 (class, deque-based) | L11-82 (class, list-based) | Same interface; rotations.py uses `collections.deque(maxlen=3)`, signals_engine.py uses `list` with `pop(0)` |
-| `_build_leg_trades` | main.py L2188-2425 | — | Extracted from `run_backtest` body; called only by `run_multi_backtest`; includes Buy_Hold early return; `run_backtest` still has its own inline trade-building logic |
+| `_build_leg_trades` | main.py L2212-2489 | — | Extracted trade-building logic; called only by `run_multi_backtest`; includes Buy_Hold early return; `run_backtest` still has its own inline trade-building logic; trade dicts include `entry_weight`/`exit_weight`/`contribution` fields |
 
 Functions in main.py that DUPLICATE logic from rotations.py (not exact copies but same purpose):
 
@@ -829,7 +829,7 @@ This file imports everything from rotations.py via `from rotations import *` plu
 
 ---
 
-### app/backend/main.py (3170 lines)
+### app/backend/main.py (3646 lines)
 
 #### `_read_live_parquet` (L80-90)
 - **Called by:** `_compute_live_breadth`, `get_basket_breadth`, `get_basket_returns`, `get_basket_data`, `list_live_signal_tickers`, `get_ticker_signals`, `get_ticker_data`, `get_basket_summary`
@@ -846,22 +846,22 @@ This file imports everything from rotations.py via `from rotations import *` plu
 - **Called by:** `get_basket_data`, `get_ticker_data`
 
 #### `get_latest_universe_tickers` (L120-142)
-- **Called by:** `_compute_live_breadth`, `get_basket_breadth`, `get_basket_data`, `get_basket_summary`, `get_basket_correlation`, `get_ticker_baskets`, `run_backtest`
+- **Called by:** `_compute_live_breadth`, `get_basket_breadth`, `get_basket_data`, `get_basket_summary`, `get_basket_correlation`, `get_ticker_baskets`, `run_backtest`, `_build_leg_trades`
 - **Data I/O:** reads `gics_mappings_{SIZE}.json`, thematic JSON files
 
 #### `get_meta_file_tickers` (L144-156)
-- **Called by:** `get_basket_summary`, `get_basket_correlation`, `run_backtest`
+- **Called by:** `get_basket_summary`, `get_basket_correlation`, `run_backtest`, `_build_leg_trades`
 
 #### `_get_universe_history` (L159-176)
-- **Called by:** `_get_universe_tickers_for_range`, `_get_ticker_join_dates`, `_get_tickers_for_date`, `get_basket_summary`
+- **Called by:** `_get_universe_tickers_for_range`, `_get_ticker_join_dates`, `_get_tickers_for_date`, `get_basket_summary`, `run_backtest`, `_build_leg_trades`
 - **Data I/O:** reads `gics_mappings_{SIZE}.json`, thematic JSON files
 
 #### `_quarter_str_to_date` (L179-185)
-- **Called by:** `_get_universe_tickers_for_range`, `_get_ticker_join_dates`, `_get_tickers_for_date`, `get_basket_summary`, `run_backtest`
+- **Called by:** `_get_universe_tickers_for_range`, `_get_ticker_join_dates`, `_get_tickers_for_date`, `get_basket_summary`, `run_backtest`, `_build_leg_trades`
 - **PARALLEL IMPL:** signals/rotations.py `_quarter_start_from_key` L427-432
 
 #### `_get_universe_tickers_for_range` (L188-202)
-- **Called by:** (available for API use)
+- **Called by:** `run_backtest`, `_build_leg_trades`
 
 #### `_get_ticker_join_dates` (L205-217)
 - **Called by:** `get_basket_summary`
@@ -922,92 +922,102 @@ This file imports everything from rotations.py via `from rotations import *` plu
 #### `get_ticker_data` (L1388-1443) — GET /api/tickers/{ticker}
 - **Calls:** `signals_engine._build_signals_next_row`, `_read_live_parquet`
 
-#### `safe_float` / `safe_int` (L1445-1454) — utility formatters
+#### `safe_float` / `safe_int` (L1456-1465) — utility formatters
 
-#### `get_basket_summary` (L1457-1909) — GET /api/baskets/{basket_name}/summary
+#### `get_basket_summary` (L1467-1921) — GET /api/baskets/{basket_name}/summary
 - **Calls:** `get_latest_universe_tickers`, `get_meta_file_tickers`, `_get_universe_history`, `_quarter_str_to_date`, `_read_live_parquet`, `_find_basket_contributions`, `_get_ticker_join_dates`, `safe_float`, `safe_int`
 
-#### `get_basket_correlation` (L1911-1957) — GET /api/baskets/{basket_name}/correlation
+#### `get_basket_correlation` (L1923-1969) — GET /api/baskets/{basket_name}/correlation
 - **Calls:** `_get_tickers_for_date`, `get_latest_universe_tickers`, `get_meta_file_tickers`
 
-#### `_find_basket_contributions` (L1959-1970)
+#### `_find_basket_contributions` (L1972-1982)
 - **Called by:** `get_basket_contributions`, `get_basket_candle_detail`, `get_basket_summary`, `get_basket_weights_from_contributions`
 
-#### `get_basket_contributions` (L1973-2059) — GET /api/baskets/{basket_name}/contributions
+#### `get_basket_contributions` (L1985-2070) — GET /api/baskets/{basket_name}/contributions
 
-#### `get_basket_candle_detail` (L2061-2105) — GET /api/baskets/{basket_name}/candle-detail
+#### `get_basket_candle_detail` (L2073-2148) — GET /api/baskets/{basket_name}/candle-detail
 
-#### `get_ticker_baskets` (L2107-2135) — GET /api/ticker-baskets/{ticker}
+#### `get_ticker_baskets` (L2150-2178) — GET /api/ticker-baskets/{ticker}
 
-#### `BacktestFilter` (L2155-2159) — Pydantic model
+#### `BacktestFilter` (L2181-2185) — Pydantic model
 - **Fields:** `metric`, `condition`, `value`, `source`
 
-#### `BacktestRequest` (L2161-2170) — Pydantic model
-- **Fields:** `target`, `target_type`, `entry_signal`, `filters`, `start_date`, `end_date`, `position_size` (default 1.0), `initial_equity` (default 100000), `max_leverage` (default 2.5)
+#### `BacktestRequest` (L2187-2195) — Pydantic model
+- **Fields:** `target`, `target_type`, `entry_signal`, `filters`, `start_date`, `end_date`, `position_size` (default 1.0), `max_leverage` (default 2.5)
+- **Removed:** `initial_equity` (no longer user-configurable; hardcoded to 1.0 internally for percentage-based equity)
 
-#### `MultiBacktestLeg` (L2172-2178) — Pydantic model
+#### `MultiBacktestLeg` (L2197-2203) — Pydantic model
 - **Fields:** `target`, `target_type`, `entry_signal`, `allocation_pct` (0-1 fraction), `position_size` (default 1.0), `filters`
 
-#### `MultiBacktestRequest` (L2180-2185) — Pydantic model
-- **Fields:** `legs`, `start_date`, `end_date`, `initial_equity` (default 100000), `max_leverage` (default 2.5)
+#### `MultiBacktestRequest` (L2205-2209) — Pydantic model
+- **Fields:** `legs`, `start_date`, `end_date`, `max_leverage` (default 2.5)
+- **Removed:** `initial_equity` (no longer user-configurable; hardcoded to 1.0 internally for percentage-based equity)
 
-#### `_build_leg_trades` (L2188-2425)
+#### `_build_leg_trades` (L2212-2489)
 - **Purpose:** extracted from `run_backtest` — builds the trades list + ticker_closes dict for a single backtest leg
 - **Called by:** `run_multi_backtest`
-- **Calls:** `_find_basket_parquet`, `get_latest_universe_tickers`, `get_meta_file_tickers`, `safe_float`
+- **Calls:** `_find_basket_parquet`, `get_latest_universe_tickers`, `get_meta_file_tickers`, `_get_universe_history`, `_get_universe_tickers_for_range`, `_quarter_str_to_date`, `safe_float`
 - **Parameters:** `target`, `target_type`, `entry_signal`, `filters`, `start_date`, `end_date`
 - **Returns:** `(trades, df, ticker_closes, direction)` tuple
 - **Key behaviors:**
-  - Early return for Buy_Hold signal: builds single trade from Close series (basket or ticker); not supported for basket_tickers
+  - Early return for Buy_Hold signal: builds single trade from Close series (basket or ticker); not supported for basket_tickers; trade includes `entry_weight/exit_weight/contribution` fields
   - Loads data for basket/basket_tickers/ticker target types
   - Applies regime filters (above/below/increasing/decreasing/equals_true/equals_false) from pre-computed parquet values
   - Merges external basket filter sources via `pd.merge_asof`
   - Skips open trades (no exit_date/exit_price)
+  - Trade dicts include `entry_weight`, `exit_weight`, `contribution` fields (initialized to None, populated by equity engine)
 
-#### `get_date_range` (L2427-2443) — GET /api/date-range/{target_type}/{target}
+#### `get_date_range` (L2492-2508) — GET /api/date-range/{target_type}/{target}
 - **Calls:** `_find_basket_parquet`
 - **Data I/O:** reads `signals_500.parquet` (columns: Ticker, Date), basket parquets (column: Date)
 
-#### `_build_buy_hold` (L2445-2506)
+#### `_build_buy_hold` (L2510-2573)
 - **Purpose:** builds a complete buy-and-hold backtest result from the Close series
 - **Called by:** `run_backtest` (early return when `entry_signal == 'Buy_Hold'`)
 - **Calls:** `_find_basket_parquet`
-- **Parameters:** `target`, `target_type`, `start_date`, `end_date`, `initial_equity`
-- **Returns:** full backtest response dict (single trade, equity curve scaled from initial_equity, trade_paths, stats)
+- **Parameters:** `target`, `target_type`, `start_date`, `end_date`
+- **Returns:** full backtest response dict (single trade, equity curve as ratio from 1.0, trade_paths, stats)
 - **Key behaviors:**
   - Supports basket (reads basket parquet) and ticker (reads INDIVIDUAL_SIGNALS_FILE) target types
   - Rejects basket_tickers mode with HTTP 400
-  - Equity curve is simply `initial_equity * close / first_close`
+  - Equity curve is `close / first_close` (percentage-based, no initial_equity)
+  - Trade includes `entry_weight: 1.0`, `exit_weight: 1.0`, `contribution: total_return`
   - Stats: single trade, max_dd from cummax drawdown
 
-#### `run_backtest` (L2509-2963) — POST /api/backtest
-- **Calls:** `_build_buy_hold` (early return for Buy_Hold), `_find_basket_parquet`, `get_latest_universe_tickers`, `get_meta_file_tickers`, `_quarter_str_to_date`, `safe_float`
+#### `run_backtest` (L2576-3075) — POST /api/backtest
+- **Calls:** `_build_buy_hold` (early return for Buy_Hold), `_find_basket_parquet`, `get_latest_universe_tickers`, `get_meta_file_tickers`, `_quarter_str_to_date`, `_get_universe_history`, `_get_universe_tickers_for_range`, `safe_float`
 - **Nested functions:**
   - `mtm_equity` — mark-to-market equity computation for open positions
-  - `compute_stats` — trade statistics (win rate, EV, PF, max DD, avg bars); filters out `skipped` trades before computing
+  - `compute_stats` — trade statistics (win rate, EV, PF, max DD, avg bars)
 - **Data I/O:** reads `signals_500.parquet`, basket parquets, thematic/gics JSON
 - **Constants:** `SIGNAL_IS_COL`, `BACKTEST_DIRECTION`
 - **Key behaviors:**
   - Early return for Buy_Hold: delegates to `_build_buy_hold()` helper
   - Vectorized trade building from pre-computed arrays — no iterrows
-  - Buy-and-hold curve aligned to equity curve dates
-  - Leverage multiplies position sizes: `wanted = equity * pos_size * max_lev`
-  - Skipped entry detection: when `alloc_f <= 0` in filtered equity path, records skip reason
-  - Daily position snapshots keyed by date index with full position detail (weight, daily_return, contribution)
-- **Frontend callers:** BacktestPanel.tsx `runBacktest` (fires main + 6 benchmark calls in parallel)
+  - Buy-and-hold curve aligned to equity curve dates, ratio from 1.0
+  - Initial equity = 1.0 (percentage-based); leverage multiplies position sizes: `wanted = equity * pos_size * max_lev`; exposure capped by `equity * max_lev`
+  - Per-trade `entry_weight` = alloc/equity at entry; `exit_weight` = exit_val/equity at exit; `contribution` = entry_weight * return
+  - Daily position snapshots keyed by date index with full position detail (entry_weight, weight, daily_return, contribution)
+- **Frontend callers:** BacktestPanel.tsx `runBacktest` now calls POST `/api/backtest/multi` for all backtests (single-leg wrapped as 1-leg multi)
 
-#### `run_multi_backtest` (L2966-3337) — POST /api/backtest/multi
+#### `run_multi_backtest` (L3078-3577) — POST /api/backtest/multi
 - **Calls:** `_build_leg_trades`, `_find_basket_parquet`
-- **Nested function:** `compute_stats` — same stats computation as in `run_backtest`
+- **Nested function:** `compute_stats` — NEW split structure: returns `{'portfolio': {...}, 'trade': {...}}` dict
+  - `portfolio` stats: `strategy_return`, `cagr`, `volatility`, `max_dd`, `sharpe`, `sortino`, `contribution?`, `allocation?`
+  - `trade` stats: `trades_met_criteria`, `trades_taken`, `trades_skipped`, `win_rate`, `avg_winner`, `avg_loser`, `ev`, `profit_factor`, `avg_time_winner`, `avg_time_loser`
 - **Key behaviors:**
+  - Initial equity = 1.0 (percentage-based, no initial_equity parameter)
   - Per-leg equity curves run two parallel simulations: allocated (for combined sum, using `leg_initial = initial * alloc_frac`) and standalone (for per-leg display, using full `initial`)
   - Leverage multiplies position sizes: `wanted = equity * pos_size * max_lev`; max exposure per leg: `equity * max_lev`
-  - Daily positions keyed by date index with full position detail (weight, daily_return, contribution, leg_target)
-  - Each leg response now includes `trade_paths` (daily cumulative return per trade)
+  - Per-trade `entry_weight`/`exit_weight`/`contribution` computed relative to combined equity (not per-leg)
+  - Daily positions keyed by date index with full position detail (entry_weight, weight, daily_return, contribution, leg_target)
+  - Each leg response includes `trade_paths` (daily cumulative return per trade)
   - Combined equity curve is sum of allocated per-leg curves
   - Buy-hold curve derived from first basket leg (falls back to first leg overall)
+  - Inter-leg correlation matrix from daily returns of standalone equity curves
+  - Per-leg contribution = alloc_frac * leg_return
 
-#### `uvicorn.run` (L3403-3406) — entry point
+#### `uvicorn.run` (L3646) — entry point
 
 ---
 
@@ -1182,14 +1192,14 @@ signals/test_correlation_optimization.py
   └── standalone (reads parquets from Python_Outputs directly; step4 hits localhost:8000)
 
 app/frontend/src/components/BacktestPanel.tsx
-  └── imports: react, axios, lightweight-charts, RangeScrollbar (local)
-  └── consumes: app/backend/main.py POST /api/backtest, GET /api/baskets, GET /api/tickers
+  └── imports: react, RangeScrollbar (local)
+  └── consumes: app/backend/main.py POST /api/backtest/multi, GET /api/baskets, GET /api/tickers, GET /api/date-range
 
 app/frontend/src/components/AnalogsPanel.tsx
   └── imports: react, axios
   └── consumes: app/backend/main.py GET /api/baskets/returns?mode=analogs, GET /api/baskets
 
-app/frontend/src/components/MultiBacktestPanel.tsx
+app/frontend/src/components/MultiBacktestPanel.tsx (DEFUNCT — no longer imported by App.tsx; functionality merged into BacktestPanel.tsx)
   └── imports: react, axios, lightweight-charts
   └── consumes: app/backend/main.py POST /api/backtest/multi, GET /api/baskets, GET /api/tickers
 
@@ -1199,159 +1209,135 @@ app/frontend/src/index.css
 
 ---
 
-## app/frontend/src/components/BacktestPanel.tsx (2026 lines)
+## app/frontend/src/components/BacktestPanel.tsx (1857 lines)
+
+**COMPLETE REWRITE:** Unified single-leg and multi-leg backtest into a single component. All backtests now use POST `/api/backtest/multi` endpoint (single-leg is sent as 1-leg multi). The old `MultiBacktestPanel.tsx` is no longer needed; `BacktestPanel` handles both modes.
 
 ### Interfaces
 
 #### BacktestFilter (L6-11)
 - **Fields:** `metric`, `condition`, `value`, `source`
 
-#### Trade (L13-25)
-- **Fields:** `ticker?`, `entry_date`, `exit_date`, `entry_price`, `exit_price`, `change`, `mfe`, `mae`, `bars_held`, `regime_pass`, `skipped?`
-- **New field:** `skipped?: boolean` — set by backend when trade was skipped due to leverage limit
+#### LegConfig (L13-20) — NEW (replaces separate single/multi config)
+- **Fields:** `target`, `targetType` ('basket' | 'basket_tickers' | 'ticker'), `entrySignal`, `allocationPct`, `positionSize`, `filters`
 
-#### Stats (L27-36)
-- **Fields:** `trades`, `win_rate`, `avg_winner`, `avg_loser`, `ev`, `profit_factor`, `max_dd`, `avg_bars`
+#### PortfolioStats (L22-31) — NEW (replaces flat Stats)
+- **Fields:** `strategy_return`, `cagr`, `volatility`, `max_dd`, `sharpe`, `sortino`, `contribution?`, `allocation?`
 
-#### DailyPosition (L38-46) — NEW
-- **Fields:** `trade_idx`, `ticker?`, `entry_date`, `alloc`, `weight`, `daily_return`, `contribution`
-- **Consumed from:** `run_backtest` response `daily_positions[idx].positions`
+#### TradeStats (L33-44) — NEW
+- **Fields:** `trades_met_criteria`, `trades_taken`, `trades_skipped`, `win_rate`, `avg_winner`, `avg_loser`, `ev`, `profit_factor`, `avg_time_winner`, `avg_time_loser`
 
-#### DailySnapshot (L48-52) — NEW
+#### Stats (L46-49) — CHANGED (now split into portfolio + trade sections)
+- **Fields:** `portfolio: PortfolioStats`, `trade: TradeStats`
+
+#### Trade (L51-66)
+- **Fields:** `ticker?`, `entry_date`, `exit_date`, `entry_price`, `exit_price`, `change`, `mfe`, `mae`, `bars_held`, `regime_pass`, `skipped?`, `entry_weight`, `exit_weight`, `contribution`
+- **New fields:** `entry_weight: number | null`, `exit_weight: number | null`, `contribution: number | null`
+
+#### DailyPosition (L68-78)
+- **Fields:** `trade_idx`, `ticker?`, `entry_date`, `leg_target`, `alloc`, `entry_weight`, `weight`, `daily_return`, `contribution`
+- **New field:** `leg_target: string` — identifies which leg the position belongs to
+- **New field:** `entry_weight: number` — weight at entry time
+
+#### DailySnapshot (L80-84)
 - **Fields:** `exposure_pct`, `equity`, `positions: DailyPosition[]`
-- **Consumed from:** `run_backtest` response `daily_positions` dict values
 
-#### SkippedEntry (L54-61) — NEW
-- **Fields:** `ticker?`, `entry_date`, `entry_price`, `reason`, `exposure_at_skip`, `equity_at_skip`
-- **Consumed from:** `run_backtest` response `skipped_entries` array
+#### LegResult (L86-95) — NEW
+- **Fields:** `target`, `target_type`, `entry_signal`, `allocation_pct`, `direction`, `trades`, `trade_paths`, `stats`
 
-#### BacktestResult (L63-72)
-- **Fields:** `trades`, `trade_paths`, `equity_curve`, `stats`, `date_range`, `blew_up?`, `daily_positions?`, `skipped_entries?`
-- **New fields:** `daily_positions?: Record<number, DailySnapshot>`, `skipped_entries?: SkippedEntry[]`
+#### MultiBacktestResult (L97-112) — NEW (replaces old BacktestResult)
+- **Fields:** `legs: LegResult[]`, `combined: { equity_curve, stats }`, `date_range`, `skipped_entries?`, `daily_positions?`, `leg_correlations?`
+- **equity_curve:** `{ dates, combined, per_leg, buy_hold }` — all percentage-based (no initial_equity scaling)
+
+#### BacktestPanelProps (L114-119) — SIMPLIFIED
+- **Fields:** `apiBase`, `target?`, `targetType?` ('basket' | 'ticker'), `exportTrigger?`
+- **Removed:** `allBaskets` (now fetched internally)
 
 ### Constants
 
-#### ENTRY_SIGNALS (L83)
+#### ENTRY_SIGNALS (L123)
 - **Value**: `['Up_Rot', 'Down_Rot', 'Breakout', 'Breakdown', 'BTFD', 'STFR', 'Buy_Hold']`
-- **Used by**: signal select dropdown, benchmark loop (filters out Buy_Hold), equity curve legend
 
-#### EXIT_MAP (L84-89)
+#### EXIT_MAP (L124-129)
 - **Value**: `{ Up_Rot: 'Down_Rot', Down_Rot: 'Up_Rot', Breakout: 'Breakdown', Breakdown: 'Breakout', BTFD: 'Breakdown', STFR: 'Breakout', Buy_Hold: 'End of Period' }`
-- **Used by**: entry signal hint text
 
-#### LONG_SIGNALS (L103)
-- **Value**: `new Set(['Up_Rot', 'Breakout', 'BTFD', 'Buy_Hold'])`
-- **Used by**: trade chart marker direction
+#### LEG_COLORS (L130)
+- **Value**: `['#1565C0', '#C2185B', '#2E7D32', '#E65100', '#6A1B9A', '#00838F']`
+- **Used by**: Multi-leg equity curves, stats headers, leg cards
 
-#### BENCHMARK_COLORS (L105-110)
+#### BENCHMARK_COLORS (L136-143)
 - **Value**: `{ Breakout: '#1565C0', Up_Rot: '#42A5F5', BTFD: '#90CAF9', Breakdown: '#C2185B', Down_Rot: '#F06292', STFR: '#F8BBD0' }`
-- **Used by**:
-  - Equity curve canvas drawing — benchmark line colors
-  - Equity curve legend — benchmark legend color
-  - Equity tab toggle buttons — button active background colors (uses `bt-strat-btn` class)
 
-#### LEV_PRESETS (L94)
-- **Value**: `[100, 110, 125, 150, 200, 250]`
-- **Used by**: BacktestPanel config UI — renders preset buttons for `maxLeverage` state
-- **CSS classes**: `.backtest-pos-presets` (container), `.backtest-pos-preset` (buttons), `.backtest-preset-label` (label "Lev:")
+#### POS_PRESETS (L133) / LEV_PRESETS (L134)
+- **Values**: `[1, 5, 10, 25, 50, 100]` / `[100, 110, 125, 150, 200, 250]`
 
-#### POS_PRESETS (L93)
-- **Value**: `[1, 5, 10, 25, 50, 100]`
-- **Used by**: BacktestPanel config UI — renders preset buttons for `positionSize` state
-- **CSS classes**: `.backtest-pos-presets` (container), `.backtest-pos-preset` (buttons), `.backtest-preset-label` (label "Size:")
+#### defaultLeg() (L164-166)
+- **Returns**: `{ target: '', targetType: 'basket_tickers', entrySignal: 'Breakout', allocationPct: 100, positionSize: 25, filters: [] }`
 
 ### Key State
 
-#### benchmarks (L172)
-- **Type**: `Record<string, number[]>` — maps signal name to unfiltered equity curve
-- **Set by**: `runBacktest` — 6 parallel `benchmarks_only: true` API calls (L348-351)
-- **Used by**: `eqWindowed` memo (L486-487), equity canvas drawing (L584-587), equity legend (L601-606), toggle buttons (L1587-1600)
+#### legs (L209-216)
+- **Type**: `LegConfig[]` — array of leg configurations (1 for single-leg, up to 6 for multi-leg)
+- **Initialized from**: props `target`/`targetType` if provided
 
-#### showBenchmark (L173)
-- **Type**: `Record<string, boolean>` — per-signal visibility toggle
-- **Used by**: equity canvas y-range (L522-523), equity line drawing (L585), legend (L602), toggle buttons (L1589-1599)
+#### benchmarks (L322) / showBenchmark (L323)
+- **Type**: `Record<string, number[]>` / `Record<string, boolean>` — auto-calculated for single-leg only
+- **Set by**: `runBacktest` — 6 parallel `/api/backtest/multi` calls with each signal
 
-#### showConstituents (L212) — NEW
-- **Type**: `boolean` — toggles constituent overlay on equity tab
-- **Set by**: Constituents toggle button (L1607-1610)
-- **Used by**: equity canvas useEffect for hover/pin/escape handlers (L706-749), crosshair line + floating overlay panel rendering (L1620-1675)
+#### showConstituents (L319) / eqHoverIdx (L347) / eqPinnedIdx (L348)
+- **Type**: boolean / number | null / number | null — constituents overlay state
 
-#### eqHoverIdx (L213) — NEW
-- **Type**: `number | null` — equity curve date index under mouse pointer
-- **Set by**: mouse move handler in constituents overlay useEffect (L711-718)
-- **Used by**: crosshair line rendering, daily position snapshot lookup (L1621-1628)
-
-#### eqPinnedIdx (L214) — NEW
-- **Type**: `number | null` — clicked/pinned equity curve date index (overrides hover)
-- **Set by**: click handler (L721-731), Escape key clears (L733-734)
-- **Used by**: crosshair line color (blue when pinned), overlay `pointerEvents` (auto when pinned), PINNED label (L1642-1644)
-
-#### eqScaleRef (L215) — NEW
-- **Type**: `Ref<{ padLeft, plotW, n, startIdx }>` — cached equity chart scale parameters
-- **Set by**: equity canvas drawing useEffect (L530)
-- **Used by**: hover/click handlers to convert mouse X to date index (L715-717, L725-727)
-
-#### eqDidDragRef (L216) — NEW
-- **Type**: `Ref<boolean>` — true when mouse was dragged (suppresses click-to-pin)
-- **Set by**: mouseDown resets to false (L662), mouseMove sets to true (L669)
-- **Used by**: click handler guards pin action (L722)
+#### constSortCol (L349)
+- **Type**: `'ticker' | 'leg_target' | 'entry_date' | 'entry_weight' | 'daily_return' | 'weight' | 'contribution'`
+- **Expanded from**: old version to include `leg_target` and `entry_weight` columns
 
 ### API Call Pattern
 
-#### runBacktest (L308-371)
-- **Fires 7 parallel requests**: 1 main backtest + 6 benchmark calls (ENTRY_SIGNALS minus Buy_Hold)
-- Main call: full body with `entry_signal`, `filters`, `include_positions: true`; when Buy_Hold, uses basket mode (not basket_tickers)
-- Benchmark calls: stripped body with `benchmarks_only: true`, `filters: []`, each signal (excludes Buy_Hold)
-- Uses `benchmarkGenRef` (L174) to discard stale results from superseded runs
-- **Backend endpoint**: POST `/api/backtest` (`run_backtest` in main.py L2509)
+#### runBacktest (L359-436)
+- **Always calls POST `/api/backtest/multi`** — single-leg wrapped as 1-leg multi with `allocation_pct: 1.0`
+- **Benchmark calls**: 6 parallel `/api/backtest/multi` calls with each signal (single-leg only)
+- **Position sizing**: `leg.positionSize / 100` sent to backend
+- **Max leverage**: `maxLeverage / 100` sent to backend
+- **Backend endpoint**: POST `/api/backtest/multi` (`run_multi_backtest` in main.py L3078)
 
-### Constituents Overlay (equity tab) — NEW
+### Constituents Overlay (equity tab)
 
-#### useEffect: hover, pin, escape handlers (L706-749)
+#### useEffect: hover, pin, escape handlers (L868-904)
 - **Guards**: canvas exists, result exists, resultTab === 'equity', showConstituents === true
-- **mousemove** (L711-718): converts mouse X to date index via eqScaleRef, updates eqHoverIdx; suppressed when dragging or pinned
-- **click** (L721-731): toggles eqPinnedIdx on/off at clicked date index; suppressed if eqDidDragRef is true (drag)
-- **keydown Escape** (L733-734): clears both eqPinnedIdx and eqHoverIdx
-- **mouseleave** (L737): clears eqHoverIdx when not pinned
+- **mousemove**: converts mouse X to date index via eqScaleRef, updates eqHoverIdx
+- **click**: toggles eqPinnedIdx on/off at clicked date index
+- **keydown Escape**: clears both eqPinnedIdx and eqHoverIdx
+- **mouseleave**: clears eqHoverIdx when not pinned
 
-#### Crosshair line + floating overlay (L1620-1675)
-- Renders vertical crosshair `<div>` at computed X position (blue when pinned, gray when hovering)
-- Renders `.candle-detail-overlay` panel showing daily position snapshot from `result.daily_positions[activeIdx]`
-- Panel columns: Ticker (or Entry date), Weight, Return, Contribution
+#### Crosshair line + floating overlay (L1248-1328)
+- Renders vertical crosshair `<div>` at computed X position
+- Renders `.candle-detail-overlay` panel showing daily position snapshot
+- Panel columns: Ticker, Leg (multi-leg only), Entry, Ent.Wt, Return, Cur.Wt, Contrib
 - Footer row: Total exposure_pct, total contribution
-- Pin/unpin hint text shown in title
 
 ### Result Tabs
 
-- `equity` — Canvas-drawn equity curves showing percentage returns (rebased to 0% from visible window start); toggle buttons for Filtered, 6 benchmarks (long: Breakout/Up_Rot/BTFD, short: Breakdown/Down_Rot/STFR), Buy & Hold, Constituents; strategy toggle buttons use `bt-strat-btn` class (equal width), timeframe buttons pushed right; crosshair overlay when Constituents enabled
-- `stats` (L1831-1851) — Table comparing Filtered vs All stats (trades, win rate, avg winner/loser, EV, PF, max DD, avg bars). Uses `.backtest-stats-table` / `.backtest-stats-th` / `.backtest-stats-td` CSS classes
-- `distribution` — Histogram canvas of change/MFE/MAE
-- `chart` — Lightweight Charts OHLC with entry/exit markers; skips rendering trade lines for `t.skipped` trades (L1217); renders skipped entry markers as gray arrows with 'skip' text (L1229-1238)
-- `path` — Trade path overlay canvas
-- `trades` — Sortable trade table; skipped rows styled with gray background, '--' placeholders, and 'SKIP' badge (L1866-1886)
+- `equity` — Canvas-drawn equity curves showing percentage returns (rebased to 0%); toggle buttons for Combined (or Equity for single), per-leg visibility, 6 benchmarks (single-leg only), Buy Hold, Constituents; strategy toggle buttons use `bt-strat-btn` class; zoom/pan via wheel/drag; log scale toggle
+- `stats` (L1342-1441) — Split portfolio + trade stats tables; per-leg + combined (multi-leg); includes CAGR, Sharpe, Sortino, Volatility, inter-leg correlations; trades taken/skipped breakdown
+- `distribution` — KDE curve canvas of change/MFE/MAE with per-leg filtering
+- `path` — Trade path overlay canvas with multi-leg support; sortable legend (Leg, Ticker, Date, Chg)
+- `trades` (L1540-1616) — Sortable trade table with per-leg filter; shows entry_weight, exit_weight, contribution columns
 
-### UI Sections
+### Configuration Mode (L1624-1857)
 
-#### Searchable target picker
-- Replaces the plain `<select>` for target with a searchable combo box
-- Fetches both baskets (GET /api/baskets) and tickers (GET /api/tickers) for autocomplete
-- CSS classes: `.bt-search-*` (input, dropdown, item, etc.)
+#### renderLegCard (L1626-1784)
+- Renders a single leg configuration card with: searchable target picker, basket signal/constituent toggle, entry signal select, position size presets, allocation % (multi-leg), regime filters
+- Cards arranged in `.multi-leg-grid` layout (2 columns for multi-leg, single-card for single-leg)
 
-#### Trade Source toggle
-- Uses `.backtest-pos-preset.wide` class for wider "Basket Signal" / "Constituent Tickers" toggle buttons
-- Controls `useConstituents` state
-- Hidden when `entrySignal === 'Buy_Hold'`
-
-#### Position Size presets
-- Uses `.backtest-preset-label` for "Size:" label
-- Uses `.backtest-pos-preset` for each POS_PRESETS button
-
-#### Max Leverage presets
-- Uses `.backtest-preset-label` for "Lev:" label
-- Uses `.backtest-pos-preset` for each LEV_PRESETS button
+#### Portfolio Settings card (L1791-1844)
+- Max Leverage presets, date range inputs, Run Backtest button
+- Always first in the grid, same size as leg cards
 
 #### Removed: Equity $ input field
-- Initial equity is no longer user-configurable in the UI (uses default 100000)
+- `initial_equity` is no longer user-configurable (uses default 1.0 for percentage-based equity)
+
+#### Removed: Separate MultiBacktestPanel component
+- BacktestPanel now handles both single and multi-leg modes natively
 
 ---
 
@@ -1397,23 +1383,11 @@ Self-contained React component for the Analogs feature — finds historical cros
 
 ---
 
-## app/frontend/src/components/MultiBacktestPanel.tsx
+## app/frontend/src/components/MultiBacktestPanel.tsx (DEFUNCT)
 
-Multi-leg backtest UI -- configures and displays results for multi-leg backtests with per-leg capital allocation.
+**No longer imported by App.tsx.** All functionality merged into BacktestPanel.tsx, which now handles both single-leg and multi-leg modes.
 
-### Key Features
-- **Leg configuration:** add/remove legs (multi-leg grid: 2 columns, up to 3 rows); each with searchable target picker (baskets + tickers via combo box), signal, allocation %, position size, optional filters; `LegConfig.targetType` supports 'ticker'
-- **Portfolio settings:** top half-width card with initial equity, max leverage, date range
-- **Equity curve:** canvas-drawn combined + per-leg equity curves with percentage returns (rebased to 0% from visible window start); per-leg visibility toggle via `Set<number>`
-- **Path tab:** trade paths chart and legend (Leg, Ticker, Date, Chg columns)
-- **Stats table:** combined and per-leg statistics (trades, win rate, EV, PF, max DD, avg bars)
-- **Trades table:** all trades across legs with leg identifier column
-- **Button styling:** `bt-strat-btn` class for equal-width strategy buttons
-
-### API Integration
-- **Endpoint:** POST `/api/backtest/multi` (`run_multi_backtest` in main.py L2966)
-- **Request model:** `MultiBacktestRequest` (legs, start_date, end_date, initial_equity, max_leverage)
-- **Response:** per-leg results (including `trade_paths`) + combined equity curve + combined stats + daily_positions + skipped_entries
+The file still exists on disk but is dead code.
 
 ---
 
@@ -1422,17 +1396,17 @@ Multi-leg backtest UI -- configures and displays results for multi-leg backtests
 ### .backtest-stats-table (L1195-1199)
 - **Purpose**: Stats comparison table in the Stats tab
 - **Properties**: font-size 11px, border-collapse, nowrap
-- **Used by**: BacktestPanel.tsx Stats tab (L1833)
+- **Used by**: BacktestPanel.tsx Stats tab (L1342)
 
 ### .backtest-stats-th (L1201-1211)
-- **Purpose**: Header cells in stats table (columns: empty, Filtered, All)
+- **Purpose**: Header cells in stats table
 - **Properties**: font-size 10px, bold, uppercase, right-aligned (first-child left-aligned)
-- **Used by**: BacktestPanel.tsx Stats tab (L1836-1838)
+- **Used by**: BacktestPanel.tsx Stats tab
 
 ### .backtest-stats-td (L1213-1226)
 - **Purpose**: Data cells in stats table, with `.label` variant for row labels
 - **Properties**: right-aligned, `.label` variant is left-aligned, bold, uppercase
-- **Used by**: BacktestPanel.tsx Stats tab (L1844-1846)
+- **Used by**: BacktestPanel.tsx Stats tab
 
 ### .backtest-preset-label
 - **Purpose**: Label text ("Size:", "Lev:") preceding preset button rows in backtest config
@@ -1454,34 +1428,40 @@ Multi-leg backtest UI -- configures and displays results for multi-leg backtests
 - **Properties**: height 42px, box-sizing border-box, centered alignment, compact padding
 - **Used by**: BasketSummary.tsx — tabs bar (Signals / Correlation / Returns / Contribution)
 
-### .bt-search-* classes (NEW)
+### .bt-search-* classes
 - **Purpose**: Searchable target picker combo box for backtest panels
 - **Includes**: `.bt-search-wrap`, `.bt-search-input`, `.bt-search-dropdown`, `.bt-search-item`, `.bt-search-group`
-- **Used by**: BacktestPanel.tsx and MultiBacktestPanel.tsx target selectors
+- **Used by**: BacktestPanel.tsx target selectors
 
-### .backtest-sizing-row / .backtest-sizing-field (NEW)
+### .backtest-sizing-row / .backtest-sizing-field
 - **Purpose**: Equal-width input layout for position size, leverage, date fields
 - **Used by**: BacktestPanel.tsx config section
 
-### .multi-leg-grid / .multi-leg-card / .multi-leg-add (NEW)
-- **Purpose**: Multi-leg grid layout (2 columns, up to 3 rows) with per-leg cards and add button
-- **Used by**: MultiBacktestPanel.tsx leg configuration area
+### .multi-leg-grid / .multi-leg-card / .multi-leg-add
+- **Purpose**: Multi-leg grid layout (2 columns, up to 6 legs) with per-leg cards and add button
+- **Used by**: BacktestPanel.tsx leg configuration area (both single and multi-leg modes)
 
-### .single-leg-grid / .single-leg-card (NEW)
-- **Purpose**: Single-leg grid and card layout variants
-- **Used by**: MultiBacktestPanel.tsx
+### .single-leg-card
+- **Purpose**: Single-leg card layout variant
+- **Used by**: BacktestPanel.tsx (single-leg mode)
 
-### .bt-strat-btn (NEW)
+### .bt-strat-btn
 - **Purpose**: Equal-width strategy toggle buttons in backtest results
-- **Used by**: BacktestPanel.tsx equity tab toggle row, MultiBacktestPanel.tsx
+- **Used by**: BacktestPanel.tsx equity tab toggle row (benchmarks, per-leg, buy hold, constituents)
 
-### .path-legend-header / .path-legend-row / .path-legend-col (NEW)
+### .path-legend-header / .path-legend-row / .path-legend-col
 - **Purpose**: Trade paths legend with Leg, Ticker, Date, Chg columns
-- **Used by**: MultiBacktestPanel.tsx path tab
+- **Used by**: BacktestPanel.tsx path tab
 
 ### .backtest-path-legend
-- **Width**: 240px (widened)
-- **Used by**: BacktestPanel.tsx and MultiBacktestPanel.tsx path tab
+- **Width**: 240px (default), 320px (multi-leg via inline style)
+- **Used by**: BacktestPanel.tsx path tab
+
+### .candle-detail-row .const-entry (L1008)
+- **Purpose**: Entry date column in constituents overlay
+- **Properties**: flex: 0 0 80px, text-align: right
+- **Used by**: TVChart.tsx candle detail overlay, BacktestPanel.tsx constituents overlay
+- **Format**: Entry dates shown as `MM-DD-YYYY` (e.g., `03-18-2026`) via `date.slice(5) + '-' + date.slice(0, 4)`
 
 ### Removed: max-width 700px from .backtest-config
 - **Previously**: constrained config panel width
