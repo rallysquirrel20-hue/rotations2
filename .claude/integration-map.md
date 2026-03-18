@@ -1,6 +1,6 @@
 # Monorepo Integration Map
 
-> Auto-generated 2026-03-16. Last updated 2026-03-18 (batch 5). Tracks all communication points between signals/ and app/backend/.
+> Auto-generated 2026-03-16. Last updated 2026-03-18 (batch 6). Tracks all communication points between signals/ and app/backend/.
 
 ## Signal Refresh Entry Point
 
@@ -339,7 +339,7 @@
 
 ### `POST /api/backtest` — `BacktestFilter` extended with `source` field; `benchmarks_only`/`include_positions` removed (updated HEAD commit)
 
-**`BacktestFilter` model** (`app/backend/main.py:2155`) — now has a `source` field:
+**`BacktestFilter` model** (`app/backend/main.py:2181`) — now has a `source` field:
 ```
 {
   metric: str,           // column name (e.g. "Uptrend_Pct", "Trend", "Is_Breakout_Sequence")
@@ -355,7 +355,7 @@
 - Failed sources (parquet not found) are recorded in `failed_sources` and their filters are silently skipped (no exception thrown).
 - **Columns read from external basket parquets**: `Date` plus whichever `metric` columns appear in filters with that `source` slug.
 
-**Full `BacktestRequest` schema** (`app/backend/main.py:2161`):
+**Full `BacktestRequest` schema** (`app/backend/main.py:2187`):
 ```
 {
   target: str,
@@ -365,12 +365,13 @@
   start_date: str | null,
   end_date: str | null,
   position_size: float,           // default 1.0
-  initial_equity: float,          // default 100000
   max_leverage: float,            // default 2.5 — now multiplies position sizes (wanted = equity * pos_size * max_lev)
 }
 ```
 
-**Breaking change from prior version**: `benchmarks_only: bool` and `include_positions: bool` fields have been REMOVED from `BacktestRequest`. Any frontend code still sending these fields will have them silently ignored by Pydantic (extra fields are ignored by default in FastAPI). The fast-path equity curve behavior (`benchmarks_only=true`) and position snapshotting (`include_positions=true`) are no longer supported by this endpoint.
+**Breaking changes from prior versions**:
+- `benchmarks_only: bool` and `include_positions: bool` fields REMOVED (2026-03-16). Silently ignored by Pydantic.
+- `initial_equity: float` field REMOVED (2026-03-18). Equity is now hardcoded to `1.0` internally (line 2846). All equity curve values and trade allocations are expressed as fractions of 1.0. Frontend consumers that previously assumed dollar values must now interpret equity curves as unit-normalized.
 
 **Response shape** (updated 2026-03-18 — `daily_positions` added):
 ```
@@ -391,20 +392,31 @@
 - Each entry contains `exposure_pct` (total exposure / equity), `equity` (filtered equity at that date), and `positions` array with per-position detail: `trade_idx`, `ticker`, `entry_date`, `alloc` (dollar allocation), `weight` (alloc / equity), `daily_return`, `contribution` (weight * daily_return).
 - `null` when no positions exist (no trades taken).
 
-**`Buy_Hold` signal support** (added 2026-03-18, `app/backend/main.py:2445` + `2188`):
+**`Buy_Hold` signal support** (added 2026-03-18, `app/backend/main.py:2445` + `2212`):
 - When `entry_signal == 'Buy_Hold'`, the endpoint delegates to `_build_buy_hold()` (single-leg) or the Buy_Hold branch inside `_build_leg_trades()` (multi-leg).
 - Loads the Close series from the basket parquet (`_find_basket_parquet()`) or individual signals parquet, then builds a single trade spanning the full date range.
-- Returns equity curve (scaled by `initial_equity`), stats (1 trade, max drawdown from cummax), and a single trade with MFE/MAE.
+- Returns equity curve (normalized to start at `1.0`), stats (1 trade, max drawdown from cummax), and a single trade with MFE/MAE.
 - **Not supported** for `target_type == 'basket_tickers'` — raises HTTP 400.
 - `Buy_Hold` is in `SIGNAL_TYPES` and `BACKTEST_DIRECTION` (`'long'`) but intentionally NOT in `SIGNAL_IS_COL` — it has no `Is_*` column in the parquets.
 - **Note**: `get_basket_summary()` iterates `SIGNAL_TYPES` and indexes `SIGNAL_IS_COL[st]` — `Buy_Hold` would cause a `KeyError` there if reached. Currently the iteration at line 1518 is only for building `cols_needed` and will fail on startup/first call. This is a latent bug introduced by adding `Buy_Hold` to `SIGNAL_TYPES` without guarding the summary code.
 
-**Leverage now multiplies position sizes** (changed 2026-03-18, both endpoints):
-- **Previous behavior**: `wanted = equity * pos_size`, leverage only acted as an exposure cap (`equity * max_lev`).
-- **Current behavior**: `wanted = equity * pos_size * max_lev`, cap = `equity * max_lev`. This means leverage amplifies position sizing, not just limits exposure.
-- Applies to both `POST /api/backtest` (line 2814: `wanted = eq_est * pos_size * max_lev`) and `POST /api/backtest/multi` (line 3139: same formula per leg, both allocated and standalone paths).
+**Leverage enforcement uses MTM exposure** (changed 2026-03-18, both endpoints):
+- Exposure is computed as `equity - cash` (mark-to-market), not `sum(allocs)`. This means appreciated positions count at current market value, not initial allocation.
+- `mtm_equity()` function (`app/backend/main.py:2864` single-leg, `:3256` multi-leg) marks all open positions to market via `ticker_closes.asof(close_date)`.
+- Leverage formula: `wanted = equity * pos_size * max_lev`, `exposure = equity - cash`, `room = max(0, equity * max_lev - exposure)`, `alloc = min(wanted, room)`.
+- **Previous behavior**: `wanted = equity * pos_size`, leverage only acted as an exposure cap.
+- **Current behavior**: Leverage amplifies position sizing AND caps total MTM exposure.
+- Applies to both `POST /api/backtest` (line 2921) and `POST /api/backtest/multi` (lines 3309-3310 allocated path, 3323-3324 standalone path).
 
-**`_build_leg_trades()` helper** (`app/backend/main.py:2188`): Function extracted to encapsulate trade-building logic (data loading, filter application, signal detection, membership filtering, trade construction, Buy_Hold branch). Called by `run_multi_backtest()` via the multi-backtest path. The single `POST /api/backtest` endpoint has its own inline implementation — not yet refactored to call `_build_leg_trades()`.
+**Trade dict fields** (updated 2026-03-18):
+- Trade dicts now include three additional fields: `entry_weight`, `exit_weight`, `contribution`.
+- `entry_weight`: fraction of portfolio equity allocated at entry (`alloc / equity` at entry date). Set during equity curve simulation.
+- `exit_weight`: fraction of pre-exit portfolio equity at exit (`exit_value / pre_exit_equity`). Set during exit processing.
+- `contribution`: `entry_weight * return`. Approximates the trade's contribution to portfolio-level return.
+- All three initialized to `None` in trade construction (lines 2259-2261, 2472-2474, 2797-2799) and populated during the equity curve loop.
+- For multi-leg, trade weights are recomputed relative to combined portfolio equity in a post-processing pass (lines 3433-3444).
+
+**`_build_leg_trades()` helper** (`app/backend/main.py:2212`): Function extracted to encapsulate trade-building logic (data loading, filter application, signal detection, membership filtering, trade construction, Buy_Hold branch). Called by `run_multi_backtest()` via the multi-backtest path. The single `POST /api/backtest` endpoint has its own inline implementation — not yet refactored to call `_build_leg_trades()`.
 
 **Regime filter column contract**: When filters are applied, the following columns must be present in the respective parquet:
 - `pct_metrics`: `Uptrend_Pct`, `Breakout_Pct`, `Correlation_Pct`, `RV_EMA`, `Breakdown_Pct`, `Downtrend_Pct` — all present in basket signals parquets (written by `_finalize_basket_signals_output()`)
@@ -419,18 +431,19 @@
 
 ### `POST /api/backtest/multi` — multi-leg basket backtest (updated 2026-03-18)
 
-**Request model** — `MultiBacktestRequest` (`app/backend/main.py:2180`):
+**Request model** — `MultiBacktestRequest` (`app/backend/main.py:2205`):
 ```
 {
-  legs: MultiBacktestLeg[],   // at least 2 (renamed from MultiBasketLeg)
+  legs: MultiBacktestLeg[],   // 1 or more (unified panel sends single-leg here too)
   start_date: str | null,
   end_date: str | null,
-  initial_equity: float,      // default 100000
   max_leverage: float,        // default 2.5
 }
 ```
 
-**`MultiBacktestLeg`** (`app/backend/main.py:2172`) — renamed from `MultiBasketLeg`:
+**Breaking change**: `initial_equity` field REMOVED (2026-03-18). Equity is now hardcoded to `1.0` internally (line 3081). The "at least 2 legs" constraint is no longer enforced — the unified `BacktestPanel.tsx` sends single-leg requests here too.
+
+**`MultiBacktestLeg`** (`app/backend/main.py:2197`) — renamed from `MultiBasketLeg`:
 ```
 {
   target: str,                // basket name or ticker
@@ -446,15 +459,18 @@
 
 **Key design detail**: `position_size` is per-leg — each leg sizes positions as a fraction of its own allocated equity. Leverage multiplies position sizes: `wanted = equity * pos_size * max_lev`, capped at `equity * max_lev`.
 
-**Response shape** (updated 2026-03-18 — `trade_paths` added per leg, `per_leg` standalone, `daily_positions` fixed):
+**Response shape** (updated 2026-03-18 — nested stats, `leg_correlations`, `trade_paths` per leg, `per_leg` standalone, `daily_positions` fixed):
 ```
 {
   legs: [                         // one per input leg
     {
       target, target_type, entry_signal, allocation_pct, direction,
-      trades: [...],              // per-leg trade list
-      trade_paths: number[][],    // daily % return paths from entry to exit for each trade (added 2026-03-18)
-      stats: { trades, win_rate, avg_winner, avg_loser, ev, profit_factor, max_dd, avg_bars }
+      trades: [...],              // per-leg trade list (each trade includes entry_weight, exit_weight, contribution)
+      trade_paths: number[][],    // daily % return paths from entry to exit for each trade
+      stats: {                    // NESTED FORMAT (changed 2026-03-18)
+        portfolio: { strategy_return, cagr, volatility, max_dd, sharpe, sortino, contribution, allocation },
+        trade: { trades_met_criteria, trades_taken, trades_skipped, win_rate, avg_winner, avg_loser, ev, profit_factor, avg_time_winner, avg_time_loser }
+      }
     },
     ...
   ],
@@ -462,21 +478,38 @@
     equity_curve: {
       dates: ["YYYY-MM-DD", ...],
       combined: [float, ...],     // summed equity across all legs (uses allocated capital)
-      per_leg: [[float, ...], ...], // per-leg STANDALONE equity series (starts at initial_equity, not initial * alloc_pct)
-      buy_hold: [float, ...],     // quarterly-rebalanced buy-and-hold benchmark
+      per_leg: [[float, ...], ...], // per-leg STANDALONE equity series (starts at 1.0)
+      buy_hold: [float, ...],     // buy-and-hold benchmark from first basket leg
     },
-    stats: { ... },               // stats computed on all trades merged
+    stats: {                      // same nested format as per-leg stats
+      portfolio: { strategy_return, cagr, volatility, max_dd, sharpe, sortino },
+      trade: { trades_met_criteria, trades_taken, trades_skipped, win_rate, avg_winner, avg_loser, ev, profit_factor, avg_time_winner, avg_time_loser }
+    },
   },
   date_range: { min, max },
   skipped_entries: [...] | null,  // includes leg_index and leg_target fields
-  daily_positions: { [int_date_idx]: { exposure_pct, equity, positions: [...] } } | null
+  daily_positions: { [int_date_idx]: { exposure_pct, equity, positions: [...] } } | null,
+  leg_correlations: { [target_i]: { [target_j]: float, ... }, ... } | null   // pairwise daily-return correlation between legs
 }
 ```
 
+**Nested stats format** (changed 2026-03-18):
+- `compute_stats()` inside `run_multi_backtest()` (line 3085) now returns `{ portfolio: {...}, trade: {...} }` instead of a flat dict.
+- `portfolio` sub-object: `strategy_return`, `cagr`, `volatility`, `max_dd`, `sharpe`, `sortino`. Per-leg stats also get `contribution` and `allocation` appended post-hoc (lines 3547-3558).
+- `trade` sub-object: `trades_met_criteria` (total signals before leverage/cash filtering), `trades_taken`, `trades_skipped`, `win_rate`, `avg_winner`, `avg_loser`, `ev`, `profit_factor`, `avg_time_winner`, `avg_time_loser`.
+- **Note**: The single-leg `POST /api/backtest` still uses a FLAT stats format (`{ trades, win_rate, avg_winner, avg_loser, ev, profit_factor, max_dd, avg_bars }`) — the nested format is multi-leg only.
+
+**`leg_correlations`** (new field, 2026-03-18):
+- Pairwise Pearson correlation of daily returns between each leg's standalone equity curve.
+- Only computed when there are 2+ legs AND the minimum curve length exceeds 10 days.
+- Keyed by `target` string (basket/ticker name) for both dimensions.
+- `null` when not computable (single leg or too few data points).
+- Implementation: `app/backend/main.py:3523-3545` — uses `np.corrcoef` on daily returns matrix.
+
 **`per_leg` standalone curves** (changed 2026-03-18):
 - **Previous behavior**: `per_leg` showed allocated-capital curves (starting at `initial_equity * allocation_pct`).
-- **Current behavior**: Two parallel simulations run per leg — an allocated path (for combining via sum into the `combined` curve) and a standalone path (starts at full `initial_equity`, runs its own equity/cash tracking). The `per_leg` array in the response uses the standalone curves for chart display. This means each leg's curve shows what performance would look like if that leg had the full portfolio.
-- Implementation: `per_leg_equity` (allocated, for combined sum) vs `per_leg_standalone` (standalone, for `per_leg` response). See `app/backend/main.py:3058–3059`.
+- **Current behavior**: Two parallel simulations run per leg — an allocated path (for combining via sum into the `combined` curve, starting at `1.0 * allocation_pct`) and a standalone path (starts at full `1.0`, runs its own equity/cash tracking). The `per_leg` array in the response uses the standalone curves for chart display. This means each leg's curve shows what performance would look like if that leg had the full portfolio.
+- Implementation: `per_leg_equity` (allocated, for combined sum) vs `per_leg_standalone` (standalone, for `per_leg` response). See `app/backend/main.py:3381–3382`.
 
 **`daily_positions` fix** (changed 2026-03-18):
 - **Previous behavior**: Keyed by string date values (e.g. `"2024-01-15"`).
@@ -487,39 +520,39 @@
 **`trade_paths` per leg** (added 2026-03-18):
 - Each leg response now includes `trade_paths: number[][]` — daily percentage return paths from entry to exit for every trade in that leg.
 - Computed from `ticker_closes` per-ticker close series: `path[i] = close[i] / entry_price - 1`.
-- Enables the Path tab in `MultiBacktestPanel` for visualizing individual trade trajectories across legs.
+- Enables the Path tab in the unified `BacktestPanel` for visualizing individual trade trajectories across legs.
 
 **Buy-and-hold benchmark**: Single-leg B&H — uses the largest-allocation leg's basket/ticker Close series as the benchmark. The buy-and-hold tracks the first available close in the date range and scales proportionally. Falls back to the first leg if no clear largest-allocation leg exists.
 
-**Helper function** — `_build_leg_trades()` (`app/backend/main.py:2188`) — replaces `_build_leg_data()`:
+**Helper function** — `_build_leg_trades()` (`app/backend/main.py:2212`) — replaces `_build_leg_data()`:
 - Extracts trade-building logic (data loading, filter application — including external source merging — signal detection, membership filtering, trade construction, Buy_Hold branch) into a reusable function.
 - Returns `(trades, df, ticker_closes, direction)`.
 - Called by `run_multi_backtest()`. The single `POST /api/backtest` endpoint still has its own inline implementation.
 
-**Frontend consumer**: `app/frontend/src/components/MultiBacktestPanel.tsx` — dedicated panel that constructs a `MultiBacktestRequest` and renders per-leg trades/stats, combined equity curve, and trade path visualization (Path tab).
+**Frontend consumer**: `app/frontend/src/components/BacktestPanel.tsx` (unified, replaces both old `BacktestPanel` + `MultiBacktestPanel`) — constructs a `MultiBacktestRequest` for ALL backtests (single-leg and multi-leg). Renders per-leg trades/stats with nested `{ portfolio, trade }` stats format, combined equity curve with per-leg overlays, and trade path visualization (Path tab). The old `MultiBacktestPanel.tsx` is retained as `MultiBacktestPanel_old.tsx` but is no longer imported by `App.tsx`.
 
 ---
 
 ## Frontend Component Integration Notes
 
-### BacktestPanel — Overlay Toggle Props Removed (2026-03-16); equity curve percentage-based (2026-03-18)
-- **Previous behavior**: `App.tsx` passed overlay toggle props to `BacktestPanel` via its interface: `showPivots`, `showTargets`, `showVolume`, `showBreadth`, `showBreakout`, `showCorrelation`. Also, on submit, `BacktestPanel` fired 7 parallel POST requests: 1 main + 6 benchmark calls with `benchmarks_only: true`.
-- **Current behavior**: All six toggle props removed from `BacktestPanel`'s interface (internally managed). `benchmarks_only` and `include_positions` fields also removed from `BacktestRequest` model in the backend.
-- **Equity curve percentage rebasing** (added 2026-03-18): All equity curve series (filtered, unfiltered, buy_hold, benchmarks) are rebased to 0% return from the visible window start. The `rebase()` function divides each value by the first visible value and subtracts 1, converting to percentage returns. Y-axis shows percentages with a breakeven line at 0%. This rebasing applies dynamically when scrolling/zooming or selecting timeframe presets.
-- **Impact**: No backend/data contract change beyond what is noted in the `POST /api/backtest` section. Percentage display is purely a frontend presentation change.
-
-### MultiBacktestPanel — Multi-leg backtest UI (2026-03-16, updated 2026-03-18)
-- **Component**: `app/frontend/src/components/MultiBacktestPanel.tsx`
-- **Backend endpoint**: `POST /api/backtest/multi` (see endpoint section above for full request/response schema)
-- **Renders**: Per-leg trade tables and stats, combined equity curve chart with per-leg overlay and quarterly-rebalanced buy-and-hold, daily position snapshots across all legs.
-- **Equity curve percentage rebasing** (added 2026-03-18): Same percentage-based rebasing as `BacktestPanel` — all series rebased to 0% return from visible window start.
-- **Path tab** (added 2026-03-18): Trade paths chart visualizing daily percentage return trajectories from entry to exit for all trades across all legs. Includes a sortable legend with columns: Leg, Ticker, Date, Chg. Uses `trade_paths` from each leg in the response. Hovered paths are highlighted; legend entries are color-coded by leg.
-- **Also referenced in**: `app/frontend/src/App.tsx` (imported and routed)
+### BacktestPanel — Unified single+multi-leg backtest UI (2026-03-18, replaces old BacktestPanel + MultiBacktestPanel)
+- **Component**: `app/frontend/src/components/BacktestPanel.tsx`
+- **Backend endpoint**: `POST /api/backtest/multi` — ALL backtests (single-leg and multi-leg) are sent to the multi endpoint now.
+- **Previous behavior**: Separate `BacktestPanel` (single-leg, called `POST /api/backtest`) and `MultiBacktestPanel` (multi-leg, called `POST /api/backtest/multi`). `App.tsx` imported both.
+- **Current behavior**: Single unified component. Uses `LegConfig[]` state array — starts with 1 leg, user can add up to 6. When `isSingleLeg` (1 leg), the request is sent to `/api/backtest/multi` with `allocation_pct: 1.0`. The component adapts its UI based on leg count (e.g. allocation controls only shown for multi-leg).
+- **Stats display**: Expects nested `{ portfolio: {...}, trade: {...} }` stats format from the multi endpoint response. The `PortfolioStats` and `TradeStats` TypeScript interfaces match the backend's `compute_stats()` output shape.
+- **Response interface**: `MultiBacktestResult` with `legs[]`, `combined`, `date_range`, `skipped_entries`, `daily_positions`, `leg_correlations`.
+- **Trade interface**: Includes `entry_weight`, `exit_weight`, `contribution` fields (all `number | null`).
+- **Equity curve percentage rebasing**: All series rebased to 0% return from visible window start. Y-axis shows percentages with a breakeven line at 0%.
+- **Path tab**: Trade paths chart visualizing daily percentage return trajectories. Includes sortable legend with columns: Leg, Ticker, Date, Chg. Hovered paths are highlighted; legend entries are color-coded by leg.
+- **Benchmark auto-fire**: For single-leg backtests, automatically fires parallel benchmark requests for all other signal types (excluding `Buy_Hold`) to the same `/api/backtest/multi` endpoint.
+- **Old components**: `BacktestPanel_old.tsx` and `MultiBacktestPanel_old.tsx` are retained but not imported by `App.tsx`. `MultiBacktestPanel.tsx` still exists but is NOT imported.
+- **Also referenced in**: `app/frontend/src/App.tsx` (sole import: `import { BacktestPanel } from './components/BacktestPanel'`)
 
 ### BacktestPanel — Leverage Preset Buttons & Uniform Sizing (2026-03-16)
-- **Added**: `LEV_PRESETS = [100, 110, 125, 150, 200, 250]` constant and a row of leverage preset buttons (`.backtest-pos-preset`) in the Position Sizing config section. Clicking a button sets `maxLeverage` state, which is sent as `max_leverage: maxLeverage / 100` to `POST /api/backtest` (unchanged contract).
+- **Added**: `LEV_PRESETS = [100, 110, 125, 150, 200, 250]` constant and a row of leverage preset buttons (`.backtest-pos-preset`) in the Position Sizing config section. Clicking a button sets `maxLeverage` state, which is sent as `max_leverage: maxLeverage / 100` to `POST /api/backtest/multi` (unchanged contract).
 - **CSS changes** (`index.css`): Added `.backtest-pos-preset` / `.backtest-pos-preset.wide` button styles, uniform `.control-btn` sizing (120px x 32px), `.sidebar-header` and `.main-header` both pinned to `height: 114px` for alignment, `.backtest-results-header` height fixed to 41px to match accordion row heights.
-- **Impact**: No backend/data contract change. The `POST /api/backtest` request body already accepted `max_leverage`; preset buttons are a UI convenience only.
+- **Impact**: No backend/data contract change. The request body already accepted `max_leverage`; preset buttons are a UI convenience only.
 
 ### AnalogsPanel — Regime analog search UI (2026-03-17)
 - **Component**: `app/frontend/src/components/AnalogsPanel.tsx`
