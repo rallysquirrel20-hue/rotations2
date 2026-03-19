@@ -89,6 +89,24 @@ def _read_live_parquet(path):
     except Exception:
         return None
 
+
+def _live_is_current(live_df, norgate_max_date):
+    """Return True if the live parquet date is strictly newer than Norgate.
+
+    When Norgate updates after market close, it will have the same date as the
+    live file from that trading day.  In that case Norgate's end-of-day data is
+    authoritative, so the live overlay should be skipped.  The live file is only
+    useful when its date is ahead of Norgate (i.e. market is open, Norgate
+    hasn't updated yet).
+    """
+    if live_df is None or live_df.empty:
+        return False
+    try:
+        live_date = pd.to_datetime(live_df['Date'].iloc[0])
+        return live_date > pd.to_datetime(norgate_max_date)
+    except Exception:
+        return False
+
 def _find_basket_parquet(slug):
     """Glob for a basket parquet by slug prefix across basket cache folders. Returns path or None."""
     for folder in BASKET_CACHE_FOLDERS:
@@ -316,14 +334,18 @@ def _compute_live_breadth(basket_name):
     if live_df is None:
         return {}
 
+    # Skip live overlay if Norgate already has newer data (market closed)
+    needed_cols = ['Ticker', 'Date', 'Close', 'Trend', 'Resistance_Pivot', 'Support_Pivot',
+                   'Upper_Target', 'Lower_Target', 'Is_Breakout_Sequence']
+    hist = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=needed_cols, filters=[('Ticker', 'in', tickers)])
+    if not _live_is_current(live_df, hist['Date'].max()):
+        return {}
+
     live_prices = live_df[live_df['Ticker'].isin(tickers)].set_index('Ticker')
     if live_prices.empty:
         return {}
     live_close = live_prices['Close'].to_dict()
 
-    needed_cols = ['Ticker', 'Date', 'Close', 'Trend', 'Resistance_Pivot', 'Support_Pivot',
-                   'Upper_Target', 'Lower_Target', 'Is_Breakout_Sequence']
-    hist = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=needed_cols, filters=[('Ticker', 'in', tickers)])
     last = hist.sort_values('Date').groupby('Ticker').tail(1).set_index('Ticker')
 
     breadth = _tally_breadth(tickers, live_close, last)
@@ -469,28 +491,31 @@ def get_basket_breadth():
     try:
         live_df = _read_live_parquet(LIVE_SIGNALS_FILE)
         if live_df is not None:
-            live_close = live_df.set_index('Ticker')['Close'].to_dict()
             needed_cols = ['Ticker', 'Date', 'Trend', 'Resistance_Pivot', 'Support_Pivot',
                            'Upper_Target', 'Lower_Target', 'Is_Breakout_Sequence']
             hist = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=needed_cols,
-                                   filters=[('Ticker', 'in', list(live_close.keys()))])
-            last_hist = hist.sort_values('Date').groupby('Ticker').tail(1).set_index('Ticker')
+                                   filters=[('Ticker', 'in', list(live_df['Ticker'].unique()))])
+            norgate_max_date = hist['Date'].max()
 
-            for slug in list(result.keys()):
-                tickers = get_latest_universe_tickers(slug)
-                if not tickers:
-                    continue
-                breadth = _tally_breadth(tickers, live_close, last_hist)
-                if breadth:
-                    result[slug]['uptrend_pct'] = breadth['Uptrend_Pct']
-                    result[slug]['breakout_pct'] = breadth['Breakout_Pct']
+            if _live_is_current(live_df, norgate_max_date):
+                live_close = live_df.set_index('Ticker')['Close'].to_dict()
+                last_hist = hist.sort_values('Date').groupby('Ticker').tail(1).set_index('Ticker')
+
+                for slug in list(result.keys()):
+                    tickers = get_latest_universe_tickers(slug)
+                    if not tickers:
+                        continue
+                    breadth = _tally_breadth(tickers, live_close, last_hist)
+                    if breadth:
+                        result[slug]['uptrend_pct'] = breadth['Uptrend_Pct']
+                        result[slug]['breakout_pct'] = breadth['Breakout_Pct']
     except Exception:
         pass
 
     # Overlay live basket equity curve signals using live basket OHLC + cached pivots
     try:
         live_basket_df = _read_live_parquet(LIVE_BASKET_SIGNALS_FILE)
-        if live_basket_df is not None:
+        if live_basket_df is not None and _live_is_current(live_basket_df, norgate_max_date if 'norgate_max_date' in dir() else pd.Timestamp.min):
             name_col = 'BasketName' if 'BasketName' in live_basket_df.columns else 'Basket'
             for slug, entry in result.items():
                 pivots = entry.get('_pivots')
@@ -541,7 +566,7 @@ logger.info(f"DATA_STORAGE: {DATA_STORAGE} (exists={DATA_STORAGE.exists()})")
 logger.info(f"INDIVIDUAL_SIGNALS_FILE: {INDIVIDUAL_SIGNALS_FILE} (exists={INDIVIDUAL_SIGNALS_FILE.exists()})")
 
 @app.get("/api/baskets/returns")
-def get_basket_returns(start: str = None, end: str = None, mode: str = "period", basket: str = None, group: str = "all", top_n: int = 10, threshold: float = 0.0):
+def get_basket_returns(start: str = None, end: str = None, mode: str = "period", basket: str = None, group: str = "all", top_n: int = 10, threshold: float = 0.0, conditions: str = None):
     """Cross-basket period returns or single-basket daily returns time series."""
     t_names = list(THEMATIC_CONFIG.keys())
     s_names = ["Communication_Services", "Consumer_Discretionary", "Consumer_Staples", "Energy", "Financials", "Health_Care", "Industrials", "Information_Technology", "Materials", "Real_Estate", "Utilities"]
@@ -582,11 +607,11 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
         except Exception:
             continue
 
-    # Read live basket closes for today overlay
+    # Read live basket closes for today overlay (skip if stale)
     live_closes = {}  # slug -> (date, close)
     try:
         live_basket_df = _read_live_parquet(LIVE_BASKET_SIGNALS_FILE)
-        if live_basket_df is not None:
+        if live_basket_df is not None and _live_is_current(live_basket_df, global_max if global_max else pd.Timestamp.min):
             name_col = 'BasketName' if 'BasketName' in live_basket_df.columns else 'Basket'
             for _, row in live_basket_df.iterrows():
                 bname = row[name_col]
@@ -771,22 +796,28 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
             return {"current": None, "analogs": [], "date_range": date_range, "message": "Window too short (< 5 days)"}
 
         # Helper: rank across baskets (handles NaN by giving worst rank)
-        def rank_vec(v):
-            """Rank values 1..B. NaN gets rank B."""
+        def rank_vec(v, descending=False):
+            """Rank values 1..B. descending=True: 1=highest. NaN gets rank B."""
             out = np.full(len(v), float(len(v)))
             valid = ~np.isnan(v)
-            if valid.sum() > 0:
+            nv = valid.sum()
+            if nv > 0:
                 order = np.argsort(v[valid])
-                ranks = np.empty_like(order, dtype=float)
-                ranks[order] = np.arange(1, valid.sum() + 1, dtype=float)
+                ranks = np.empty(nv, dtype=float)
+                if descending:
+                    ranks[order] = np.arange(nv, 0, -1, dtype=float)
+                else:
+                    ranks[order] = np.arange(1, nv + 1, dtype=float)
                 out[valid] = ranks
             return out
 
         # Current fingerprint
+        # Returns, breadth, breakout: 1 = highest (descending)
+        # Correlation, volatility: 1 = lowest (ascending)
         cur_ret = close_mat[end_idx] / close_mat[start_idx] - 1
-        cur_ret_ranks = rank_vec(cur_ret)
-        cur_upt_ranks = rank_vec(uptrend_mat[end_idx])
-        cur_bkt_ranks = rank_vec(breakout_mat[end_idx])
+        cur_ret_ranks = rank_vec(cur_ret, descending=True)
+        cur_upt_ranks = rank_vec(uptrend_mat[end_idx], descending=True)
+        cur_bkt_ranks = rank_vec(breakout_mat[end_idx], descending=True)
         cur_cor_ranks = rank_vec(corr_mat[end_idx])
         cur_rv_ranks = rank_vec(rv_mat[end_idx])
 
@@ -800,22 +831,26 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
         N_windows = roll_ret.shape[0]
 
         # Rank each metric for all windows: vectorized argsort
-        def rank_matrix(mat):
+        def rank_matrix(mat, descending=False):
             """Rank across axis=1 for each row. NaN → rank B."""
             R = np.full_like(mat, float(B))
             for i in range(mat.shape[0]):
                 valid = ~np.isnan(mat[i])
-                if valid.sum() == 0:
+                nv = valid.sum()
+                if nv == 0:
                     continue
                 order = np.argsort(mat[i][valid])
-                ranks = np.empty(valid.sum(), dtype=float)
-                ranks[order] = np.arange(1, valid.sum() + 1, dtype=float)
+                ranks = np.empty(nv, dtype=float)
+                if descending:
+                    ranks[order] = np.arange(nv, 0, -1, dtype=float)
+                else:
+                    ranks[order] = np.arange(1, nv + 1, dtype=float)
                 R[i][valid] = ranks
             return R
 
-        rr_ret = rank_matrix(roll_ret)
-        rr_upt = rank_matrix(roll_upt)
-        rr_bkt = rank_matrix(roll_bkt)
+        rr_ret = rank_matrix(roll_ret, descending=True)
+        rr_upt = rank_matrix(roll_upt, descending=True)
+        rr_bkt = rank_matrix(roll_bkt, descending=True)
         rr_cor = rank_matrix(roll_cor)
         rr_rv = rank_matrix(roll_rv)
 
@@ -832,14 +867,14 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
         rho_rv = spearman_vec(cur_rv_ranks, rr_rv)
 
         # Multi-timeframe return fingerprints
-        MULTI_TF = {"1Q": 63, "1Y": 252, "3Y": 756, "5Y": 1260}
+        MULTI_TF = {"1D": 1, "1W": 5, "1M": 21, "1Q": 63, "1Y": 252, "3Y": 756, "5Y": 1260}
         rho_tf_list = []
         cur_tf_returns = {}  # for current.metrics
         for tf_label, W_t in MULTI_TF.items():
             if end_idx < W_t:
                 continue  # not enough history for this timeframe
             cur_tf_ret = close_mat[end_idx] / close_mat[max(0, end_idx - W_t)] - 1
-            cur_tf_ranks = rank_vec(cur_tf_ret)
+            cur_tf_ranks = rank_vec(cur_tf_ret, descending=True)
             cur_tf_returns[tf_label] = cur_tf_ret
             # Vectorized: compute roll_tf as matrix (N_windows, B) then rank
             roll_tf_mat = np.full((N_windows, B), np.nan)
@@ -848,7 +883,7 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
                 s_tf = e - W_t
                 if s_tf >= 0 and e < T:
                     roll_tf_mat[i] = close_mat[e] / close_mat[s_tf] - 1
-            rr_tf = rank_matrix(roll_tf_mat)
+            rr_tf = rank_matrix(roll_tf_mat, descending=True)
             rho_tf = spearman_vec(cur_tf_ranks, rr_tf)
             rho_tf_list.append(rho_tf)
 
@@ -911,7 +946,7 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
         cur_tf_rank_vecs = {}
         for tf_label in MULTI_TF:
             if tf_label in cur_tf_returns:
-                cur_tf_rank_vecs[tf_label] = rank_vec(cur_tf_returns[tf_label])
+                cur_tf_rank_vecs[tf_label] = rank_vec(cur_tf_returns[tf_label], descending=True)
         for tf_label in MULTI_TF:
             current_metrics[f"returns_{tf_label}"] = {}
             current_ranks[f"returns_{tf_label}"] = {}
@@ -1068,6 +1103,273 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
             "date_range": date_range,
         }
 
+    # ── mode=query: condition-based historical search ──
+    if mode == "query":
+        try:
+            conds = json.loads(conditions) if conditions else []
+        except Exception:
+            conds = []
+
+        # Load all baskets (respect group filter for ranking context)
+        slugs = []
+        for slug in sorted(all_slugs):
+            cat = _categorize(slug)
+            if group != "all":
+                if group == "themes" and cat != "theme": continue
+                if group == "sectors" and cat != "sector": continue
+                if group == "industries" and cat != "industry": continue
+            slugs.append(slug)
+
+        COLS = ['Date', 'Close', 'Uptrend_Pct', 'Breakout_Pct', 'Correlation_Pct', 'RV_EMA']
+        basket_frames = {}
+        for slug in slugs:
+            pf = _find_basket_parquet(slug)
+            if not pf: continue
+            try:
+                df = pd.read_parquet(pf, columns=COLS)
+                df['Date'] = pd.to_datetime(df['Date'])
+                df = df.sort_values('Date').drop_duplicates(subset=['Date'])
+                if slug in live_closes:
+                    ld, lc = live_closes[slug]
+                    if ld not in df['Date'].values:
+                        df = pd.concat([df, pd.DataFrame({'Date': [ld], 'Close': [lc],
+                            'Uptrend_Pct': [np.nan], 'Breakout_Pct': [np.nan],
+                            'Correlation_Pct': [np.nan], 'RV_EMA': [np.nan]})],
+                            ignore_index=True).sort_values('Date')
+                basket_frames[slug] = df.set_index('Date')
+            except Exception:
+                continue
+
+        if len(basket_frames) < 3:
+            return {"matches": [], "aggregate": {}, "match_count": 0, "date_range": date_range}
+
+        ordered_slugs = sorted(basket_frames.keys())
+        B = len(ordered_slugs)
+        all_dates = sorted(set().union(*(df.index for df in basket_frames.values())))
+        date_idx = pd.DatetimeIndex(all_dates)
+        T = len(date_idx)
+        slug_to_j = {s: j for j, s in enumerate(ordered_slugs)}
+
+        close_mat = np.full((T, B), np.nan)
+        q_uptrend_mat = np.full((T, B), np.nan)
+        q_breakout_mat = np.full((T, B), np.nan)
+        q_corr_mat = np.full((T, B), np.nan)
+        q_rv_mat = np.full((T, B), np.nan)
+
+        for j, slug in enumerate(ordered_slugs):
+            df = basket_frames[slug]
+            idxs = date_idx.searchsorted(df.index)
+            valid = idxs < T
+            idxs = idxs[valid]
+            close_mat[idxs, j] = df['Close'].values[valid]
+            q_uptrend_mat[idxs, j] = df['Uptrend_Pct'].values[valid]
+            q_breakout_mat[idxs, j] = df['Breakout_Pct'].values[valid]
+            q_corr_mat[idxs, j] = df['Correlation_Pct'].values[valid]
+            q_rv_mat[idxs, j] = df['RV_EMA'].values[valid]
+
+        for mat in [close_mat, q_uptrend_mat, q_breakout_mat, q_corr_mat, q_rv_mat]:
+            for j in range(B):
+                col = mat[:, j]
+                m = np.isnan(col)
+                if m.all(): continue
+                idx_arr = np.where(~m, np.arange(T), 0)
+                np.maximum.accumulate(idx_arr, out=idx_arr)
+                mat[:, j] = col[idx_arr]
+                first_valid = np.argmax(~m)
+                mat[:first_valid, j] = np.nan
+
+        # Lookback return matrices
+        LOOKBACKS = {"return_1D": 1, "return_1W": 5, "return_1M": 21, "return_1Q": 63, "return_1Y": 252}
+        ret_mats = {}
+        for key, lb in LOOKBACKS.items():
+            mat = np.full((T, B), np.nan)
+            if lb < T:
+                mat[lb:] = close_mat[lb:] / close_mat[:-lb] - 1
+            ret_mats[key] = mat
+
+        metric_mats = {
+            **ret_mats,
+            "uptrend_pct": q_uptrend_mat,
+            "breakout_pct": q_breakout_mat,
+            "correlation_pct": q_corr_mat,
+            "rv_ema": q_rv_mat,
+        }
+
+        cat_map = {"sectors": "sector", "themes": "theme", "industries": "industry"}
+
+        # Pre-compute rank matrices (rank 1 = lowest value, rank B = highest)
+        rank_mats = {}
+        for mkey, mat in metric_mats.items():
+            R = np.full((T, B), np.nan)
+            for t in range(T):
+                row = mat[t]
+                v = ~np.isnan(row)
+                nv = v.sum()
+                if nv == 0: continue
+                order = np.argsort(row[v])
+                ranks = np.empty(nv, dtype=float)
+                ranks[order] = np.arange(1, nv + 1, dtype=float)
+                R[t, v] = ranks
+            rank_mats[mkey] = R
+
+        # Evaluate conditions
+        mask = np.ones(T, dtype=bool)
+        mask[:max(252, 5)] = False  # need lookback history
+
+        for cond in conds:
+            cbasket = cond.get("basket", "")
+            cmetric = cond.get("metric", "return_1D")
+            cop = cond.get("operator", "negative")
+            cval = float(cond.get("value", 0))
+
+            mat = metric_mats.get(cmetric)
+            rmat = rank_mats.get(cmetric)
+            if mat is None:
+                continue
+
+            if cbasket.startswith("*"):
+                # Group condition: ALL baskets in group must satisfy
+                gkey = cbasket[1:]
+                cat_val = cat_map.get(gkey, gkey)
+                group_js = [slug_to_j[s] for s in ordered_slugs if _categorize(s) == cat_val]
+
+                for j in group_js:
+                    col = mat[:, j]
+                    nan_mask = np.isnan(col)
+                    if cop == "positive":
+                        mask &= (col > 0) & ~nan_mask
+                    elif cop == "negative":
+                        mask &= (col < 0) & ~nan_mask
+                    elif cop == "above":
+                        mask &= (col > cval) & ~nan_mask
+                    elif cop == "below":
+                        mask &= (col < cval) & ~nan_mask
+                    elif cop == "top_n" and rmat is not None:
+                        nv_per_date = (~np.isnan(mat)).sum(axis=1)
+                        mask &= (rmat[:, j] > nv_per_date - int(cval)) & ~np.isnan(rmat[:, j])
+                    elif cop == "bottom_n" and rmat is not None:
+                        mask &= (rmat[:, j] <= int(cval)) & ~np.isnan(rmat[:, j])
+            else:
+                j = slug_to_j.get(cbasket)
+                if j is None:
+                    continue
+                col = mat[:, j]
+                nan_mask = np.isnan(col)
+
+                if cop == "positive":
+                    mask &= (col > 0) & ~nan_mask
+                elif cop == "negative":
+                    mask &= (col < 0) & ~nan_mask
+                elif cop == "above":
+                    mask &= (col > cval) & ~nan_mask
+                elif cop == "below":
+                    mask &= (col < cval) & ~nan_mask
+                elif cop == "top_n" and rmat is not None:
+                    nv_per_date = (~np.isnan(mat)).sum(axis=1)
+                    mask &= (rmat[:, j] > nv_per_date - int(cval)) & ~np.isnan(rmat[:, j])
+                elif cop == "bottom_n" and rmat is not None:
+                    mask &= (rmat[:, j] <= int(cval)) & ~np.isnan(rmat[:, j])
+
+        mask[-5:] = False  # need forward data
+
+        # Deduplicate: skip matches within 5 days of each other
+        match_indices_raw = np.where(mask)[0]
+        deduped = []
+        last_idx = -10
+        for idx in match_indices_raw:
+            if idx - last_idx >= 5:
+                deduped.append(idx)
+                last_idx = idx
+        match_indices = deduped[:100]
+
+        # Build matches with forward returns
+        Q_HORIZONS = {"1W": 5, "1M": 21, "3M": 63, "6M": 126}
+        matches = []
+        for idx in match_indices:
+            forward = {}
+            for hz_label, hz_days in Q_HORIZONS.items():
+                fwd_idx = idx + hz_days
+                if fwd_idx >= T:
+                    forward[hz_label] = None
+                else:
+                    fwd = {}
+                    for j, slug in enumerate(ordered_slugs):
+                        c_now = close_mat[idx, j]
+                        c_fwd = close_mat[fwd_idx, j]
+                        if np.isnan(c_now) or np.isnan(c_fwd) or c_now == 0:
+                            fwd[slug] = None
+                        else:
+                            fwd[slug] = round(float(c_fwd / c_now - 1), 6)
+                    forward[hz_label] = fwd
+
+            # Forward series (up to 126 days)
+            max_fwd = min(126, T - idx - 1)
+            fwd_dates = []
+            fwd_baskets = {slug: [] for slug in ordered_slugs}
+            for d in range(1, max_fwd + 1):
+                fwd_dates.append(date_idx[idx + d].strftime('%Y-%m-%d'))
+                for j, slug in enumerate(ordered_slugs):
+                    c_base = close_mat[idx, j]
+                    c_fwd = close_mat[idx + d, j]
+                    if np.isnan(c_base) or np.isnan(c_fwd) or c_base == 0:
+                        fwd_baskets[slug].append(None)
+                    else:
+                        fwd_baskets[slug].append(round(float(c_fwd / c_base - 1), 6))
+
+            matches.append({
+                "date": date_idx[idx].strftime('%Y-%m-%d'),
+                "forward": forward,
+                "forward_series": {"dates": fwd_dates, "baskets": fwd_baskets},
+            })
+
+        # Aggregate
+        aggregate = {}
+        for hz_label in Q_HORIZONS:
+            per_basket = {slug: [] for slug in ordered_slugs}
+            all_vals = []
+            for m in matches:
+                fwd = m["forward"].get(hz_label)
+                if not fwd: continue
+                for slug in ordered_slugs:
+                    v = fwd.get(slug)
+                    if v is not None:
+                        per_basket[slug].append(v)
+                        all_vals.append(v)
+            if all_vals:
+                arr = np.array(all_vals)
+                aggregate[hz_label] = {
+                    "mean": round(float(np.mean(arr)), 6),
+                    "median": round(float(np.median(arr)), 6),
+                    "min": round(float(np.min(arr)), 6),
+                    "max": round(float(np.max(arr)), 6),
+                    "std": round(float(np.std(arr)), 6),
+                    "count": len(all_vals),
+                    "per_basket": {},
+                }
+                for slug in ordered_slugs:
+                    vals = per_basket[slug]
+                    if vals:
+                        ba = np.array(vals)
+                        aggregate[hz_label]["per_basket"][slug] = {
+                            "mean": round(float(np.mean(ba)), 6),
+                            "median": round(float(np.median(ba)), 6),
+                            "min": round(float(np.min(ba)), 6),
+                            "max": round(float(np.max(ba)), 6),
+                            "std": round(float(np.std(ba)), 6),
+                            "count": len(vals),
+                        }
+            else:
+                aggregate[hz_label] = None
+
+        return {
+            "matches": matches,
+            "match_count": len(matches),
+            "total_searched": int(mask.sum() + (~mask).sum()),
+            "aggregate": aggregate,
+            "baskets": ordered_slugs,
+            "date_range": date_range,
+        }
+
     # mode=period: one return per basket
     # Default to 1Y range if no dates specified
     if not start and not end and global_max:
@@ -1133,9 +1435,9 @@ def get_basket_data(basket_name: str):
         df = pd.read_parquet(basket_file)
         df['Date'] = pd.to_datetime(df['Date'])
 
-        # Merge live basket data for today's candle with recomputed signals
+        # Merge live basket data for today's candle with recomputed signals (skip if stale)
         live_basket_df = _read_live_parquet(LIVE_BASKET_SIGNALS_FILE)
-        if live_basket_df is not None:
+        if live_basket_df is not None and _live_is_current(live_basket_df, df['Date'].max()):
             name_col = 'BasketName' if 'BasketName' in live_basket_df.columns else 'Basket'
             basket_name_spaced = basket_name.replace('_', ' ')
             live_row = live_basket_df[live_basket_df[name_col].str.endswith(basket_name_spaced)]
@@ -1249,10 +1551,10 @@ def list_live_signal_tickers():
         if universe is not None:
             latest = latest[latest['Ticker'].isin(universe)]
 
-        # Read live OHLC
+        # Read live OHLC (skip if stale — market closed, Norgate already updated)
         live_df = _read_live_parquet(LIVE_SIGNALS_FILE)
-        if live_df is None or live_df.empty:
-            return []  # No live data → no live signals
+        if live_df is None or live_df.empty or not _live_is_current(live_df, max_date):
+            return []  # No live data or stale → no live signals
 
         live_ohlc = {}
         for _, lr in live_df.iterrows():
@@ -1376,9 +1678,9 @@ def get_ticker_signals():
                 'dollar_vol': int(dv) if dv is not None else None,
             }
 
-        # Override pct_change with live data if available
+        # Override pct_change with live data if available and newer than Norgate
         live_df = _read_live_parquet(LIVE_SIGNALS_FILE)
-        if live_df is not None and not live_df.empty:
+        if live_df is not None and _live_is_current(live_df, pd.to_datetime(df['Date']).max()):
             for _, lr in live_df.iterrows():
                 t = lr.get('Ticker')
                 if t and pd.notna(lr.get('Close')) and t in result:
@@ -1402,35 +1704,39 @@ def get_ticker_data(ticker: str):
         df['Date'] = pd.to_datetime(df['Date'])
 
         # Merge live bar using incremental signal computation (matches live-signals endpoint)
+        # Only use the live bar if it's at least as recent as the latest Norgate date;
+        # otherwise Norgate already has newer/equal data and the live file is stale.
         live_df = _read_live_parquet(LIVE_SIGNALS_FILE)
         if live_df is not None:
             live_row = live_df[live_df['Ticker'] == ticker]
             if not live_row.empty:
                 lr = live_row.iloc[0]
                 live_date = pd.to_datetime(lr['Date'])
+                latest_norgate_date = df['Date'].max()
 
-                # Drop any existing row for today (in case cached parquet already has it)
-                df = df[df['Date'] < live_date]
+                if live_date > latest_norgate_date:
+                    # Drop any existing row for the live date (live bar replaces it)
+                    df = df[df['Date'] < live_date]
 
-                # Use last cached row + _build_signals_next_row (same path as /api/live-signals)
-                prev = df.sort_values('Date').iloc[-1]
-                ohlc = {
-                    'Close': float(lr['Close']) if pd.notna(lr.get('Close')) else None,
-                    'Open':  float(lr['Open'])  if pd.notna(lr.get('Open'))  else None,
-                    'High':  float(lr['High'])  if pd.notna(lr.get('High'))  else None,
-                    'Low':   float(lr['Low'])   if pd.notna(lr.get('Low'))   else None,
-                }
-                if ohlc['Close'] is not None:
-                    new_row = signals_engine._build_signals_next_row(
-                        prev, ohlc['Close'], live_date,
-                        live_high=ohlc.get('High'),
-                        live_low=ohlc.get('Low'),
-                        live_open=ohlc.get('Open'),
-                    )
-                    if new_row is not None:
-                        live_bar = pd.DataFrame([new_row])
-                        live_bar['Source'] = 'live'
-                        df = pd.concat([df, live_bar], ignore_index=True)
+                    # Use last cached row + _build_signals_next_row (same path as /api/live-signals)
+                    prev = df.sort_values('Date').iloc[-1]
+                    ohlc = {
+                        'Close': float(lr['Close']) if pd.notna(lr.get('Close')) else None,
+                        'Open':  float(lr['Open'])  if pd.notna(lr.get('Open'))  else None,
+                        'High':  float(lr['High'])  if pd.notna(lr.get('High'))  else None,
+                        'Low':   float(lr['Low'])   if pd.notna(lr.get('Low'))   else None,
+                    }
+                    if ohlc['Close'] is not None:
+                        new_row = signals_engine._build_signals_next_row(
+                            prev, ohlc['Close'], live_date,
+                            live_high=ohlc.get('High'),
+                            live_low=ohlc.get('Low'),
+                            live_open=ohlc.get('Open'),
+                        )
+                        if new_row is not None:
+                            live_bar = pd.DataFrame([new_row])
+                            live_bar['Source'] = 'live'
+                            df = pd.concat([df, live_bar], ignore_index=True)
 
         df['Date'] = df['Date'].dt.strftime('%Y-%m-%d')
         return {"chart_data": clean_data_for_json(df.sort_values('Date')), "tickers": []}
@@ -1645,11 +1951,11 @@ def get_basket_summary(basket_name: str, start: str = None, end: str = None):
             max_date = latest['Date'].max()
             latest = latest[latest['Date'] >= max_date]
 
-        # Read live closes for intraday price updates (skip in range mode)
+        # Read live closes for intraday price updates (skip in range mode or stale live file)
         live_closes = {}
         if not is_range_mode:
             live_df = _read_live_parquet(LIVE_SIGNALS_FILE)
-            if live_df is not None:
+            if live_df is not None and _live_is_current(live_df, max_date):
                 for _, lr in live_df.iterrows():
                     t = lr.get('Ticker')
                     c = lr.get('Close')
@@ -2940,6 +3246,7 @@ def run_backtest(req: BacktestRequest):
                                            'entry_weight': entry_wt}
                         cash_filt -= alloc_f
                         trade_map[idx]['entry_weight'] = entry_wt
+                        trade_map[idx]['_was_taken'] = True
 
         # Record daily mark-to-market equity
         equity_all = mtm_equity(open_all, cash_all, date)
@@ -3024,9 +3331,12 @@ def run_backtest(req: BacktestRequest):
     # 8. Compute stats
     def compute_stats(trade_list, equity_vals):
         if not trade_list:
-            return {'trades': 0, 'win_rate': 0, 'avg_winner': 0, 'avg_loser': 0,
+            return {'trades': 0, 'trades_met_criteria': 0, 'trades_taken': 0, 'trades_skipped': 0,
+                    'win_rate': 0, 'avg_winner': 0, 'avg_loser': 0,
                     'ev': 0, 'profit_factor': 0, 'max_dd': 0, 'avg_bars': 0}
-        returns = [t['change'] for t in trade_list if t['change'] is not None]
+        met_criteria = len(trade_list)
+        taken = [t for t in trade_list if t.get('_was_taken')]
+        returns = [t['change'] for t in taken if t['change'] is not None]
         winners = [r for r in returns if r > 0]
         losers = [r for r in returns if r <= 0]
         total = len(returns)
@@ -3046,9 +3356,12 @@ def run_backtest(req: BacktestRequest):
                 if peak > 0:
                     dd = (peak - v) / peak
                     max_dd = max(max_dd, dd)
-        avg_bars = sum(t['bars_held'] for t in trade_list) / len(trade_list) if trade_list else 0
+        avg_bars = sum(t['bars_held'] for t in taken) / len(taken) if taken else 0
         return {
             'trades': total,
+            'trades_met_criteria': met_criteria,
+            'trades_taken': total,
+            'trades_skipped': met_criteria - total,
             'win_rate': round(win_rate, 4),
             'avg_winner': round(avg_winner, 4),
             'avg_loser': round(avg_loser, 4),
@@ -3061,6 +3374,10 @@ def run_backtest(req: BacktestRequest):
     filtered_trades = [t for t in trades if t['regime_pass']]
     stats_filtered = compute_stats(filtered_trades, eq_filt_vals)
     stats_unfiltered = compute_stats(trades, eq_all_vals)
+
+    # Clean up internal fields before returning
+    for t in trades:
+        t.pop('_was_taken', None)
 
     resp = {
         "trades": sorted_trades,
