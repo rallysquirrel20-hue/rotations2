@@ -76,19 +76,20 @@ interface BasketSummaryData {
 type ViewType = 'Themes' | 'Sectors' | 'Industries' | 'Tickers' | 'LiveSignals';
 type SearchCategory = 'all' | 'Themes' | 'Sectors' | 'Industries' | 'Tickers';
 interface SearchResult { name: string; category: ViewType; displayName: string; }
-interface TickerSignalSummary { lt_trend: string | null; st_trend: string | null; mean_rev: string | null; pct_change: number | null; dollar_vol: number | null; }
-type SignalSortCol = 'ticker' | 'wt' | 'lt' | 'st' | 'mr' | 'pct'
-type BasketSortCol = 'name' | 'bo' | 'br' | 'cor' | 'lt' | 'st' | 'mr' | 'chg'
+interface TickerSignalSummary { lt_trend: string | null; st_trend: string | null; mean_rev: string | null; pct_change: number | null; dollar_vol: number | null; last_price: number | null; }
+type SignalSortCol = 'ticker' | 'wt' | 'lt' | 'st' | 'mr' | 'price' | 'pct'
+type BasketSortCol = 'name' | 'bo' | 'br' | 'cor' | 'lt' | 'st' | 'mr' | 'price' | 'chg'
 
 function getSigSortVal(ticker: string, col: SignalSortCol, sigs: Record<string, TickerSignalSummary>): string | number {
   if (col === 'ticker') return ticker
   const sig = sigs[ticker]
-  if (!sig) return col === 'pct' ? -Infinity : ''
+  if (!sig) return (col === 'pct' || col === 'price') ? -Infinity : ''
   switch (col) {
     case 'lt': return sig.lt_trend || ''
     case 'st': return sig.st_trend || ''
     case 'mr': return sig.mean_rev || ''
     case 'wt': return sig.dollar_vol ?? -Infinity
+    case 'price': return sig.last_price ?? -Infinity
     case 'pct': return sig.pct_change ?? -Infinity
     default: return ''
   }
@@ -130,7 +131,12 @@ function App() {
   const [showBreadth, setShowBreadth] = useState(true)
   const [showBreakout, setShowBreakout] = useState(true)
   const [showCorrelation, setShowCorrelation] = useState(true)
+  const [showRV, setShowRV] = useState(true)
   const [showCandleDetail, setShowCandleDetail] = useState(true)
+  const [sidebarWidth, setSidebarWidth] = useState(460)
+  const sidebarDragging = useRef(false)
+  const [hiddenCols, setHiddenCols] = useState<Set<string>>(new Set())
+  const [colMenuOpen, setColMenuOpen] = useState(false)
   const [startDate, setStartDate] = useState('')
   const [endDate, setEndDate] = useState('')
   const [rangeUpdateTrigger, setRangeUpdateTrigger] = useState<{from?: string, to?: string, reset1Y?: boolean} | null>(null)
@@ -333,6 +339,23 @@ function App() {
     return { min: dates[0] || '', max: dates[dates.length - 1] || '' }
   }, [chartData])
 
+  // Sidebar resize drag handler
+  useEffect(() => {
+    const onMouseMove = (e: MouseEvent) => {
+      if (!sidebarDragging.current) return
+      const w = Math.max(280, Math.min(800, e.clientX))
+      setSidebarWidth(w)
+    }
+    const onMouseUp = () => {
+      sidebarDragging.current = false
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+    }
+    window.addEventListener('mousemove', onMouseMove)
+    window.addEventListener('mouseup', onMouseUp)
+    return () => { window.removeEventListener('mousemove', onMouseMove); window.removeEventListener('mouseup', onMouseUp) }
+  }, [])
+
   // Fetch all reference data on mount
   useEffect(() => {
     axios.get(`${API_BASE}/baskets`).then(res => {
@@ -524,7 +547,7 @@ function App() {
     const hasFilter = !!(filterLT || filterST || filterMR)
 
     const handleClick = (col: SignalSortCol) => {
-      if (col === 'ticker' || col === 'pct' || col === 'wt') {
+      if (col === 'ticker' || col === 'pct' || col === 'wt' || col === 'price') {
         doSort(col, sortCol, sortDir, setCol, setDir)
         setFilterOpen(null)
       } else {
@@ -575,26 +598,39 @@ function App() {
         <span className={`col-ticker col-hdr ${sortCol === 'ticker' ? 'active' : ''}`} onClick={() => handleClick('ticker')}>
           Ticker{arrow('ticker')}
         </span>
-        {(showWeight || showDV) && (
+        {(showWeight || showDV) && !hiddenCols.has('wt') && (
           <span className={`col-wt col-hdr ${sortCol === 'wt' ? 'active' : ''}`} onClick={() => handleClick('wt')}>
             {showWeight ? 'Wt' : 'DV'}{arrow('wt')}
           </span>
         )}
-        <span className={`col-lt col-hdr ${sortCol === 'lt' ? 'active' : ''} ${filterLT ? 'filtered' : ''}`}
-              onClick={() => handleClick('lt')} style={{position:'relative'}}>
-          LT{arrow('lt')}{filterOpen === 'lt' && renderDropdown('lt')}
-        </span>
-        <span className={`col-st col-hdr ${sortCol === 'st' ? 'active' : ''} ${filterST ? 'filtered' : ''}`}
-              onClick={() => handleClick('st')} style={{position:'relative'}}>
-          ST{arrow('st')}{filterOpen === 'st' && renderDropdown('st')}
-        </span>
-        <span className={`col-mr col-hdr ${sortCol === 'mr' ? 'active' : ''} ${filterMR ? 'filtered' : ''}`}
-              onClick={() => handleClick('mr')} style={{position:'relative'}}>
-          MR{arrow('mr')}{filterOpen === 'mr' && renderDropdown('mr')}
-        </span>
-        <span className={`col-pct col-hdr ${sortCol === 'pct' ? 'active' : ''}`} onClick={() => handleClick('pct')}>
-          Chg{arrow('pct')}
-        </span>
+        {!hiddenCols.has('lt') && (
+          <span className={`col-lt col-hdr ${sortCol === 'lt' ? 'active' : ''} ${filterLT ? 'filtered' : ''}`}
+                onClick={() => handleClick('lt')} style={{position:'relative'}}>
+            LT{arrow('lt')}{filterOpen === 'lt' && renderDropdown('lt')}
+          </span>
+        )}
+        {!hiddenCols.has('st') && (
+          <span className={`col-st col-hdr ${sortCol === 'st' ? 'active' : ''} ${filterST ? 'filtered' : ''}`}
+                onClick={() => handleClick('st')} style={{position:'relative'}}>
+            ST{arrow('st')}{filterOpen === 'st' && renderDropdown('st')}
+          </span>
+        )}
+        {!hiddenCols.has('mr') && (
+          <span className={`col-mr col-hdr ${sortCol === 'mr' ? 'active' : ''} ${filterMR ? 'filtered' : ''}`}
+                onClick={() => handleClick('mr')} style={{position:'relative'}}>
+            MR{arrow('mr')}{filterOpen === 'mr' && renderDropdown('mr')}
+          </span>
+        )}
+        {!hiddenCols.has('price') && (
+          <span className={`col-price col-hdr ${sortCol === 'price' ? 'active' : ''}`} onClick={() => handleClick('price')}>
+            Price{arrow('price')}
+          </span>
+        )}
+        {!hiddenCols.has('pct') && (
+          <span className={`col-pct col-hdr ${sortCol === 'pct' ? 'active' : ''}`} onClick={() => handleClick('pct')}>
+            Chg{arrow('pct')}
+          </span>
+        )}
         {hasFilter && <span className="col-clear-x" onClick={(e) => { e.stopPropagation(); setFLT(null); setFST(null); setFMR(null) }}>{'\u00D7'}</span>}
       </div>
     )
@@ -604,7 +640,7 @@ function App() {
   const getBasketSortVal = (slug: string, col: BasketSortCol): string | number => {
     if (col === 'name') return slug
     const b = basketBreadth[slug]
-    if (!b) return col === 'chg' || col === 'bo' || col === 'br' || col === 'cor' ? -Infinity : ''
+    if (!b) return col === 'chg' || col === 'bo' || col === 'br' || col === 'cor' || col === 'price' ? -Infinity : ''
     switch (col) {
       case 'bo': return b.breakout_pct ?? -Infinity
       case 'br': return b.uptrend_pct ?? -Infinity
@@ -612,6 +648,7 @@ function App() {
       case 'lt': return b.lt_trend || ''
       case 'st': return b.st_trend || ''
       case 'mr': return b.mean_rev || ''
+      case 'price': return b.last_price ?? -Infinity
       case 'chg': return b.pct_change ?? -Infinity
       default: return ''
     }
@@ -635,7 +672,7 @@ function App() {
     const hasFilter = !!(bFilterLT || bFilterST || bFilterMR)
 
     const handleClick = (col: BasketSortCol) => {
-      if (col === 'name' || col === 'bo' || col === 'br' || col === 'cor' || col === 'chg') {
+      if (col === 'name' || col === 'bo' || col === 'br' || col === 'cor' || col === 'chg' || col === 'price') {
         if (bSortCol === col) setBSortDir(bSortDir === 1 ? -1 : 1)
         else { setBSortCol(col); setBSortDir(col === 'name' ? 1 : -1) }
         setBFilterOpen(null)
@@ -687,30 +724,49 @@ function App() {
         <span className={`basket-name-text col-hdr ${bSortCol === 'name' ? 'active' : ''}`} onClick={() => handleClick('name')}>
           Basket{arrow('name')}
         </span>
-        <span className={`col-bkt col-hdr ${bSortCol === 'bo' ? 'active' : ''}`} onClick={() => handleClick('bo')}>
-          BO%{arrow('bo')}
-        </span>
-        <span className={`col-bkt col-hdr ${bSortCol === 'br' ? 'active' : ''}`} onClick={() => handleClick('br')}>
-          Br%{arrow('br')}
-        </span>
-        <span className={`col-bkt col-hdr ${bSortCol === 'cor' ? 'active' : ''}`} onClick={() => handleClick('cor')}>
-          Cor%{arrow('cor')}
-        </span>
-        <span className={`col-lt col-hdr ${bSortCol === 'lt' ? 'active' : ''} ${bFilterLT ? 'filtered' : ''}`}
-              onClick={() => handleClick('lt')} style={{position:'relative'}}>
-          LT{arrow('lt')}{bFilterOpen === 'lt' && renderDropdown('lt')}
-        </span>
-        <span className={`col-st col-hdr ${bSortCol === 'st' ? 'active' : ''} ${bFilterST ? 'filtered' : ''}`}
-              onClick={() => handleClick('st')} style={{position:'relative'}}>
-          ST{arrow('st')}{bFilterOpen === 'st' && renderDropdown('st')}
-        </span>
-        <span className={`col-mr col-hdr ${bSortCol === 'mr' ? 'active' : ''} ${bFilterMR ? 'filtered' : ''}`}
-              onClick={() => handleClick('mr')} style={{position:'relative'}}>
-          MR{arrow('mr')}{bFilterOpen === 'mr' && renderDropdown('mr')}
-        </span>
-        <span className={`col-pct col-hdr ${bSortCol === 'chg' ? 'active' : ''}`} onClick={() => handleClick('chg')}>
-          Chg{arrow('chg')}
-        </span>
+        {!hiddenCols.has('bo') && (
+          <span className={`col-bkt col-hdr ${bSortCol === 'bo' ? 'active' : ''}`} onClick={() => handleClick('bo')}>
+            BO%{arrow('bo')}
+          </span>
+        )}
+        {!hiddenCols.has('br') && (
+          <span className={`col-bkt col-hdr ${bSortCol === 'br' ? 'active' : ''}`} onClick={() => handleClick('br')}>
+            Br%{arrow('br')}
+          </span>
+        )}
+        {!hiddenCols.has('cor') && (
+          <span className={`col-bkt col-hdr ${bSortCol === 'cor' ? 'active' : ''}`} onClick={() => handleClick('cor')}>
+            Cor%{arrow('cor')}
+          </span>
+        )}
+        {!hiddenCols.has('lt') && (
+          <span className={`col-lt col-hdr ${bSortCol === 'lt' ? 'active' : ''} ${bFilterLT ? 'filtered' : ''}`}
+                onClick={() => handleClick('lt')} style={{position:'relative'}}>
+            LT{arrow('lt')}{bFilterOpen === 'lt' && renderDropdown('lt')}
+          </span>
+        )}
+        {!hiddenCols.has('st') && (
+          <span className={`col-st col-hdr ${bSortCol === 'st' ? 'active' : ''} ${bFilterST ? 'filtered' : ''}`}
+                onClick={() => handleClick('st')} style={{position:'relative'}}>
+            ST{arrow('st')}{bFilterOpen === 'st' && renderDropdown('st')}
+          </span>
+        )}
+        {!hiddenCols.has('mr') && (
+          <span className={`col-mr col-hdr ${bSortCol === 'mr' ? 'active' : ''} ${bFilterMR ? 'filtered' : ''}`}
+                onClick={() => handleClick('mr')} style={{position:'relative'}}>
+            MR{arrow('mr')}{bFilterOpen === 'mr' && renderDropdown('mr')}
+          </span>
+        )}
+        {!hiddenCols.has('price') && (
+          <span className={`col-price col-hdr ${bSortCol === 'price' ? 'active' : ''}`} onClick={() => handleClick('price')}>
+            Price{arrow('price')}
+          </span>
+        )}
+        {!hiddenCols.has('pct') && (
+          <span className={`col-pct col-hdr ${bSortCol === 'chg' ? 'active' : ''}`} onClick={() => handleClick('chg')}>
+            Chg{arrow('chg')}
+          </span>
+        )}
         {hasFilter && <span className="col-clear-x" onClick={(e) => { e.stopPropagation(); setBFilterLT(null); setBFilterST(null); setBFilterMR(null) }}>{'\u00D7'}</span>}
       </div>
     )
@@ -728,24 +784,37 @@ function App() {
     const live = liveOverrides[ticker]
     return (
       <>
-        {weight !== undefined && (
+        {weight !== undefined && !hiddenCols.has('wt') && (
           <span className="col-wt">{weight > 0 ? `${(weight * 100).toFixed(1)}%` : ''}</span>
         )}
-        {showDV && weight === undefined && (
+        {showDV && weight === undefined && !hiddenCols.has('wt') && (
           <span className="col-wt">{sig?.dollar_vol != null ? fmtDV(sig.dollar_vol) : ''}</span>
         )}
-        <span className={`col-lt ${sig?.lt_trend ? (sig.lt_trend === 'BO' ? 'sig-bull' : 'sig-bear') : ''}${live?.has('lt') ? ' sig-live' : ''}`}>
-          {sig?.lt_trend || ''}
-        </span>
-        <span className={`col-st ${sig?.st_trend ? (sig.st_trend === 'Up' ? 'sig-bull' : 'sig-bear') : ''}${live?.has('st') ? ' sig-live' : ''}`}>
-          {sig?.st_trend || ''}
-        </span>
-        <span className={`col-mr ${sig?.mean_rev ? (sig.mean_rev === 'BTFD' ? 'sig-bull' : 'sig-bear') : ''}${live?.has('mr') ? ' sig-live' : ''}`}>
-          {sig?.mean_rev || ''}
-        </span>
-        <span className={`col-pct ${sig?.pct_change != null ? (sig.pct_change >= 0 ? 'sig-bull' : 'sig-bear') : ''}`}>
-          {sig?.pct_change != null ? `${sig.pct_change >= 0 ? '+' : ''}${sig.pct_change.toFixed(1)}%` : ''}
-        </span>
+        {!hiddenCols.has('lt') && (
+          <span className={`col-lt ${sig?.lt_trend ? (sig.lt_trend === 'BO' ? 'sig-bull' : 'sig-bear') : ''}${live?.has('lt') ? ' sig-live' : ''}`}>
+            {sig?.lt_trend || ''}
+          </span>
+        )}
+        {!hiddenCols.has('st') && (
+          <span className={`col-st ${sig?.st_trend ? (sig.st_trend === 'Up' ? 'sig-bull' : 'sig-bear') : ''}${live?.has('st') ? ' sig-live' : ''}`}>
+            {sig?.st_trend || ''}
+          </span>
+        )}
+        {!hiddenCols.has('mr') && (
+          <span className={`col-mr ${sig?.mean_rev ? (sig.mean_rev === 'BTFD' ? 'sig-bull' : 'sig-bear') : ''}${live?.has('mr') ? ' sig-live' : ''}`}>
+            {sig?.mean_rev || ''}
+          </span>
+        )}
+        {!hiddenCols.has('price') && (
+          <span className="col-price">
+            {sig?.last_price != null ? sig.last_price.toFixed(2) : ''}
+          </span>
+        )}
+        {!hiddenCols.has('pct') && (
+          <span className={`col-pct ${sig?.pct_change != null ? (sig.pct_change >= 0 ? 'sig-bull' : 'sig-bear') : ''}`}>
+            {sig?.pct_change != null ? `${sig.pct_change >= 0 ? '+' : ''}${sig.pct_change.toFixed(1)}%` : ''}
+          </span>
+        )}
       </>
     )
   }
@@ -753,10 +822,41 @@ function App() {
   return (
     <ErrorBoundary>
       <div className="app-container">
-        <div className="sidebar navigation-sidebar">
+        <div className="sidebar navigation-sidebar" style={{ width: sidebarWidth }}>
           <div className="sidebar-header">
             <div className="sidebar-brand">
               <img src="/usamlogo.webp" alt="U.S. Asset Management" className="sidebar-logo" />
+            </div>
+            <div className="col-toggle-wrapper">
+              <button className="col-toggle-btn" onClick={() => setColMenuOpen(v => !v)} title="Toggle columns">Columns</button>
+              {colMenuOpen && (
+                <>
+                  <div className="col-filter-backdrop" onClick={() => setColMenuOpen(false)}></div>
+                  <div className="col-toggle-menu" onClick={e => e.stopPropagation()}>
+                    {[
+                      { key: 'wt', label: 'Wt / DV' },
+                      { key: 'bo', label: 'BO%' },
+                      { key: 'br', label: 'Breadth%' },
+                      { key: 'cor', label: 'Corr%' },
+                      { key: 'lt', label: 'LT Trend' },
+                      { key: 'st', label: 'ST Trend' },
+                      { key: 'mr', label: 'Mean Rev' },
+                      { key: 'price', label: 'Price' },
+                      { key: 'pct', label: 'Chg%' },
+                    ].map(c => (
+                      <label key={c.key} className="cfd-check">
+                        <input type="checkbox" checked={!hiddenCols.has(c.key)}
+                          onChange={() => setHiddenCols(prev => {
+                            const next = new Set(prev)
+                            if (next.has(c.key)) next.delete(c.key); else next.add(c.key)
+                            return next
+                          })} />
+                        <span>{c.label}</span>
+                      </label>
+                    ))}
+                  </div>
+                </>
+              )}
             </div>
           </div>
           <div className="sidebar-scrollable-content">
@@ -823,27 +923,46 @@ function App() {
                       <span className="basket-name-text">{item.replace(/_/g, ' ')}</span>
                       {basketBreadth[item] && (
                         <>
-                          <span className={`col-bkt ${(basketBreadth[item].breakout_pct ?? 0) >= 50 ? 'sig-bull' : 'sig-bear'}`}>
-                            {basketBreadth[item].breakout_pct != null ? `${basketBreadth[item].breakout_pct}%` : ''}
-                          </span>
-                          <span className={`col-bkt ${(basketBreadth[item].uptrend_pct ?? 0) >= 50 ? 'sig-bull' : 'sig-bear'}`}>
-                            {basketBreadth[item].uptrend_pct != null ? `${basketBreadth[item].uptrend_pct}%` : ''}
-                          </span>
-                          <span className="col-bkt sig-corr">
-                            {basketBreadth[item].corr_pct != null ? `${basketBreadth[item].corr_pct}%` : ''}
-                          </span>
-                          <span className={`col-lt ${basketBreadth[item].lt_trend === 'BO' ? 'sig-bull' : 'sig-bear'}`}>
-                            {basketBreadth[item].lt_trend || ''}
-                          </span>
-                          <span className={`col-st ${basketBreadth[item].st_trend === 'UP' ? 'sig-bull' : 'sig-bear'}`}>
-                            {basketBreadth[item].st_trend || ''}
-                          </span>
-                          <span className={`col-mr ${basketBreadth[item].mean_rev ? (basketBreadth[item].mean_rev === 'BTFD' ? 'sig-bull' : 'sig-bear') : ''}`}>
-                            {basketBreadth[item].mean_rev || ''}
-                          </span>
-                          <span className={`col-pct ${(basketBreadth[item].pct_change ?? 0) >= 0 ? 'sig-bull' : 'sig-bear'}`}>
-                            {basketBreadth[item].pct_change != null ? `${basketBreadth[item].pct_change >= 0 ? '+' : ''}${basketBreadth[item].pct_change.toFixed(1)}%` : ''}
-                          </span>
+                          {!hiddenCols.has('bo') && (
+                            <span className={`col-bkt ${(basketBreadth[item].breakout_pct ?? 0) >= 50 ? 'sig-bull' : 'sig-bear'}`}>
+                              {basketBreadth[item].breakout_pct != null ? `${basketBreadth[item].breakout_pct}%` : ''}
+                            </span>
+                          )}
+                          {!hiddenCols.has('br') && (
+                            <span className={`col-bkt ${(basketBreadth[item].uptrend_pct ?? 0) >= 50 ? 'sig-bull' : 'sig-bear'}`}>
+                              {basketBreadth[item].uptrend_pct != null ? `${basketBreadth[item].uptrend_pct}%` : ''}
+                            </span>
+                          )}
+                          {!hiddenCols.has('cor') && (
+                            <span className="col-bkt sig-corr">
+                              {basketBreadth[item].corr_pct != null ? `${basketBreadth[item].corr_pct}%` : ''}
+                            </span>
+                          )}
+                          {!hiddenCols.has('lt') && (
+                            <span className={`col-lt ${basketBreadth[item].lt_trend === 'BO' ? 'sig-bull' : 'sig-bear'}`}>
+                              {basketBreadth[item].lt_trend || ''}
+                            </span>
+                          )}
+                          {!hiddenCols.has('st') && (
+                            <span className={`col-st ${basketBreadth[item].st_trend === 'UP' ? 'sig-bull' : 'sig-bear'}`}>
+                              {basketBreadth[item].st_trend || ''}
+                            </span>
+                          )}
+                          {!hiddenCols.has('mr') && (
+                            <span className={`col-mr ${basketBreadth[item].mean_rev ? (basketBreadth[item].mean_rev === 'BTFD' ? 'sig-bull' : 'sig-bear') : ''}`}>
+                              {basketBreadth[item].mean_rev || ''}
+                            </span>
+                          )}
+                          {!hiddenCols.has('price') && (
+                            <span className="col-price">
+                              {basketBreadth[item].last_price != null ? basketBreadth[item].last_price.toFixed(2) : ''}
+                            </span>
+                          )}
+                          {!hiddenCols.has('pct') && (
+                            <span className={`col-pct ${(basketBreadth[item].pct_change ?? 0) >= 0 ? 'sig-bull' : 'sig-bear'}`}>
+                              {basketBreadth[item].pct_change != null ? `${basketBreadth[item].pct_change >= 0 ? '+' : ''}${basketBreadth[item].pct_change.toFixed(1)}%` : ''}
+                            </span>
+                          )}
                         </>
                       )}
                     </div>
@@ -900,6 +1019,12 @@ function App() {
             ))}
           </div>
         </div>
+        <div className="sidebar-resizer" onMouseDown={(e) => {
+          e.preventDefault()
+          sidebarDragging.current = true
+          document.body.style.cursor = 'col-resize'
+          document.body.style.userSelect = 'none'
+        }} />
         <div className="main-content">
           {loading && <div className="loading-overlay"><span className="loading-text">Loading...</span></div>}
           <div className="main-header">
@@ -956,13 +1081,17 @@ function App() {
               <label className="overlay-checkbox"><input type="checkbox" checked={showPivots} onChange={e => setShowPivots(e.target.checked)} /> Pivots</label>
               <label className="overlay-checkbox"><input type="checkbox" checked={showTargets} onChange={e => setShowTargets(e.target.checked)} /> Targets</label>
               {!isBasketView && (
-                <label className="overlay-checkbox"><input type="checkbox" checked={showVolume} onChange={e => setShowVolume(e.target.checked)} /> Volume</label>
+                <>
+                  <label className="overlay-checkbox"><input type="checkbox" checked={showRV} onChange={e => setShowRV(e.target.checked)} /> RV%</label>
+                  <label className="overlay-checkbox"><input type="checkbox" checked={showVolume} onChange={e => setShowVolume(e.target.checked)} /> Volume</label>
+                </>
               )}
               {isBasketView && (
                 <>
                   <label className="overlay-checkbox"><input type="checkbox" checked={showBreadth} onChange={e => setShowBreadth(e.target.checked)} /> Breadth%</label>
                   <label className="overlay-checkbox"><input type="checkbox" checked={showBreakout} onChange={e => setShowBreakout(e.target.checked)} /> Breakout%</label>
                   <label className="overlay-checkbox"><input type="checkbox" checked={showCorrelation} onChange={e => setShowCorrelation(e.target.checked)} /> Correlation%</label>
+                  <label className="overlay-checkbox"><input type="checkbox" checked={showRV} onChange={e => setShowRV(e.target.checked)} /> RV%</label>
                   <label className="overlay-checkbox"><input type="checkbox" checked={showCandleDetail} onChange={e => setShowCandleDetail(e.target.checked)} /> Constituents</label>
                 </>
               )}
@@ -1083,6 +1212,7 @@ function App() {
                 showBreadth={showBreadth && isBasketView}
                 showBreakout={showBreakout && isBasketView}
                 showCorrelation={showCorrelation && isBasketView}
+                showRV={showRV}
                 rangeUpdateTrigger={rangeUpdateTrigger}
                 exportTrigger={exportTrigger}
                 symbolName={activeTicker || selectedItem}

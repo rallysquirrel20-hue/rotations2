@@ -87,12 +87,13 @@ Called by `main.py` to recompute signals when merging live Databento bars with h
 
 **`TVChart.tsx`** — Multi-pane chart using `lightweight-charts`. Synchronized crosshairs and time scales across panes:
 - **Price pane**: Candlesticks + resistance pivots (pink) + support pivots (blue) + upper/lower targets
-- **Volume pane**: Histogram
-- **Breadth pane**: Uptrend_Pct line
-- **Breakout pane**: Breakout_Pct line
-- **Correlation pane**: Correlation_Pct line
+- **Volume pane**: Histogram (tickers only)
+- **Breadth pane**: Uptrend_Pct line (baskets only)
+- **Breakout pane**: Breakout_Pct line (baskets only)
+- **Correlation pane**: Correlation_Pct line (baskets only)
+- **RV pane**: Annualized realized volatility (RV_EMA * sqrt(252) * 100), gold line (`#b58900`). Shown for both tickers and baskets.
 
-Panes are drag-resizable (min 40px, default 80px). Supports live WebSocket updates, date range navigation, and chart export.
+Panes are drag-resizable (min 40px, default 80px). Supports live WebSocket updates, date range navigation, and chart export. Header toggle order: Pivots, Targets, then for tickers: RV%, Volume; for baskets: Breadth%, Breakout%, Correlation%, RV%, Constituents.
 
 **`BasketSummary.tsx`** — Two analysis modes activated by separate header buttons:
 - **Intrabasket Analysis** — Per-basket analysis. When a basket is selected in the sidebar, it auto-targets that basket. When a ticker is selected, shows a searchable basket picker (grouped by Themes/Sectors/Industries) to choose which basket to analyze. Tabs:
@@ -102,12 +103,12 @@ Panes are drag-resizable (min 40px, default 80px). Supports live WebSocket updat
   - **Contribution tab**: Canvas-rendered per-constituent return contribution chart via `GET /api/baskets/{name}/contributions`
 - **Cross-Basket Analysis** — Cross-basket comparison via `BasketReturnsChart` component. Modes: `cross` (ranked bar chart, filterable by ALL/T/S/I) and `daily` (single basket day-by-day via searchable dropdown). Date presets, live intraday overlay, canvas PNG export.
 
-**`AnalogsPanel.tsx`** — Self-contained analogs analysis panel activated by the **Analogs** header button. Matches the current market environment fingerprint against historical periods using Spearman rank correlation across multiple factors. Five tabs:
-  - **Summary**: Ranking table showing raw value → rank transformation per factor per basket (the fingerprint)
-  - **Analogs**: Scrollable card list of matched historical periods with similarity scores, breakdown badges, mini bar charts
-  - **Comparison**: Side-by-side bar charts (current vs selected analog) with per-factor similarity breakdown
-  - **Forward**: Cumulative forward returns line chart per basket from selected analog's end date
-  - **Aggregate**: Stats table (mean/median/min/max/std) at 1M/3M/6M horizons with expandable per-basket rows
+**`AnalogsPanel.tsx`** — Self-contained analogs analysis panel activated by the **Analogs** header button. Matches the current market environment fingerprint against historical periods using Spearman rank correlation across multiple factors. Uses condition-based query builder to find historical matches. Three tabs:
+  - **Summary**: Ranking table showing raw value → rank transformation per factor per basket (the fingerprint). Sortable columns (1D/1W/1M/1Q/1Y/3Y/5Y returns + Breadth% + BO% + Corr% + RV%). Click any cell to add a query condition. Blue→purple→pink color gradient by rank.
+  - **Forward**: 3-pane layout. Left sidebar: match date picker (scrollable list of matching dates with avg +1Q return). Center: canvas cumulative forward returns chart per basket with horizon presets (1M/1Q/1Y) and log scale toggle. Right panel: sortable Basket/Chg legend with hover highlighting. Y-axis on right side.
+  - **Aggregate**: 3-pane layout. Left sidebar: sortable basket picker (Basket/Avg columns) with horizon presets (1M/1Q/1Y). Center: canvas mean forward return path with ±1σ shaded band; hovering a match in the right panel overlays that individual path. Right panel: sortable Date/Chg columns showing each match's return for the selected basket.
+
+Backend horizons: analogs mode returns `1M/1Q/6M/1Y` forward point returns and up to 252-day forward series. Query mode returns `1W/1M/1Q/6M/1Y` forward returns and 252-day forward series.
 
 ### Styling
 

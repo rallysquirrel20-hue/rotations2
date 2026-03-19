@@ -467,6 +467,9 @@ def get_basket_breadth():
                     entry['mean_rev'] = 'BTFD'
                 elif stfr_open:
                     entry['mean_rev'] = 'STFR'
+                # Last price
+                if pd.notna(last.get('Close')):
+                    entry['last_price'] = round(float(last['Close']), 2)
                 # Pct change from last 2 closes
                 if len(df) >= 2:
                     prev_close = df.iloc[-2]['Close']
@@ -547,7 +550,8 @@ def get_basket_breadth():
                 elif is_bd:
                     entry['lt_trend'] = 'BD'
 
-                # Live pct_change from cached prev close
+                # Live last_price and pct_change from cached prev close
+                entry['last_price'] = round(lc, 2)
                 prev_close = entry.get('_prev_close')
                 if prev_close and prev_close != 0:
                     entry['pct_change'] = round(float(lc / prev_close - 1) * 100, 2)
@@ -974,7 +978,7 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
                     current_ranks[f"returns_{tf_label}"][slug] = None
 
         analogs = []
-        HORIZONS = {"1M": 21, "3M": 63, "6M": 126}
+        HORIZONS = {"1M": 21, "1Q": 63, "6M": 126, "1Y": 252}
         for sel_idx in selected:
             a_start = sel_idx
             a_end = sel_idx + W
@@ -1048,7 +1052,7 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
             analogs = [a for a in analogs if a["similarity"] >= threshold]
 
         # Aggregate stats across analogs
-        AGG_HORIZONS = {"1M": 21, "3M": 63, "6M": 126}
+        AGG_HORIZONS = {"1M": 21, "1Q": 63, "6M": 126, "1Y": 252}
         aggregate = {}
         for hz_label, hz_days in AGG_HORIZONS.items():
             # Collect per-basket forward returns at this horizon
@@ -1283,7 +1287,7 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
         match_indices = deduped[:100]
 
         # Build matches with forward returns
-        Q_HORIZONS = {"1W": 5, "1M": 21, "3M": 63, "6M": 126}
+        Q_HORIZONS = {"1W": 5, "1M": 21, "1Q": 63, "6M": 126, "1Y": 252}
         matches = []
         for idx in match_indices:
             forward = {}
@@ -1302,8 +1306,8 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
                             fwd[slug] = round(float(c_fwd / c_now - 1), 6)
                     forward[hz_label] = fwd
 
-            # Forward series (up to 126 days)
-            max_fwd = min(126, T - idx - 1)
+            # Forward series (up to 252 days)
+            max_fwd = min(252, T - idx - 1)
             fwd_dates = []
             fwd_baskets = {slug: [] for slug in ordered_slugs}
             for d in range(1, max_fwd + 1):
@@ -1670,24 +1674,31 @@ def get_ticker_signals():
             if pd.notna(final.get('Close')) and pd.notna(final.get('Volume')):
                 dv = round(float(final['Close']) * float(final['Volume']))
 
+            # Last price
+            last_price = None
+            if pd.notna(final.get('Close')):
+                last_price = round(float(final['Close']), 2)
+
             result[ticker] = {
                 'lt_trend': lt,
                 'st_trend': st,
                 'mean_rev': mr,
                 'pct_change': float(pct) if pct is not None else None,
                 'dollar_vol': int(dv) if dv is not None else None,
+                'last_price': last_price,
             }
 
-        # Override pct_change with live data if available and newer than Norgate
+        # Override pct_change and last_price with live data if available and newer than Norgate
         live_df = _read_live_parquet(LIVE_SIGNALS_FILE)
         if live_df is not None and _live_is_current(live_df, pd.to_datetime(df['Date']).max()):
             for _, lr in live_df.iterrows():
                 t = lr.get('Ticker')
                 if t and pd.notna(lr.get('Close')) and t in result:
+                    live_close = float(lr['Close'])
+                    result[t]['last_price'] = round(live_close, 2)
                     ticker_rows = last2[last2['Ticker'] == t].sort_values('Date')
                     if len(ticker_rows) >= 1:
                         prev_close = ticker_rows.iloc[-1]['Close']
-                        live_close = float(lr['Close'])
                         if pd.notna(prev_close) and prev_close != 0:
                             result[t]['pct_change'] = round(float(live_close / prev_close - 1) * 100, 2)
 
@@ -1743,7 +1754,7 @@ def get_ticker_data(ticker: str):
     except Exception: raise HTTPException(status_code=500)
 
 
-SIGNAL_TYPES = ['Breakout', 'Breakdown', 'Up_Rot', 'Down_Rot', 'BTFD', 'STFR', 'Buy_Hold']
+SIGNAL_TYPES = ['Breakout', 'Breakdown', 'Up_Rot', 'Down_Rot', 'BTFD', 'STFR', 'Long', 'Short']
 SIGNAL_PAIRS = [('Breakout', 'Breakdown'), ('Up_Rot', 'Down_Rot'), ('BTFD', 'STFR')]
 # The Is_ columns in the parquet use different names for rotations
 SIGNAL_IS_COL = {
@@ -1751,11 +1762,22 @@ SIGNAL_IS_COL = {
     'Up_Rot': 'Is_Up_Rotation', 'Down_Rot': 'Is_Down_Rotation',
     'BTFD': 'Is_BTFD', 'STFR': 'Is_STFR',
 }
+# Long/Short are not in SIGNAL_IS_COL — they don't use Is_ columns
 BACKTEST_DIRECTION = {
     "Up_Rot": "long", "Down_Rot": "short",
     "Breakout": "long", "Breakdown": "short",
     "BTFD": "long", "STFR": "short",
-    "Buy_Hold": "long",
+    "Long": "long", "Short": "short",
+}
+DEFAULT_EXIT_MAP = {
+    'Breakout': 'Breakdown', 'Breakdown': 'Breakout',
+    'Up_Rot': 'Down_Rot', 'Down_Rot': 'Up_Rot',
+    'BTFD': 'Breakdown', 'STFR': 'Breakout',
+}
+EXIT_IS_COL = {
+    'Breakout': 'Is_Breakout', 'Breakdown': 'Is_Breakdown',
+    'Up_Rot': 'Is_Up_Rotation', 'Down_Rot': 'Is_Down_Rotation',
+    'BTFD': 'Is_BTFD', 'STFR': 'Is_STFR',
 }
 
 
@@ -2489,11 +2511,18 @@ class BacktestFilter(BaseModel):
     condition: str
     value: Optional[float] = None
     source: str = "self"
+    lookback: Optional[int] = 21
 
 class BacktestRequest(BaseModel):
     target: str
     target_type: str
     entry_signal: str
+    exit_signal: Optional[str] = None
+    stop_signal: Optional[str] = None
+    exit_rv_multiple: Optional[float] = None
+    stop_rv_multiple: Optional[float] = None
+    trailing_stop_rv_multiple: Optional[float] = None
+    no_exit_target: Optional[bool] = None
     filters: List[BacktestFilter] = []
     start_date: Optional[str] = None
     end_date: Optional[str] = None
@@ -2504,6 +2533,12 @@ class MultiBacktestLeg(BaseModel):
     target: str
     target_type: str
     entry_signal: str
+    exit_signal: Optional[str] = None
+    stop_signal: Optional[str] = None
+    exit_rv_multiple: Optional[float] = None
+    stop_rv_multiple: Optional[float] = None
+    trailing_stop_rv_multiple: Optional[float] = None
+    no_exit_target: Optional[bool] = None
     allocation_pct: float  # 0-1 fraction
     position_size: float = 1.0
     filters: List[BacktestFilter] = []
@@ -2515,21 +2550,24 @@ class MultiBacktestRequest(BaseModel):
     max_leverage: float = 2.5
 
 
-def _build_leg_trades(target, target_type, entry_signal, filters, start_date, end_date):
+def _build_leg_trades(target, target_type, entry_signal, filters, start_date, end_date,
+                      exit_signal=None, stop_signal=None, exit_rv_multiple=None, stop_rv_multiple=None,
+                      trailing_stop_rv_multiple=None, no_exit_target=False):
     """Extract trade-building logic for a single backtest leg.
     Returns (trades, df, ticker_closes, direction).
     """
     sig = entry_signal
 
-    # Buy & Hold: single trade spanning the full date range
-    if sig == 'Buy_Hold':
+    # Long/Short/Buy_Hold: single trade spanning the full date range
+    if sig in ('Buy_Hold', 'Long', 'Short'):
+        direction = 'short' if sig == 'Short' else 'long'
         if target_type == 'basket':
             basket_file = _find_basket_parquet(target)
             if not basket_file:
                 raise HTTPException(status_code=404, detail=f"Basket file not found for {target}")
             df = pd.read_parquet(basket_file, columns=['Date', 'Close'])
         elif target_type == 'basket_tickers':
-            raise HTTPException(status_code=400, detail="Buy & Hold not supported for basket_tickers — use basket mode")
+            raise HTTPException(status_code=400, detail=f"{sig} not supported for basket_tickers — use basket mode")
         else:
             if not INDIVIDUAL_SIGNALS_FILE.exists():
                 raise HTTPException(status_code=404, detail="Signals file not found")
@@ -2545,10 +2583,17 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
         closes = df.drop_duplicates('Date').set_index('Date')['Close'].sort_index()
         ticker_closes = {'': closes}
         if closes.empty:
-            return ([], df, ticker_closes, 'long')
+            return ([], df, ticker_closes, direction)
         first_close = float(closes.iloc[0])
         last_close = float(closes.iloc[-1])
-        total_return = last_close / first_close - 1 if first_close else 0
+        if direction == 'long':
+            total_return = last_close / first_close - 1 if first_close else 0
+            mfe_val = float(closes.max()) / first_close - 1 if first_close else 0
+            mae_val = float(closes.min()) / first_close - 1 if first_close else 0
+        else:
+            total_return = (first_close - last_close) / first_close if first_close else 0
+            mfe_val = (first_close - float(closes.min())) / first_close if first_close else 0
+            mae_val = (first_close - float(closes.max())) / first_close if first_close else 0
         entry_date = closes.index[0]
         exit_date = closes.index[-1]
         bars = max(1, int(np.busday_count(entry_date.date(), exit_date.date())))
@@ -2558,41 +2603,63 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
             'entry_price': round(first_close, 2),
             'exit_price': round(last_close, 2),
             'change': round(total_return, 6),
-            'mfe': round(float(closes.max()) / first_close - 1, 6) if first_close else 0,
-            'mae': round(float(closes.min()) / first_close - 1, 6) if first_close else 0,
+            'mfe': round(mfe_val, 6),
+            'mae': round(mae_val, 6),
             'bars_held': bars,
             'regime_pass': True,
             'entry_weight': None,
             'exit_weight': None,
             'contribution': None,
         }
-        return ([trade], df, ticker_closes, 'long')
+        return ([trade], df, ticker_closes, direction)
 
     is_col = SIGNAL_IS_COL.get(sig)
     if not is_col:
         raise HTTPException(status_code=400, detail=f"Unknown signal: {sig}")
     direction = BACKTEST_DIRECTION[sig]
 
-    # Trade data columns for entry signal
-    trade_cols = [f'{sig}_Entry_Price', f'{sig}_Exit_Date', f'{sig}_Exit_Price',
-                  f'{sig}_Final_Change', f'{sig}_MFE', f'{sig}_MAE']
+    # Determine if custom exit is needed
+    default_exit = DEFAULT_EXIT_MAP.get(sig)
+    use_custom_exit = (
+        no_exit_target or
+        (exit_signal is not None and exit_signal != default_exit) or
+        stop_signal is not None or
+        exit_rv_multiple is not None or stop_rv_multiple is not None or
+        trailing_stop_rv_multiple is not None
+    )
 
-    # Regime filter metrics we may need
-    pct_metrics = {'Uptrend_Pct', 'Breakout_Pct', 'Correlation_Pct', 'RV_EMA', 'Breakdown_Pct', 'Downtrend_Pct'}
-    bool_metrics = {'Is_Breakout_Sequence', 'Trend', 'BTFD_Triggered', 'STFR_Triggered'}
+    # Trade data columns for entry signal (only needed for default exit path)
+    if not use_custom_exit:
+        trade_cols = [f'{sig}_Entry_Price', f'{sig}_Exit_Date', f'{sig}_Exit_Price',
+                      f'{sig}_Final_Change', f'{sig}_MFE', f'{sig}_MAE']
+    else:
+        trade_cols = [f'{sig}_Entry_Price']
+    # Resolve effective exit signal for custom path (None if no_exit_target)
+    effective_exit = None if no_exit_target else (exit_signal if exit_signal is not None else default_exit)
 
     is_multi_ticker = target_type == 'basket_tickers'
 
     # 1. Load target data
-    _quarter_bounds = None  # Set by basket_tickers path for membership filtering
+    _quarter_bounds = None
     if target_type == 'basket':
         basket_file = _find_basket_parquet(target)
         if not basket_file:
             raise HTTPException(status_code=404, detail=f"Basket file not found for {target}")
         base_cols = ['Date', 'Close', is_col] + trade_cols
+        # Add custom exit/stop Is_ columns if needed
+        if use_custom_exit:
+            for _sig in [effective_exit, stop_signal]:
+                if _sig:
+                    _is = EXIT_IS_COL.get(_sig)
+                    if _is and _is not in base_cols:
+                        base_cols.append(_is)
+            base_cols.extend(['High', 'Low'])
+            if exit_rv_multiple is not None or stop_rv_multiple is not None or trailing_stop_rv_multiple is not None:
+                base_cols.append('RV_EMA')
         for flt in filters:
             if flt.source == 'self' and flt.metric not in base_cols:
                 base_cols.append(flt.metric)
+        base_cols = list(dict.fromkeys(base_cols))  # dedupe
         try:
             df = pd.read_parquet(basket_file, columns=[c for c in base_cols if c])
         except Exception:
@@ -2601,18 +2668,14 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
     elif target_type == 'basket_tickers':
         if not INDIVIDUAL_SIGNALS_FILE.exists():
             raise HTTPException(status_code=404, detail="Signals file not found")
-        # Build quarterly universe history for membership filtering
         _universe_history = _get_universe_history(target)
         if _universe_history:
-            # Load union of all tickers across the backtest date range
             if start_date and end_date:
                 basket_tickers = _get_universe_tickers_for_range(target, pd.Timestamp(start_date), pd.Timestamp(end_date))
             elif start_date:
                 basket_tickers = _get_universe_tickers_for_range(target, pd.Timestamp(start_date), pd.Timestamp('2099-12-31'))
             else:
-                # No date filter — union of ALL quarters
                 basket_tickers = list({t for tks in _universe_history.values() for t in tks})
-            # Build sorted quarter boundaries for fast date->tickers lookup
             _quarter_bounds = sorted(
                 [(_quarter_str_to_date(q), set(tks)) for q, tks in _universe_history.items()],
                 key=lambda x: x[0]
@@ -2625,22 +2688,48 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
         if not basket_tickers:
             raise HTTPException(status_code=404, detail=f"No tickers found for basket {target}")
         base_cols = ['Ticker', 'Date', 'Close', is_col] + trade_cols
+        if use_custom_exit:
+            exit_is = EXIT_IS_COL.get(exit_signal)
+            if exit_is and exit_is not in base_cols:
+                base_cols.append(exit_is)
+            base_cols.extend(['High', 'Low'])
+            if exit_rv_multiple is not None or stop_rv_multiple is not None or trailing_stop_rv_multiple is not None:
+                base_cols.append('RV_EMA')
         for flt in filters:
             if flt.source == 'self' and flt.metric not in base_cols:
                 base_cols.append(flt.metric)
-        df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
-                             columns=[c for c in base_cols if c],
-                             filters=[('Ticker', 'in', basket_tickers)])
+        base_cols = list(dict.fromkeys(base_cols))
+        try:
+            df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
+                                 columns=[c for c in base_cols if c],
+                                 filters=[('Ticker', 'in', basket_tickers)])
+        except Exception:
+            df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
+                                 filters=[('Ticker', 'in', basket_tickers)])
+            df = df[[c for c in base_cols if c in df.columns]]
     else:
         if not INDIVIDUAL_SIGNALS_FILE.exists():
             raise HTTPException(status_code=404, detail="Signals file not found")
         base_cols = ['Ticker', 'Date', 'Close', is_col] + trade_cols
+        if use_custom_exit:
+            exit_is = EXIT_IS_COL.get(exit_signal)
+            if exit_is and exit_is not in base_cols:
+                base_cols.append(exit_is)
+            base_cols.extend(['High', 'Low'])
+            if exit_rv_multiple is not None or stop_rv_multiple is not None or trailing_stop_rv_multiple is not None:
+                base_cols.append('RV_EMA')
         for flt in filters:
             if flt.source == 'self' and flt.metric not in base_cols:
                 base_cols.append(flt.metric)
-        df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
-                             columns=[c for c in base_cols if c],
-                             filters=[('Ticker', '==', target)])
+        base_cols = list(dict.fromkeys(base_cols))
+        try:
+            df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
+                                 columns=[c for c in base_cols if c],
+                                 filters=[('Ticker', '==', target)])
+        except Exception:
+            df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
+                                 filters=[('Ticker', '==', target)])
+            df = df[[c for c in base_cols if c in df.columns]]
 
     df['Date'] = pd.to_datetime(df['Date'])
     if is_multi_ticker:
@@ -2656,6 +2745,18 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
 
     if df.empty:
         return [], df, {}, direction
+
+    # Compute Return filter column if needed
+    for flt in filters:
+        if flt.metric == 'Return':
+            lookback = flt.lookback or 252
+            return_col = f'__return_{lookback}'
+            if return_col not in df.columns:
+                if is_multi_ticker:
+                    df[return_col] = df.groupby('Ticker')['Close'].transform(
+                        lambda x: x / x.shift(lookback) - 1)
+                else:
+                    df[return_col] = df['Close'] / df['Close'].shift(lookback) - 1
 
     # Load external filter sources and merge
     external_sources = {}
@@ -2688,21 +2789,58 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
     if needs_ext_merge and is_multi_ticker:
         df = df.sort_values(['Ticker', 'Date']).reset_index(drop=True)
 
-    # Add shift columns for increasing/decreasing conditions
+    # Add shift columns for increasing/decreasing conditions (with lookback and EMA smoothing)
     for flt in filters:
         col_name = flt.metric
         if flt.source != 'self':
             col_name = f'{flt.metric}__{flt.source}'
+        # For Return metric, use the computed column
+        if flt.metric == 'Return':
+            col_name = f'__return_{flt.lookback or 252}'
         if flt.condition in ('increasing', 'decreasing') and col_name in df.columns:
-            if is_multi_ticker:
-                df[f'{col_name}__prev'] = df.groupby('Ticker')[col_name].shift(1)
-            else:
-                df[f'{col_name}__prev'] = df[col_name].shift(1)
+            lookback = flt.lookback or 1
+            # EMA smoothing for noisy metrics
+            col_for_shift = col_name
+            if flt.metric in ('Volume', 'RV_EMA') and flt.condition in ('increasing', 'decreasing'):
+                smooth_col = f'{col_name}__ema10'
+                if smooth_col not in df.columns:
+                    if is_multi_ticker:
+                        df[smooth_col] = df.groupby('Ticker')[col_name].transform(lambda x: x.ewm(span=10).mean())
+                    else:
+                        df[smooth_col] = df[col_name].ewm(span=10).mean()
+                col_for_shift = smooth_col
+            shift_col = f'{col_for_shift}__prev_{lookback}'
+            if shift_col not in df.columns:
+                if is_multi_ticker:
+                    df[shift_col] = df.groupby('Ticker')[col_for_shift].shift(lookback)
+                else:
+                    df[shift_col] = df[col_for_shift].shift(lookback)
+
+    # Build custom exit/stop date indexes if needed
+    exit_date_index = None
+    stop_date_index = None
+
+    def _build_signal_date_index(signal_name):
+        sig_is = EXIT_IS_COL.get(signal_name)
+        if not sig_is or sig_is not in df.columns:
+            return None
+        if is_multi_ticker:
+            idx = {}
+            for tkr, grp in df.groupby('Ticker'):
+                idx[tkr] = grp[grp[sig_is] == True]['Date'].values
+            return idx
+        else:
+            return df[df[sig_is] == True]['Date'].values
+
+    if use_custom_exit:
+        exit_date_index = _build_signal_date_index(effective_exit)
+        if stop_signal:
+            stop_date_index = _build_signal_date_index(stop_signal)
 
     # Find entry rows
     entries = df[df[is_col] == True].copy()
 
-    # Build trades from pre-computed data
+    # Build trades
     trades = []
     for _, row in entries.iterrows():
         entry_date = row['Date']
@@ -2710,7 +2848,6 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
         # For basket_tickers: skip trades where ticker wasn't in the basket at entry date
         if is_multi_ticker and _quarter_bounds:
             ticker = row.get('Ticker', '')
-            # Find the active quarter for entry_date (latest quarter start <= entry_date)
             active_tickers = None
             for q_start, q_tickers in _quarter_bounds:
                 if q_start <= entry_date:
@@ -2718,27 +2855,153 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
                 else:
                     break
             if active_tickers is None:
-                # Entry date is before any quarter — use earliest quarter
                 active_tickers = _quarter_bounds[0][1]
             if ticker not in active_tickers:
                 continue
 
         entry_price = row.get(f'{sig}_Entry_Price')
-        exit_date = row.get(f'{sig}_Exit_Date')
-        exit_price = row.get(f'{sig}_Exit_Price')
-        final_change = row.get(f'{sig}_Final_Change')
-        mfe = row.get(f'{sig}_MFE')
-        mae = row.get(f'{sig}_MAE')
+        if pd.isna(entry_price) or entry_price is None or entry_price == 0:
+            entry_price = row.get('Close', 0)
 
-        # Skip open trades (no exit)
-        if pd.isna(exit_date) or pd.isna(exit_price):
-            continue
+        if use_custom_exit:
+            entry_np = np.datetime64(entry_date)
+            tkr = row.get('Ticker', '') if is_multi_ticker else ''
+            ep = float(entry_price)
+            if ep == 0:
+                continue
 
-        # Compute bars held
-        exit_dt = pd.Timestamp(exit_date)
-        bars_held = max(1, int(np.busday_count(
-            entry_date.date(), exit_dt.date())))
+            # Collect exit candidates: (date, exit_price_override or None)
+            candidates = []
 
+            # Signal-based exit target
+            if exit_date_index is not None:
+                earr = exit_date_index.get(tkr) if is_multi_ticker else exit_date_index
+                if earr is not None and len(earr) > 0:
+                    ei = np.searchsorted(earr, entry_np, side='right')
+                    if ei < len(earr):
+                        candidates.append((pd.Timestamp(earr[ei]), None))
+
+            # Signal-based stop
+            if stop_date_index is not None:
+                sarr = stop_date_index.get(tkr) if is_multi_ticker else stop_date_index
+                if sarr is not None and len(sarr) > 0:
+                    si = np.searchsorted(sarr, entry_np, side='right')
+                    if si < len(sarr):
+                        candidates.append((pd.Timestamp(sarr[si]), None))
+
+            # RV-based price targets (forward scan through High/Low)
+            if (exit_rv_multiple is not None or stop_rv_multiple is not None):
+                rv_ema = row.get('RV_EMA')
+                if pd.notna(rv_ema) and float(rv_ema) > 0:
+                    rv = float(rv_ema)
+                    if is_multi_ticker:
+                        fwd = df[(df['Ticker'] == tkr) & (df['Date'] > entry_date)]
+                    else:
+                        fwd = df[df['Date'] > entry_date]
+                    if not fwd.empty and 'High' in fwd.columns and 'Low' in fwd.columns:
+                        if exit_rv_multiple is not None:
+                            if direction == 'long':
+                                target_px = ep * (1 + exit_rv_multiple * rv)
+                                hits = fwd[fwd['High'] >= target_px]
+                            else:
+                                target_px = ep * (1 - exit_rv_multiple * rv)
+                                hits = fwd[fwd['Low'] <= target_px]
+                            if not hits.empty:
+                                candidates.append((hits.iloc[0]['Date'], target_px))
+                        if stop_rv_multiple is not None:
+                            if direction == 'long':
+                                stop_px = ep * (1 - stop_rv_multiple * rv)
+                                hits = fwd[fwd['Low'] <= stop_px]
+                            else:
+                                stop_px = ep * (1 + stop_rv_multiple * rv)
+                                hits = fwd[fwd['High'] >= stop_px]
+                            if not hits.empty:
+                                candidates.append((hits.iloc[0]['Date'], stop_px))
+
+            # Trailing RVol stop (day-by-day scan — stop ratchets with new extremes)
+            if trailing_stop_rv_multiple is not None:
+                rv_ema = row.get('RV_EMA')
+                if pd.notna(rv_ema) and float(rv_ema) > 0:
+                    rv = float(rv_ema)
+                    trail_offset = trailing_stop_rv_multiple * rv * ep
+                    if is_multi_ticker:
+                        fwd_t = df[(df['Ticker'] == tkr) & (df['Date'] > entry_date)]
+                    else:
+                        fwd_t = df[df['Date'] > entry_date]
+                    # Limit scan horizon to earliest other candidate (optimization)
+                    if candidates:
+                        horizon = min(c[0] for c in candidates)
+                        fwd_t = fwd_t[fwd_t['Date'] <= horizon]
+                    if not fwd_t.empty and 'High' in fwd_t.columns and 'Low' in fwd_t.columns:
+                        if direction == 'long':
+                            best = ep  # best high seen
+                            stop_lvl = ep - trail_offset
+                            for _, frow in fwd_t.iterrows():
+                                fh = float(frow['High']) if pd.notna(frow.get('High')) else best
+                                fl = float(frow['Low']) if pd.notna(frow.get('Low')) else fh
+                                if fh > best:
+                                    best = fh
+                                    stop_lvl = best - trail_offset
+                                if fl <= stop_lvl:
+                                    candidates.append((frow['Date'], stop_lvl))
+                                    break
+                        else:
+                            best = ep  # best low seen
+                            stop_lvl = ep + trail_offset
+                            for _, frow in fwd_t.iterrows():
+                                fl = float(frow['Low']) if pd.notna(frow.get('Low')) else best
+                                fh = float(frow['High']) if pd.notna(frow.get('High')) else fl
+                                if fl < best:
+                                    best = fl
+                                    stop_lvl = best + trail_offset
+                                if fh >= stop_lvl:
+                                    candidates.append((frow['Date'], stop_lvl))
+                                    break
+
+            if not candidates:
+                continue
+
+            # Take earliest; on tie prefer stop (conservative)
+            candidates.sort(key=lambda c: c[0])
+            exit_dt = candidates[0][0]
+            exit_price_override = candidates[0][1]
+
+            # Get exit price and compute MFE/MAE from High/Low
+            if is_multi_ticker:
+                tkr_df = df[(df['Ticker'] == tkr) & (df['Date'] >= entry_date) & (df['Date'] <= exit_dt)]
+            else:
+                tkr_df = df[(df['Date'] >= entry_date) & (df['Date'] <= exit_dt)]
+            if tkr_df.empty:
+                continue
+            if exit_price_override is not None:
+                exit_price = exit_price_override
+            else:
+                exit_row = tkr_df[tkr_df['Date'] == exit_dt]
+                exit_price = float(exit_row['Close'].iloc[0]) if not exit_row.empty else float(tkr_df['Close'].iloc[-1])
+            if direction == 'long':
+                final_change = (exit_price - ep) / ep
+                max_high = float(tkr_df['High'].max()) if 'High' in tkr_df.columns else exit_price
+                min_low = float(tkr_df['Low'].min()) if 'Low' in tkr_df.columns else exit_price
+                mfe = (max_high - ep) / ep
+                mae = (min_low - ep) / ep
+            else:
+                final_change = (ep - exit_price) / ep
+                max_high = float(tkr_df['High'].max()) if 'High' in tkr_df.columns else exit_price
+                min_low = float(tkr_df['Low'].min()) if 'Low' in tkr_df.columns else exit_price
+                mfe = (ep - min_low) / ep
+                mae = (ep - max_high) / ep
+        else:
+            # Default exit: use pre-computed columns
+            exit_date_val = row.get(f'{sig}_Exit_Date')
+            exit_price = row.get(f'{sig}_Exit_Price')
+            final_change = row.get(f'{sig}_Final_Change')
+            mfe = row.get(f'{sig}_MFE')
+            mae = row.get(f'{sig}_MAE')
+            if pd.isna(exit_date_val) or pd.isna(exit_price):
+                continue
+            exit_dt = pd.Timestamp(exit_date_val)
+
+        bars_held = max(1, int(np.busday_count(entry_date.date(), exit_dt.date())))
         trade_return = float(final_change) if pd.notna(final_change) else 0.0
 
         # Apply regime filters
@@ -2749,17 +3012,34 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
             col_name = flt.metric
             if flt.source != 'self':
                 col_name = f'{flt.metric}__{flt.source}'
+            # For Return metric, use computed column
+            if flt.metric == 'Return':
+                col_name = f'__return_{flt.lookback or 252}'
             val = row.get(col_name)
+            if val is None and col_name not in row.index:
+                continue  # skip filter if column missing
             if flt.condition == 'above':
                 regime_pass = regime_pass and (pd.notna(val) and float(val) > flt.value)
             elif flt.condition == 'below':
                 regime_pass = regime_pass and (pd.notna(val) and float(val) < flt.value)
             elif flt.condition == 'increasing':
-                prev_val = row.get(f'{col_name}__prev')
-                regime_pass = regime_pass and (pd.notna(val) and pd.notna(prev_val) and float(val) > float(prev_val))
+                lookback = flt.lookback or 1
+                actual_col = col_name
+                if flt.metric in ('Volume', 'RV_EMA'):
+                    actual_col = f'{col_name}__ema10'
+                prev_col = f'{actual_col}__prev_{lookback}'
+                cur = row.get(actual_col if flt.metric in ('Volume', 'RV_EMA') else col_name)
+                prev_val = row.get(prev_col)
+                regime_pass = regime_pass and (pd.notna(cur) and pd.notna(prev_val) and float(cur) > float(prev_val))
             elif flt.condition == 'decreasing':
-                prev_val = row.get(f'{col_name}__prev')
-                regime_pass = regime_pass and (pd.notna(val) and pd.notna(prev_val) and float(val) < float(prev_val))
+                lookback = flt.lookback or 1
+                actual_col = col_name
+                if flt.metric in ('Volume', 'RV_EMA'):
+                    actual_col = f'{col_name}__ema10'
+                prev_col = f'{actual_col}__prev_{lookback}'
+                cur = row.get(actual_col if flt.metric in ('Volume', 'RV_EMA') else col_name)
+                prev_val = row.get(prev_col)
+                regime_pass = regime_pass and (pd.notna(cur) and pd.notna(prev_val) and float(cur) < float(prev_val))
             elif flt.condition == 'equals_true':
                 regime_pass = regime_pass and (pd.notna(val) and bool(val))
             elif flt.condition == 'equals_false':
@@ -2813,7 +3093,7 @@ def get_date_range(target_type: str, target: str):
         raise HTTPException(status_code=404, detail="No data found")
     return {"min": dates.min().strftime('%Y-%m-%d'), "max": dates.max().strftime('%Y-%m-%d')}
 
-def _build_buy_hold(target, target_type, start_date, end_date):
+def _build_buy_hold(target, target_type, start_date, end_date, direction='long'):
     """Build a buy-and-hold backtest result from the Close series."""
     if target_type == 'basket':
         basket_file = _find_basket_parquet(target)
@@ -2821,7 +3101,7 @@ def _build_buy_hold(target, target_type, start_date, end_date):
             raise HTTPException(status_code=404, detail=f"Basket file not found for {target}")
         df = pd.read_parquet(basket_file, columns=['Date', 'Close'])
     elif target_type == 'basket_tickers':
-        raise HTTPException(status_code=400, detail="Buy & Hold not supported for basket_tickers mode — use basket mode")
+        raise HTTPException(status_code=400, detail="Long/Short not supported for basket_tickers mode — use basket mode")
     else:
         if not INDIVIDUAL_SIGNALS_FILE.exists():
             raise HTTPException(status_code=404, detail="Signals file not found")
@@ -2841,19 +3121,25 @@ def _build_buy_hold(target, target_type, start_date, end_date):
     closes = df.drop_duplicates('Date').set_index('Date')['Close'].sort_index()
     first_close = float(closes.iloc[0])
     last_close = float(closes.iloc[-1])
-    total_return = last_close / first_close - 1 if first_close else 0
+    if direction == 'long':
+        total_return = last_close / first_close - 1 if first_close else 0
+        mfe_val = float(closes.max()) / first_close - 1 if first_close else 0
+        mae_val = float(closes.min()) / first_close - 1 if first_close else 0
+    else:
+        total_return = (first_close - last_close) / first_close if first_close else 0
+        mfe_val = (first_close - float(closes.min())) / first_close if first_close else 0
+        mae_val = (first_close - float(closes.max())) / first_close if first_close else 0
     entry_date = closes.index[0]
     exit_date = closes.index[-1]
     bars = max(1, int(np.busday_count(entry_date.date(), exit_date.date())))
-    # Single trade
     trade = {
         'entry_date': entry_date.strftime('%Y-%m-%d'),
         'exit_date': exit_date.strftime('%Y-%m-%d'),
         'entry_price': round(first_close, 2),
         'exit_price': round(last_close, 2),
         'change': round(total_return, 6),
-        'mfe': round(float(closes.max()) / first_close - 1, 6) if first_close else 0,
-        'mae': round(float(closes.min()) / first_close - 1, 6) if first_close else 0,
+        'mfe': round(mfe_val, 6),
+        'mae': round(mae_val, 6),
         'bars_held': bars,
         'regime_pass': True,
         'entry_weight': 1.0,
@@ -2882,270 +3168,51 @@ def _build_buy_hold(target, target_type, start_date, end_date):
 @app.post("/api/backtest")
 def run_backtest(req: BacktestRequest):
     sig = req.entry_signal
-    if sig == 'Buy_Hold':
-        return _build_buy_hold(req.target, req.target_type, req.start_date, req.end_date)
-    is_col = SIGNAL_IS_COL.get(sig)
-    if not is_col:
-        raise HTTPException(status_code=400, detail=f"Unknown signal: {sig}")
-    direction = BACKTEST_DIRECTION[sig]
+    # Handle Long/Short/Buy_Hold via _build_buy_hold
+    if sig in ('Buy_Hold', 'Long', 'Short'):
+        direction = 'short' if sig == 'Short' else 'long'
+        return _build_buy_hold(req.target, req.target_type, req.start_date, req.end_date, direction)
 
-    # Trade data columns for entry signal
-    trade_cols = [f'{sig}_Entry_Price', f'{sig}_Exit_Date', f'{sig}_Exit_Price',
-                  f'{sig}_Final_Change', f'{sig}_MFE', f'{sig}_MAE']
-
-    # Regime filter metrics we may need
-    pct_metrics = {'Uptrend_Pct', 'Breakout_Pct', 'Correlation_Pct', 'RV_EMA', 'Breakdown_Pct', 'Downtrend_Pct'}
-    bool_metrics = {'Is_Breakout_Sequence', 'Trend', 'BTFD_Triggered', 'STFR_Triggered'}
+    # Delegate trade building to _build_leg_trades
+    trades, df, ticker_closes, direction = _build_leg_trades(
+        req.target, req.target_type, sig, req.filters,
+        req.start_date, req.end_date, exit_signal=req.exit_signal,
+        stop_signal=req.stop_signal, exit_rv_multiple=req.exit_rv_multiple,
+        stop_rv_multiple=req.stop_rv_multiple, trailing_stop_rv_multiple=req.trailing_stop_rv_multiple,
+        no_exit_target=bool(req.no_exit_target),
+    )
 
     is_multi_ticker = req.target_type == 'basket_tickers'
 
-    # 1. Load target data
-    _quarter_bounds = None  # Set by basket_tickers path for membership filtering
-    if req.target_type == 'basket':
-        basket_file = _find_basket_parquet(req.target)
-        if not basket_file:
-            raise HTTPException(status_code=404, detail=f"Basket file not found for {req.target}")
-        base_cols = ['Date', 'Close', is_col] + trade_cols
-        # Add self-filter metrics
-        for flt in req.filters:
-            if flt.source == 'self' and flt.metric not in base_cols:
-                base_cols.append(flt.metric)
-        try:
-            df = pd.read_parquet(basket_file, columns=[c for c in base_cols if c])
-        except Exception:
-            df = pd.read_parquet(basket_file)
-            df = df[[c for c in base_cols if c in df.columns]]
-    elif req.target_type == 'basket_tickers':
-        # Load individual ticker signals for all tickers in the basket
-        if not INDIVIDUAL_SIGNALS_FILE.exists():
-            raise HTTPException(status_code=404, detail="Signals file not found")
-        # Build quarterly universe history for membership filtering
-        _universe_history = _get_universe_history(req.target)
-        if _universe_history:
-            if req.start_date and req.end_date:
-                basket_tickers = _get_universe_tickers_for_range(req.target, pd.Timestamp(req.start_date), pd.Timestamp(req.end_date))
-            elif req.start_date:
-                basket_tickers = _get_universe_tickers_for_range(req.target, pd.Timestamp(req.start_date), pd.Timestamp('2099-12-31'))
-            else:
-                basket_tickers = list({t for tks in _universe_history.values() for t in tks})
-            _quarter_bounds = sorted(
-                [(_quarter_str_to_date(q), set(tks)) for q, tks in _universe_history.items()],
-                key=lambda x: x[0]
-            )
-        else:
-            basket_tickers = get_latest_universe_tickers(req.target)
-            if not basket_tickers:
-                basket_tickers = get_meta_file_tickers(req.target)
-        if not basket_tickers:
-            raise HTTPException(status_code=404, detail=f"No tickers found for basket {req.target}")
-        base_cols = ['Ticker', 'Date', 'Close', is_col] + trade_cols
-        for flt in req.filters:
-            if flt.source == 'self' and flt.metric not in base_cols:
-                base_cols.append(flt.metric)
-        df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
-                             columns=[c for c in base_cols if c],
-                             filters=[('Ticker', 'in', basket_tickers)])
-    else:
-        if not INDIVIDUAL_SIGNALS_FILE.exists():
-            raise HTTPException(status_code=404, detail="Signals file not found")
-        base_cols = ['Ticker', 'Date', 'Close', is_col] + trade_cols
-        for flt in req.filters:
-            if flt.source == 'self' and flt.metric not in base_cols:
-                base_cols.append(flt.metric)
-        df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
-                             columns=[c for c in base_cols if c],
-                             filters=[('Ticker', '==', req.target)])
+    # Capture date range from df
+    if df.empty:
+        return {"trades": [], "trade_paths": [], "equity_curve": {"dates": [], "filtered": [], "unfiltered": []},
+                "stats": {"filtered": {}, "unfiltered": {}}, "date_range": {"min": "", "max": ""}}
 
-    df['Date'] = pd.to_datetime(df['Date'])
-    if is_multi_ticker:
-        df = df.sort_values(['Ticker', 'Date']).reset_index(drop=True)
-    else:
-        df = df.sort_values('Date').reset_index(drop=True)
-
-    # Capture full date range before any filtering
     date_range = {
         "min": df['Date'].min().strftime('%Y-%m-%d'),
         "max": df['Date'].max().strftime('%Y-%m-%d'),
     }
 
-    # 2. Date range filter
-    if req.start_date:
-        df = df[df['Date'] >= pd.Timestamp(req.start_date)]
-    if req.end_date:
-        df = df[df['Date'] <= pd.Timestamp(req.end_date)]
-
-    if df.empty:
-        return {"trades": [], "trade_paths": [], "equity_curve": {"dates": [], "filtered": [], "unfiltered": []},
-                "stats": {"filtered": {}, "unfiltered": {}}, "date_range": date_range}
-
-    # 3. Load external filter sources and merge
-    external_sources = {}
-    failed_sources = set()
-    needs_ext_merge = any(flt.source != 'self' for flt in req.filters)
-    if needs_ext_merge and is_multi_ticker:
-        # merge_asof requires Date-sorted df; re-sort after merges
-        df = df.sort_values('Date').reset_index(drop=True)
-    for flt in req.filters:
-        if flt.source != 'self' and flt.source not in external_sources and flt.source not in failed_sources:
-            ext_file = _find_basket_parquet(flt.source)
-            if not ext_file:
-                failed_sources.add(flt.source)
-                continue
-            ext_cols = ['Date']
-            for f2 in req.filters:
-                if f2.source == flt.source and f2.metric not in ext_cols:
-                    ext_cols.append(f2.metric)
-            try:
-                ext_df = pd.read_parquet(ext_file, columns=ext_cols)
-            except Exception:
-                ext_df = pd.read_parquet(ext_file)
-                ext_df = ext_df[[c for c in ext_cols if c in ext_df.columns]]
-            ext_df['Date'] = pd.to_datetime(ext_df['Date'])
-            ext_df = ext_df.sort_values('Date')
-            suffix = f'__{flt.source}'
-            rename_map = {c: f'{c}{suffix}' for c in ext_df.columns if c != 'Date'}
-            ext_df = ext_df.rename(columns=rename_map)
-            df = pd.merge_asof(df, ext_df, on='Date', direction='backward')
-            external_sources[flt.source] = suffix
-    if needs_ext_merge and is_multi_ticker:
-        df = df.sort_values(['Ticker', 'Date']).reset_index(drop=True)
-
-    # 4. Add shift columns for increasing/decreasing conditions
-    for flt in req.filters:
-        col_name = flt.metric
-        if flt.source != 'self':
-            col_name = f'{flt.metric}__{flt.source}'
-        if flt.condition in ('increasing', 'decreasing') and col_name in df.columns:
-            if is_multi_ticker:
-                df[f'{col_name}__prev'] = df.groupby('Ticker')[col_name].shift(1)
-            else:
-                df[f'{col_name}__prev'] = df[col_name].shift(1)
-
-    # 5. Find entry rows
-    entries = df[df[is_col] == True].copy()
-
-    # 6. Build trades from pre-computed data
-    trades = []
-    for _, row in entries.iterrows():
-        entry_date = row['Date']
-
-        # For basket_tickers: skip trades where ticker wasn't in the basket at entry date
-        if is_multi_ticker and _quarter_bounds:
-            ticker = row.get('Ticker', '')
-            active_tickers = None
-            for q_start, q_tickers in _quarter_bounds:
-                if q_start <= entry_date:
-                    active_tickers = q_tickers
-                else:
-                    break
-            if active_tickers is None:
-                active_tickers = _quarter_bounds[0][1]
-            if ticker not in active_tickers:
-                continue
-
-        entry_price = row.get(f'{sig}_Entry_Price')
-        exit_date = row.get(f'{sig}_Exit_Date')
-        exit_price = row.get(f'{sig}_Exit_Price')
-        final_change = row.get(f'{sig}_Final_Change')
-        mfe = row.get(f'{sig}_MFE')
-        mae = row.get(f'{sig}_MAE')
-
-        # Skip open trades (no exit)
-        if pd.isna(exit_date) or pd.isna(exit_price):
-            continue
-
-        # Compute bars held
-        exit_dt = pd.Timestamp(exit_date)
-        # Count trading days between entry and exit using business days
-        bars_held = max(1, int(np.busday_count(
-            entry_date.date(), exit_dt.date())))
-
-        # Apply direction: for short signals, the raw Final_Change is already
-        # from the perspective of the signal (positive = profitable short).
-        # We use Final_Change as-is since the signals engine already accounts for direction.
-        trade_return = float(final_change) if pd.notna(final_change) else 0.0
-
-        # Apply regime filters
-        regime_pass = True
-        for flt in req.filters:
-            # Skip filters whose external source had no data
-            if flt.source != 'self' and flt.source in failed_sources:
-                continue
-            col_name = flt.metric
-            if flt.source != 'self':
-                col_name = f'{flt.metric}__{flt.source}'
-            val = row.get(col_name)
-            if flt.condition == 'above':
-                regime_pass = regime_pass and (pd.notna(val) and float(val) > flt.value)
-            elif flt.condition == 'below':
-                regime_pass = regime_pass and (pd.notna(val) and float(val) < flt.value)
-            elif flt.condition == 'increasing':
-                prev_val = row.get(f'{col_name}__prev')
-                regime_pass = regime_pass and (pd.notna(val) and pd.notna(prev_val) and float(val) > float(prev_val))
-            elif flt.condition == 'decreasing':
-                prev_val = row.get(f'{col_name}__prev')
-                regime_pass = regime_pass and (pd.notna(val) and pd.notna(prev_val) and float(val) < float(prev_val))
-            elif flt.condition == 'equals_true':
-                regime_pass = regime_pass and (pd.notna(val) and bool(val))
-            elif flt.condition == 'equals_false':
-                regime_pass = regime_pass and (pd.notna(val) and not bool(val))
-
-        trade_dict = {
-            'entry_date': entry_date.strftime('%Y-%m-%d'),
-            'exit_date': exit_dt.strftime('%Y-%m-%d'),
-            'entry_price': safe_float(entry_price, 2),
-            'exit_price': safe_float(exit_price, 2),
-            'change': safe_float(trade_return, 4),
-            'mfe': safe_float(mfe, 4),
-            'mae': safe_float(mae, 4),
-            'bars_held': bars_held,
-            'regime_pass': regime_pass,
-            'entry_weight': None,
-            'exit_weight': None,
-            'contribution': None,
-        }
-        if is_multi_ticker:
-            trade_dict['ticker'] = row.get('Ticker', '')
-        trades.append(trade_dict)
-
-    # 6b. Compute trade paths (daily cumulative return from entry to exit)
+    # Compute trade paths
     trade_paths = []
-    if is_multi_ticker:
-        # Build per-ticker close series for path lookup
-        ticker_closes = {}
-        for tkr, grp in df.groupby('Ticker'):
-            ticker_closes[tkr] = grp.set_index('Date')['Close'].sort_index()
-        for t in trades:
-            ep = t['entry_price']
-            tkr = t.get('ticker', '')
-            if ep is None or ep == 0 or tkr not in ticker_closes:
-                trade_paths.append([])
-                continue
-            ed = pd.Timestamp(t['entry_date'])
-            xd = pd.Timestamp(t['exit_date'])
-            cs = ticker_closes[tkr]
-            segment = cs[(cs.index >= ed) & (cs.index <= xd)]
-            path = [round(float(c) / ep - 1, 6) for c in segment.values]
-            trade_paths.append(path)
-    else:
-        closes = df.set_index('Date')['Close'].sort_index()
-        for t in trades:
-            ep = t['entry_price']
-            if ep is None or ep == 0:
-                trade_paths.append([])
-                continue
-            ed = pd.Timestamp(t['entry_date'])
-            xd = pd.Timestamp(t['exit_date'])
-            mask = (closes.index >= ed) & (closes.index <= xd)
-            segment = closes[mask]
-            path = [round(float(c) / ep - 1, 6) for c in segment.values]
-            trade_paths.append(path)
+    for t in trades:
+        ep = t['entry_price']
+        tkr = t.get('ticker', '')
+        if ep is None or ep == 0:
+            trade_paths.append([])
+            continue
+        ed = pd.Timestamp(t['entry_date'])
+        xd = pd.Timestamp(t['exit_date'])
+        cs = ticker_closes.get(tkr)
+        if cs is None:
+            trade_paths.append([])
+            continue
+        segment = cs[(cs.index >= ed) & (cs.index <= xd)]
+        path = [round(float(c) / ep - 1, 6) for c in segment.values]
+        trade_paths.append(path)
 
-    # Ensure ticker_closes is available for both modes
-    if not is_multi_ticker:
-        ticker_closes = {'': closes}
-
-    # 7. Build daily mark-to-market equity curves with position sizing
+    # Build daily mark-to-market equity curves with position sizing
     paired = sorted(zip(trades, trade_paths), key=lambda p: p[0]['exit_date'])
     sorted_trades = [p[0] for p in paired]
     sorted_paths = [p[1] for p in paired]
@@ -3154,10 +3221,8 @@ def run_backtest(req: BacktestRequest):
     max_lev = req.max_leverage
     is_long = direction == 'long'
 
-    # Build daily date index
     all_dates = sorted(df['Date'].unique())
 
-    # Build entry/exit date maps for O(1) lookup
     entry_map = {}
     exit_map = {}
     trade_map = {i: t for i, t in enumerate(sorted_trades)}
@@ -3168,7 +3233,6 @@ def run_backtest(req: BacktestRequest):
         exit_map.setdefault(xd, []).append(i)
 
     def mtm_equity(open_pos, cash, close_date):
-        """Compute mark-to-market equity: cash + sum of position values."""
         total = cash
         for info in open_pos.values():
             tkr = info.get('ticker', '')
@@ -3190,7 +3254,7 @@ def run_backtest(req: BacktestRequest):
 
     cash_all = initial
     cash_filt = initial
-    open_all = {}   # trade_index -> {alloc, entry_price, ticker}
+    open_all = {}
     open_filt = {}
     eq_dates = []
     eq_all_vals = []
@@ -3199,8 +3263,6 @@ def run_backtest(req: BacktestRequest):
     blew_up = None
 
     for date in all_dates:
-        # Process exits first (frees capital before new entries)
-        # Compute pre-exit equity for exit weight calculation (only if filtered exits exist)
         filt_exits_today = [idx for idx in exit_map.get(date, []) if idx in open_filt]
         pre_exit_eq_filt = mtm_equity(open_filt, cash_filt, date) if filt_exits_today else 0
         for idx in exit_map.get(date, []):
@@ -3218,14 +3280,13 @@ def run_backtest(req: BacktestRequest):
                 trade_map[idx]['exit_weight'] = round(exit_val / pre_exit_eq_filt, 4) if pre_exit_eq_filt > 0 else 0
                 trade_map[idx]['contribution'] = round(ew * ret, 4)
 
-        # Process entries (allocate capital)
         for idx in entry_map.get(date, []):
             t = trade_map[idx]
             eq_est = mtm_equity(open_all, cash_all, date)
             if eq_est <= 0:
                 continue
             wanted = eq_est * pos_size * max_lev
-            exposure = eq_est - cash_all  # MTM exposure (appreciated positions count at current value)
+            exposure = eq_est - cash_all
             room = max(0, eq_est * max_lev - exposure)
             alloc = min(wanted, room)
             if alloc > 0:
@@ -3236,7 +3297,7 @@ def run_backtest(req: BacktestRequest):
                 eq_est_f = mtm_equity(open_filt, cash_filt, date)
                 if eq_est_f > 0:
                     wanted_f = eq_est_f * pos_size * max_lev
-                    exposure_f = eq_est_f - cash_filt  # MTM exposure
+                    exposure_f = eq_est_f - cash_filt
                     room_f = max(0, eq_est_f * max_lev - exposure_f)
                     alloc_f = min(wanted_f, room_f)
                     if alloc_f > 0:
@@ -3248,7 +3309,6 @@ def run_backtest(req: BacktestRequest):
                         trade_map[idx]['entry_weight'] = entry_wt
                         trade_map[idx]['_was_taken'] = True
 
-        # Record daily mark-to-market equity
         equity_all = mtm_equity(open_all, cash_all, date)
         equity_filt = mtm_equity(open_filt, cash_filt, date)
         di = len(eq_dates)
@@ -3260,7 +3320,6 @@ def run_backtest(req: BacktestRequest):
         if equity_filt <= 0 and blew_up is None:
             blew_up = {"date": eq_dates[-1], "trade_index": -1, "equity": "filtered"}
 
-        # Track daily positions for constituents overlay
         if open_filt:
             positions = []
             for tidx, info in open_filt.items():
@@ -3299,7 +3358,7 @@ def run_backtest(req: BacktestRequest):
                 'positions': positions,
             }
 
-    # Build buy-and-hold curve (aligned to equity curve dates)
+    # Build buy-and-hold curve
     if is_multi_ticker:
         basket_file_bh = _find_basket_parquet(req.target)
         if basket_file_bh:
@@ -3328,7 +3387,7 @@ def run_backtest(req: BacktestRequest):
     else:
         bh_vals = [round(initial, 2)] * len(all_dates)
 
-    # 8. Compute stats
+    # Compute stats
     def compute_stats(trade_list, equity_vals):
         if not trade_list:
             return {'trades': 0, 'trades_met_criteria': 0, 'trades_taken': 0, 'trades_skipped': 0,
@@ -3347,7 +3406,6 @@ def run_backtest(req: BacktestRequest):
         gross_profit = sum(winners)
         gross_loss = abs(sum(losers))
         profit_factor = gross_profit / gross_loss if gross_loss > 0 else (999 if gross_profit > 0 else 0)
-        # Max drawdown from equity curve values (peak-to-trough / peak)
         max_dd = 0.0
         if equity_vals:
             peak = equity_vals[0]
@@ -3358,16 +3416,11 @@ def run_backtest(req: BacktestRequest):
                     max_dd = max(max_dd, dd)
         avg_bars = sum(t['bars_held'] for t in taken) / len(taken) if taken else 0
         return {
-            'trades': total,
-            'trades_met_criteria': met_criteria,
-            'trades_taken': total,
-            'trades_skipped': met_criteria - total,
-            'win_rate': round(win_rate, 4),
-            'avg_winner': round(avg_winner, 4),
-            'avg_loser': round(avg_loser, 4),
-            'ev': round(ev, 4),
-            'profit_factor': round(profit_factor, 2),
-            'max_dd': round(max_dd, 4),
+            'trades': total, 'trades_met_criteria': met_criteria,
+            'trades_taken': total, 'trades_skipped': met_criteria - total,
+            'win_rate': round(win_rate, 4), 'avg_winner': round(avg_winner, 4),
+            'avg_loser': round(avg_loser, 4), 'ev': round(ev, 4),
+            'profit_factor': round(profit_factor, 2), 'max_dd': round(max_dd, 4),
             'avg_bars': round(avg_bars, 1),
         }
 
@@ -3375,7 +3428,6 @@ def run_backtest(req: BacktestRequest):
     stats_filtered = compute_stats(filtered_trades, eq_filt_vals)
     stats_unfiltered = compute_stats(trades, eq_all_vals)
 
-    # Clean up internal fields before returning
     for t in trades:
         t.pop('_was_taken', None)
 
@@ -3497,6 +3549,11 @@ def run_multi_backtest(req: MultiBacktestRequest):
         trades, df, ticker_closes, direction = _build_leg_trades(
             leg.target, leg.target_type, leg.entry_signal,
             leg.filters, req.start_date, req.end_date,
+            exit_signal=leg.exit_signal, stop_signal=leg.stop_signal,
+            exit_rv_multiple=leg.exit_rv_multiple,
+            stop_rv_multiple=leg.stop_rv_multiple,
+            trailing_stop_rv_multiple=leg.trailing_stop_rv_multiple,
+            no_exit_target=bool(leg.no_exit_target),
         )
         if not df.empty:
             dates_in_leg = sorted(df['Date'].unique())

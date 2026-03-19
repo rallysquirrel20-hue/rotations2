@@ -21,7 +21,7 @@ rotations/
 │           │   ├── TVChart.tsx        Multi-pane chart (lightweight-charts)
 │           │   ├── BasketSummary.tsx  Intrabasket analysis (Signals/Correlation/Returns/Contribution)
 │           │   ├── BacktestPanel.tsx  Backtesting UI
-│           │   └── AnalogsPanel.tsx   Analogs analysis (Summary/Analogs/Comparison/Forward/Aggregate tabs)
+│           │   └── AnalogsPanel.tsx   Analogs analysis (Summary/Forward/Aggregate tabs)
 │           └── index.css         Solarized Light theme
 ├── .claude/              Agent reference files
 │   ├── agents/           Agent definitions

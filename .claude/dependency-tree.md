@@ -1,5 +1,5 @@
 # Dependency Tree
-Updated: 2026-03-18 (incremental — _live_is_current stale-data guard, mode=query condition search, _was_taken trade tracking, strategy_scanner.py new file)
+Updated: 2026-03-19 (incremental — last_price field in get_ticker_signals/get_basket_breadth, App.tsx resizable sidebar + column visibility toggles + price column)
 Files scanned: 16
 Functions indexed: 241
 
@@ -27,7 +27,7 @@ Functions indexed: 241
 | signals/rotations.py | 6206 | 143 | Main pipeline: universe, signals, baskets, live, reports |
 | signals/rotations_old_outputs.py | 2177 | 35 | Extracted Group B report cells (Excel, correlations, charts, PDFs) |
 | signals/databento_test.py | 624 | 16 | Databento API connectivity tests |
-| app/backend/main.py | 3963 | 44 | FastAPI REST endpoints + WebSocket |
+| app/backend/main.py | 4020 | 44 | FastAPI REST endpoints + WebSocket |
 | signals/test_all_optimizations.py | 75 | 1 | Compares old vs new breadth/contributions/correlation values after rebuild |
 | signals/test_correlation_optimization.py | 207 | 5 | Step-by-step test harness: backup, compare, check returns_matrix, test API, restore |
 | app/backend/signals_engine.py | 534 | 2 | Live signal computation (parallel impl) |
@@ -98,8 +98,8 @@ Functions indexed: 241
 | `EMA_MULT` | 2.0/11.0 | signals/rotations.py | 1227 | Range EMA alpha |
 | `RV_EMA_ALPHA` | 2.0/11.0 | signals/rotations.py | 1228 | RV EMA span=10 alpha |
 | `SIGNALS` | ['Up_Rot','Down_Rot','Breakout','Breakdown','BTFD','STFR'] | signals/rotations.py | 1225 | Signal type list |
-| `SIGNAL_TYPES` | ['Breakout','Breakdown','Up_Rot','Down_Rot','BTFD','STFR','Buy_Hold'] | app/backend/main.py | 1751 | Backtest signal type list (includes Buy_Hold) |
-| `BACKTEST_DIRECTION` | {Up_Rot:'long', Down_Rot:'short', Breakout:'long', Breakdown:'short', BTFD:'long', STFR:'short', Buy_Hold:'long'} | app/backend/main.py | 1759 | Signal-to-direction map (includes Buy_Hold) |
+| `SIGNAL_TYPES` | ['Breakout','Breakdown','Up_Rot','Down_Rot','BTFD','STFR','Long','Short'] | app/backend/main.py | 1757 | Backtest signal type list (includes Buy_Hold) |
+| `BACKTEST_DIRECTION` | {Up_Rot:'long', Down_Rot:'short', Breakout:'long', Breakdown:'short', BTFD:'long', STFR:'short', Buy_Hold:'long'} | app/backend/main.py | 1766 | Signal-to-direction map (includes Buy_Hold) |
 
 ---
 
@@ -112,7 +112,7 @@ These functions exist in BOTH signals/rotations.py AND app/backend/signals_engin
 | `_build_signals_from_df` | L1804-1940 (numba-accelerated) | L85-343 (pure Python) | rotations.py uses `@numba.njit` for passes 1-5; signals_engine.py uses Python loops with set-based tracking |
 | `_build_signals_next_row` | L1943-2131 | L346-534 | Near-identical logic; both are Python; used for incremental 1-bar updates |
 | `RollingStatsAccumulator` | L1274-1351 (class, deque-based) | L11-82 (class, list-based) | Same interface; rotations.py uses `collections.deque(maxlen=3)`, signals_engine.py uses `list` with `pop(0)` |
-| `_build_leg_trades` | main.py L2518-2795 | — | Extracted trade-building logic; called only by `run_multi_backtest`; includes Buy_Hold early return; `run_backtest` still has its own inline trade-building logic; trade dicts include `entry_weight`/`exit_weight`/`contribution` fields |
+| `_build_leg_trades` | main.py L2553-3077 | — | Extracted trade-building logic; called only by `run_multi_backtest`; includes Buy_Hold early return; `run_backtest` still has its own inline trade-building logic; trade dicts include `entry_weight`/`exit_weight`/`contribution` fields |
 
 Functions in main.py that DUPLICATE logic from rotations.py (not exact copies but same purpose):
 
@@ -509,7 +509,7 @@ Functions in verify_backtest.py that duplicate logic from other files (independe
 - **Returns:** `(ohlc_df, contrib_df)` tuple; `contrib_df` is non-None only on full rebuild
 - **Called by:** `_prebuild_equity_cache_from_signals`, `process_basket_signals`
 - **Calls:** `_get_data_signature`, `_build_universe_signature`, `_load_equity_cache`, `_is_equity_cache_valid`, `compute_equity_ohlc` (with `return_contributions=True` on full rebuild), `_build_equity_meta`, `_save_equity_cache`
-- **Key behavior:** `FORCE_REBUILD_BASKET_SIGNALS` (L3601) also triggers equity rebuild so `contrib_df` is always captured; incremental-append path (L3621-3642) uses the slow loop path (no matrix params) — `contrib_df` is None in that case
+- **Key behavior:** `FORCE_REBUILD_BASKET_SIGNALS` also triggers equity rebuild so `contrib_df` is always captured; incremental-append path (L3621-3642) uses the slow loop path (no matrix params) — `contrib_df` is None in that case
 
 #### `compute_equity_curve` (L3645-3652)
 - **Called by:** (compatibility helper, not directly called in current code)
@@ -830,7 +830,7 @@ This file imports everything from rotations.py via `from rotations import *` plu
 
 ---
 
-### app/backend/main.py (3963 lines)
+### app/backend/main.py (4020 lines)
 
 #### `_read_live_parquet` (L80-91)
 - **Called by:** `_compute_live_breadth`, `get_basket_breadth`, `get_basket_returns`, `get_basket_data`, `list_live_signal_tickers`, `get_ticker_signals`, `get_ticker_data`, `get_basket_summary`
@@ -889,73 +889,79 @@ This file imports everything from rotations.py via `from rotations import *` plu
 #### `get_basket_compositions` (L405-428) — GET /api/baskets/compositions
 #### `get_basket_breadth` (L431-566) — GET /api/baskets/breadth
 - **Calls:** `_tally_breadth`, `_read_live_parquet`, `_live_is_current`, `get_latest_universe_tickers`
+- **Returns per basket:** `uptrend_pct`, `breakout_pct`, `corr_pct`, `st_trend`, `lt_trend`, `mean_rev`, `last_price`, `pct_change`
+- **last_price field:** from `last['Close']` (L472); live basket overlay also sets `entry['last_price'] = round(lc, 2)` (L554)
 
-#### `get_basket_returns` (L568-1428) — GET /api/baskets/returns
+#### `get_basket_returns` (L572-1432) — GET /api/baskets/returns
 - **Calls:** `_find_basket_parquet`, `_read_live_parquet`
 - **Nested functions:**
-  - `_categorize` (L558-564) — classifies slug as "theme", "sector", or "industry"
-  - `rank_vec` — rank values 1..B, NaN gets rank B (analogs mode inner helper)
-  - `rank_matrix` — vectorized rank_vec across all rolling windows (analogs mode inner helper)
-  - `spearman_vec` — batch Spearman rho from rank diff squares (analogs mode inner helper)
-- **Query params:** `start`, `end` (date range), `mode` ("period", "daily", or "analogs"), `basket` (slug, daily mode), `group` ("all"/"themes"/"sectors"/"industries"), `top_n` (int, analogs mode), `threshold` (float, analogs mode — minimum similarity score)
-- **Data I/O:** reads basket signal parquets (columns: Date, Close), `LIVE_BASKET_SIGNALS_FILE` (live intraday overlay); analogs mode also reads Uptrend_Pct, Breakout_Pct, Correlation_Pct, RV_EMA
-- **Constants:** `THEMATIC_CONFIG`, `BASKET_CACHE_FOLDERS`, `MULTI_TF` (local: {"1Q":63, "1Y":252, "3Y":756, "5Y":1260}), `AGG_HORIZONS` (local: {"1M":21, "3M":63, "6M":126})
+  - `_categorize` (L587-593) — classifies slug as "theme", "sector", or "industry"
+  - `rank_vec` (L803) — rank values 1..B, NaN gets rank B (analogs mode inner helper)
+  - `rank_matrix` (L838) — vectorized rank_vec across all rolling windows (analogs mode inner helper)
+  - `spearman_vec` (L863) — batch Spearman rho from rank diff squares (analogs mode inner helper)
+- **Query params:** `start`, `end` (date range), `mode` ("period", "daily", "analogs", or "query"), `basket` (slug, daily mode), `group` ("all"/"themes"/"sectors"/"industries"), `top_n` (int, analogs mode), `threshold` (float, analogs mode — minimum similarity score), `conditions` (JSON string, query mode — array of condition objects)
+- **Data I/O:** reads basket signal parquets (columns: Date, Close), `LIVE_BASKET_SIGNALS_FILE` (live intraday overlay); analogs/query modes also read Uptrend_Pct, Breakout_Pct, Correlation_Pct, RV_EMA
+- **Constants:** `THEMATIC_CONFIG`, `BASKET_CACHE_FOLDERS`, `MULTI_TF` (local: {"1D":1, "1W":5, "1M":21, "1Q":63, "1Y":252, "3Y":756, "5Y":1260}), analogs `HORIZONS` (local: {"1M":21, "1Q":63, "6M":126, "1Y":252}), `AGG_HORIZONS` (local: {"1M":21, "1Q":63, "6M":126, "1Y":252}), query `Q_HORIZONS` (local: {"1W":5, "1M":21, "1Q":63, "6M":126, "1Y":252})
 - **Key behaviors:**
   - `mode=daily`: returns daily pct_change return series for a single basket; appends live close if available
   - `mode=period` (default): returns one period return per basket; defaults to 1Y range if no dates specified; filterable by group
   - `mode=analogs`: finds top-N historical windows with highest cross-basket regime similarity using Spearman rank correlation across 5+ metrics; greedy top-N with overlap exclusion of W/2 days; expanded features:
-    - **Multi-timeframe return fingerprints** (`MULTI_TF`): Spearman rho for 1Q/1Y/3Y/5Y return snapshots, averaged into similarity score alongside breadth/breakout/correlation/volatility
+    - **Multi-timeframe return fingerprints** (`MULTI_TF`): Spearman rho for 1D/1W/1M/1Q/1Y/3Y/5Y return snapshots, averaged into similarity score alongside breadth/breakout/correlation/volatility
     - **Cross-basket rolling correlation**: pairwise close correlation across all baskets, included in similarity breakdown and current metrics
+    - **Forward returns per analog**: point-in-time returns at 1M/1Q/6M/1Y horizons per basket
     - **Forward series per analog**: daily cumulative return series per basket for up to 252 days after each analog window end
     - **Threshold filtering**: `threshold` param filters analogs by minimum similarity score before aggregation
-    - **Aggregate stats**: mean/median/min/max/std/count of forward returns at 1M/3M/6M horizons, overall and per-basket
+    - **Aggregate stats**: mean/median/min/max/std/count of forward returns at 1M/1Q/6M/1Y horizons, overall and per-basket
+  - `mode=query`: condition-based historical search; evaluates user-defined conditions (metric/operator/value per basket) against historical data; returns matching dates with forward returns at 1W/1M/1Q/6M/1Y horizons, forward series up to 252 days, and aggregate stats per horizon
 
-#### `get_basket_data` (L1429-1484) — GET /api/baskets/{basket_name}
+#### `get_basket_data` (L1434-1489) — GET /api/baskets/{basket_name}
 - **Calls:** `_find_basket_parquet`, `_read_live_parquet`, `signals_engine._build_signals_from_df`, `_compute_live_breadth`, `get_basket_weights_from_contributions`, `get_latest_universe_tickers`, `clean_data_for_json`
 
-#### `list_tickers` (L1486-1499) — GET /api/tickers
-#### `list_tickers_by_quarter` (L1501-1512) — GET /api/tickers/quarters
-#### `list_live_signal_tickers` (L1515-1601) — GET /api/live-signals
+#### `list_tickers` (L1491-1504) — GET /api/tickers
+#### `list_tickers_by_quarter` (L1506-1518) — GET /api/tickers/quarters
+#### `list_live_signal_tickers` (L1520-1606) — GET /api/live-signals
 - **Calls:** `signals_engine._build_signals_next_row`, `_read_live_parquet`
 
-#### `get_ticker_signals` (L1603-1697) — GET /api/ticker-signals
-- **Calls:** `_read_live_parquet`
+#### `get_ticker_signals` (L1608-1709) — GET /api/ticker-signals
+- **Calls:** `_read_live_parquet`, `_live_is_current`
+- **Returns per ticker:** `lt_trend`, `st_trend`, `mean_rev`, `pct_change`, `dollar_vol`, `last_price`
+- **last_price field:** from `final['Close']` (L1680); live override also sets `result[t]['last_price'] = round(live_close, 2)` (L1698)
 
-#### `get_ticker_data` (L1699-1760) — GET /api/tickers/{ticker}
+#### `get_ticker_data` (L1711-1772) — GET /api/tickers/{ticker}
 - **Calls:** `signals_engine._build_signals_next_row`, `_read_live_parquet`
 
-#### `safe_float` / `safe_int` (L1762-1771) — utility formatters
+#### `safe_float` / `safe_int` (L1784-1794) — utility formatters
 
-#### `get_basket_summary` (L1773-2227) — GET /api/baskets/{basket_name}/summary
+#### `get_basket_summary` (L1796-2250) — GET /api/baskets/{basket_name}/summary
 - **Calls:** `get_latest_universe_tickers`, `get_meta_file_tickers`, `_get_universe_history`, `_quarter_str_to_date`, `_read_live_parquet`, `_find_basket_contributions`, `_get_ticker_join_dates`, `safe_float`, `safe_int`
 
-#### `get_basket_correlation` (L2229-2275) — GET /api/baskets/{basket_name}/correlation
+#### `get_basket_correlation` (L2252-2299) — GET /api/baskets/{basket_name}/correlation
 - **Calls:** `_get_tickers_for_date`, `get_latest_universe_tickers`, `get_meta_file_tickers`
 
-#### `_find_basket_contributions` (L2278-2288)
+#### `_find_basket_contributions` (L2300-2312)
 - **Called by:** `get_basket_contributions`, `get_basket_candle_detail`, `get_basket_summary`, `get_basket_weights_from_contributions`
 
-#### `get_basket_contributions` (L2291-2376) — GET /api/baskets/{basket_name}/contributions
+#### `get_basket_contributions` (L2314-2400) — GET /api/baskets/{basket_name}/contributions
 
-#### `get_basket_candle_detail` (L2379-2454) — GET /api/baskets/{basket_name}/candle-detail
+#### `get_basket_candle_detail` (L2402-2477) — GET /api/baskets/{basket_name}/candle-detail
 
-#### `get_ticker_baskets` (L2456-2484) — GET /api/ticker-baskets/{ticker}
+#### `get_ticker_baskets` (L2479-2508) — GET /api/ticker-baskets/{ticker}
 
-#### `BacktestFilter` (L2487-2491) — Pydantic model
+#### `BacktestFilter` (L2509-2515) — Pydantic model
 - **Fields:** `metric`, `condition`, `value`, `source`
 
-#### `BacktestRequest` (L2493-2501) — Pydantic model
+#### `BacktestRequest` (L2516-2531) — Pydantic model
 - **Fields:** `target`, `target_type`, `entry_signal`, `filters`, `start_date`, `end_date`, `position_size` (default 1.0), `max_leverage` (default 2.5)
 - **Removed:** `initial_equity` (no longer user-configurable; hardcoded to 1.0 internally for percentage-based equity)
 
-#### `MultiBacktestLeg` (L2503-2509) — Pydantic model
+#### `MultiBacktestLeg` (L2532-2545) — Pydantic model
 - **Fields:** `target`, `target_type`, `entry_signal`, `allocation_pct` (0-1 fraction), `position_size` (default 1.0), `filters`
 
-#### `MultiBacktestRequest` (L2511-2517) — Pydantic model
+#### `MultiBacktestRequest` (L2546-2552) — Pydantic model
 - **Fields:** `legs`, `start_date`, `end_date`, `max_leverage` (default 2.5)
 - **Removed:** `initial_equity` (no longer user-configurable; hardcoded to 1.0 internally for percentage-based equity)
 
-#### `_build_leg_trades` (L2518-2795)
+#### `_build_leg_trades` (L2553-3077)
 - **Purpose:** extracted from `run_backtest` — builds the trades list + ticker_closes dict for a single backtest leg
 - **Called by:** `run_multi_backtest`
 - **Calls:** `_find_basket_parquet`, `get_latest_universe_tickers`, `get_meta_file_tickers`, `_get_universe_history`, `_get_universe_tickers_for_range`, `_quarter_str_to_date`, `safe_float`
@@ -969,11 +975,11 @@ This file imports everything from rotations.py via `from rotations import *` plu
   - Skips open trades (no exit_date/exit_price)
   - Trade dicts include `entry_weight`, `exit_weight`, `contribution` fields (initialized to None, populated by equity engine)
 
-#### `get_date_range` (L2798-2814) — GET /api/date-range/{target_type}/{target}
+#### `get_date_range` (L3079-3095) — GET /api/date-range/{target_type}/{target}
 - **Calls:** `_find_basket_parquet`
 - **Data I/O:** reads `signals_500.parquet` (columns: Ticker, Date), basket parquets (column: Date)
 
-#### `_build_buy_hold` (L2816-2879)
+#### `_build_buy_hold` (L3096-3167)
 - **Purpose:** builds a complete buy-and-hold backtest result from the Close series
 - **Called by:** `run_backtest` (early return when `entry_signal == 'Buy_Hold'`)
 - **Calls:** `_find_basket_parquet`
@@ -986,7 +992,7 @@ This file imports everything from rotations.py via `from rotations import *` plu
   - Trade includes `entry_weight: 1.0`, `exit_weight: 1.0`, `contribution: total_return`
   - Stats: single trade, max_dd from cummax drawdown
 
-#### `run_backtest` (L2882-3393) — POST /api/backtest
+#### `run_backtest` (L3169-3446) — POST /api/backtest
 - **Calls:** `_build_buy_hold` (early return for Buy_Hold), `_find_basket_parquet`, `get_latest_universe_tickers`, `get_meta_file_tickers`, `_quarter_str_to_date`, `_get_universe_history`, `_get_universe_tickers_for_range`, `safe_float`
 - **Nested functions:**
   - `mtm_equity` — mark-to-market equity computation for open positions
@@ -1002,7 +1008,7 @@ This file imports everything from rotations.py via `from rotations import *` plu
   - Daily position snapshots keyed by date index with full position detail (entry_weight, weight, daily_return, contribution)
 - **Frontend callers:** BacktestPanel.tsx `runBacktest` now calls POST `/api/backtest/multi` for all backtests (single-leg wrapped as 1-leg multi)
 
-#### `run_multi_backtest` (L3395-3894) — POST /api/backtest/multi
+#### `run_multi_backtest` (L3448-3953) — POST /api/backtest/multi
 - **Calls:** `_build_leg_trades`, `_find_basket_parquet`
 - **Nested function:** `compute_stats` — NEW split structure: returns `{'portfolio': {...}, 'trade': {...}}` dict
   - `portfolio` stats: `strategy_return`, `cagr`, `volatility`, `max_dd`, `sharpe`, `sortino`, `contribution?`, `allocation?`
@@ -1019,7 +1025,7 @@ This file imports everything from rotations.py via `from rotations import *` plu
   - Inter-leg correlation matrix from daily returns of standalone equity curves
   - Per-leg contribution = alloc_frac * leg_return
 
-#### `uvicorn.run` (L3963) — entry point
+#### `uvicorn.run` (L4020) — entry point
 
 ---
 
@@ -1199,11 +1205,15 @@ app/frontend/src/components/BacktestPanel.tsx
 
 app/frontend/src/components/AnalogsPanel.tsx
   └── imports: react, axios
-  └── consumes: app/backend/main.py GET /api/baskets/returns?mode=analogs, GET /api/baskets
+  └── consumes: app/backend/main.py GET /api/baskets/returns?mode=analogs, GET /api/baskets/returns?mode=query, GET /api/baskets
 
 app/frontend/src/components/MultiBacktestPanel.tsx (DEFUNCT — no longer imported by App.tsx; functionality merged into BacktestPanel.tsx)
   └── imports: react, axios, lightweight-charts
   └── consumes: app/backend/main.py POST /api/backtest/multi, GET /api/baskets, GET /api/tickers
+
+app/frontend/src/App.tsx
+  └── imports: react, axios, lightweight-charts components (TVChart, BasketSummary, BacktestPanel, AnalogsPanel)
+  └── consumes: app/backend/main.py GET /api/baskets, GET /api/baskets/breadth, GET /api/ticker-signals, GET /api/baskets/{name}, GET /api/tickers/{ticker}, GET /api/live-signals
 
 app/frontend/src/index.css
   └── standalone (global stylesheet, no imports)
@@ -1300,7 +1310,7 @@ app/frontend/src/index.css
 - **Benchmark calls**: 6 parallel `/api/backtest/multi` calls with each signal (single-leg only)
 - **Position sizing**: `leg.positionSize / 100` sent to backend
 - **Max leverage**: `maxLeverage / 100` sent to backend
-- **Backend endpoint**: POST `/api/backtest/multi` (`run_multi_backtest` in main.py L3078)
+- **Backend endpoint**: POST `/api/backtest/multi` (`run_multi_backtest` in main.py L3448)
 
 ### Constituents Overlay (equity tab)
 
@@ -1343,9 +1353,9 @@ app/frontend/src/index.css
 
 ---
 
-## app/frontend/src/components/AnalogsPanel.tsx (935 lines)
+## app/frontend/src/components/AnalogsPanel.tsx (998 lines)
 
-Self-contained React component for the Analogs feature — finds historical cross-basket regime analogs and displays similarity analysis, forward return projections, and aggregate statistics.
+Self-contained React component for the Analogs feature — finds historical cross-basket regime analogs via similarity matching or condition-based queries, and displays forward return projections and aggregate statistics.
 
 ### Props
 
@@ -1354,31 +1364,48 @@ Self-contained React component for the Analogs feature — finds historical cros
 
 ### Types
 
-#### AnalogItem — single analog window
+#### AnalogItem — single analog window (analogs mode)
 - **Fields:** `start`, `end`, `similarity`, `similarity_breakdown` (Record), `returns` (Record), `forward` (Record of horizon->per-basket returns), `forward_series` ({dates, baskets})
+
+#### QueryMatch — single match (query mode)
+- **Fields:** `date`, `forward` (Record of horizon->per-basket returns), `forward_series` ({dates, baskets})
 
 #### AggHorizon — aggregate forward stats at one horizon
 - **Fields:** `mean`, `median`, `min`, `max`, `std`, `count`, `per_basket` (Record)
 
-#### AnalogsResponse — full API response shape
+#### AnalogsResponse — full API response shape (analogs mode)
 - **Fields:** `current`, `analogs`, `aggregate`, `date_range`, `message?`
 
-### Tabs (AnalogTab union type)
+#### QueryResponse — full API response shape (query mode)
+- **Fields:** `matches`, `aggregate`, `match_count`, `date_range`
 
-- **summary** — Current regime snapshot: per-basket returns, breadth, breakout, correlation, volatility metrics
-- **analogs** — Ranked list of top-N analog windows with similarity scores and per-metric breakdowns
-- **comparison** — Side-by-side comparison of current period vs selected analog, with per-basket return deltas
-- **forward** — Forward cumulative return series chart per analog (canvas-drawn, up to 252 days)
-- **aggregate** — Aggregate forward return stats (1M/3M/6M horizons): mean, median, min, max, std across all analogs, overall and per-basket
+### Tabs (3 tabs, reduced from previous 5)
+
+- **summary** — Current regime snapshot: per-basket ranking table with raw value and rank per factor per basket. Columns: 1D/1W/1M/1Q/1Y/3Y/5Y returns + Breadth% + BO% + Corr% + RV%. Click any cell to add a query condition. Blue-to-purple-to-pink color gradient by rank (`rankColor` function).
+- **forward** — 3-pane layout (merged from previous separate Forward + Matches tabs). Left sidebar: match date picker (scrollable list of matching dates with avg forward return for selected horizon). Center: canvas cumulative forward returns chart per basket with horizon presets (1M/1Q/6M/1Y) and log scale toggle. Right panel: sortable Basket/Chg legend with hover highlighting. Y-axis on right side.
+- **aggregate** — 3-pane layout. Left sidebar: sortable basket picker (Basket/Avg columns) with horizon presets (1M/1Q/6M/1Y). Center: canvas mean forward return path with +-1 sigma shaded band; hovering a match in the right panel overlays that individual path. Right panel: sortable Date/Chg columns showing each match's return for the selected basket.
 
 ### Key State
-- `tab` (AnalogTab) — active tab
-- `data` (AnalogsResponse | null) — API response
+- `tab` (AnalogTab: 'summary' | 'forward' | 'aggregate') — active tab
+- `data` (AnalogsResponse | null) — analogs mode API response
+- `queryData` (QueryResponse | null) — query mode API response
 - `loading`, `error` — request state
 - `window` (days preset via PRESETS), `topN`, `threshold`, `group` (GroupFilter)
+- `conditions` — array of query condition objects for mode=query
+- **Forward tab state:** `fwdHorizon` ('1M'|'1Q'|'6M'|'1Y'), `fwdSortCol` ('basket'|'chg'), `fwdSortAsc`, selected match index
+- **Aggregate tab state:** `aggSelectedBasket`, `aggHorizon` ('1M'|'1Q'|'6M'|'1Y'), `aggDims`, `aggLogScale`, `aggMatchSortCol`, `aggMatchSortAsc`, `aggHoveredMatch`, `aggBasketSortCol`, `aggBasketSortAsc`
+
+### Key Memos
+- **Forward tab:** `fwdRankedSeries` (ranked forward series for selected match), `fwdColorMap` (basket-to-color mapping), `fwdSortedLegend` (sorted basket list for legend)
+- **Aggregate tab:** `aggBasketList` (sorted baskets with avg returns), `aggMatchReturns` (per-match returns for selected basket), `aggSortedMatches` (sorted match list), `aggPathData` (mean path + sigma band data)
+
+### Canvas Effects
+- **Forward chart**: draws cumulative return lines per basket for the selected match, with horizon presets and hover interaction
+- **Aggregate chart**: draws mean forward return path with +-1 sigma shaded band; overlay of individual match paths on hover
 
 ### API Integration
-- **Endpoint:** GET `/api/baskets/returns?mode=analogs&start=...&end=...&top_n=...&group=...&threshold=...`
+- **Analogs mode:** GET `/api/baskets/returns?mode=analogs&start=...&end=...&top_n=...&group=...&threshold=...`
+- **Query mode:** GET `/api/baskets/returns?mode=query&conditions=...&group=...&threshold=...`
 - **Basket list:** GET `/api/baskets` (for basket names/groups)
 - **Imported by:** App.tsx (L6)
 - **Rendered when:** `showAnalogs` state is true in App.tsx
@@ -1472,3 +1499,116 @@ The file still exists on disk but is dead code.
 ### Removed: .backtest-stats-sidebar
 - **Previously**: sidebar panel showing stats next to equity chart
 - **Replaced by**: Stats tab with `.backtest-stats-table` layout
+
+---
+
+## app/frontend/src/App.tsx (1235 lines)
+
+Main orchestration component for the React frontend. Manages sidebar navigation, chart rendering, panel switching, and data fetching.
+
+### Interfaces & Types
+
+#### TickerSignalSummary (L79)
+- **Fields:** `lt_trend: string | null`, `st_trend: string | null`, `mean_rev: string | null`, `pct_change: number | null`, `dollar_vol: number | null`, `last_price: number | null`
+- **last_price:** Added to display current price in sidebar ticker/basket lists
+- **Consumed from:** GET `/api/ticker-signals` (main.py `get_ticker_signals`)
+
+#### SignalSortCol (L80)
+- **Type:** `'ticker' | 'wt' | 'lt' | 'st' | 'mr' | 'price' | 'pct'`
+- **'price' case:** Added for sorting tickers by last_price
+
+#### BasketSortCol (L81)
+- **Type:** `'name' | 'bo' | 'br' | 'cor' | 'lt' | 'st' | 'mr' | 'price' | 'chg'`
+- **'price' case:** Added for sorting baskets by last_price
+
+### Key Functions
+
+#### getSigSortVal (L83-95)
+- **Purpose:** Returns sort value for a ticker given a SignalSortCol
+- **'price' case:** returns `sig.last_price ?? -Infinity`
+
+#### getBasketSortVal (L640-654)
+- **Purpose:** Returns sort value for a basket given a BasketSortCol
+- **'price' case:** returns `b.last_price ?? -Infinity`
+
+#### renderColHeader / renderSignalCols (L538-637)
+- **Purpose:** Renders column headers and data cells for ticker rows in sidebar
+- **All columns conditioned on `hiddenCols`:** each column checks `!hiddenCols.has(key)` before rendering
+- **Price column:** renders `sig?.last_price?.toFixed(2)` in a `<span className="col-price">`
+
+#### renderBasketColHeader / basket row rendering (L670-817)
+- **Purpose:** Renders column headers and data cells for basket rows in sidebar
+- **All columns conditioned on `hiddenCols`:** same pattern as ticker columns
+- **Price column:** renders `basketBreadth[item].last_price?.toFixed(2)` in a `<span className="col-price">`
+
+### Sidebar Resizing
+
+#### State: sidebarWidth (L136)
+- **Type:** `number` — initial value 460
+- **Range:** 280-800px (clamped in mousemove handler)
+
+#### State: sidebarDragging (L137)
+- **Type:** `useRef<boolean>` — tracks active drag
+
+#### Resize mechanism (L1022-1027)
+- `.sidebar-resizer` div between sidebar and main content
+- `onMouseDown`: sets `sidebarDragging.current = true`, applies `col-resize` cursor and `user-select: none` to body
+- Global `mousemove` handler (useEffect): when `sidebarDragging`, updates `sidebarWidth` clamped to [280, 800]
+- Global `mouseup` handler: resets `sidebarDragging` and restores cursor/user-select
+- Sidebar element uses `style={{ width: sidebarWidth }}` (L825)
+
+### Column Visibility Toggles
+
+#### State: hiddenCols (L138)
+- **Type:** `Set<string>` — initially empty (all visible)
+- **Keys:** `'wt'`, `'bo'`, `'br'`, `'cor'`, `'lt'`, `'st'`, `'mr'`, `'price'`, `'pct'`
+
+#### State: colMenuOpen (L139)
+- **Type:** `boolean` — controls dropdown visibility
+
+#### Toggle UI (L830-857)
+- "Columns" button in `.col-toggle-wrapper` (sidebar header, next to logo)
+- Dropdown `.col-toggle-menu` with checkbox per column
+- Click backdrop `.col-filter-backdrop` closes the menu
+- Each checkbox toggles the column key in/out of `hiddenCols` Set
+
+### API Endpoints Consumed
+- GET `/api/baskets` — basket list
+- GET `/api/baskets/breadth` — per-basket breadth + last_price + pct_change
+- GET `/api/ticker-signals` — per-ticker signal summary + last_price
+- GET `/api/baskets/{name}` — basket OHLCV data
+- GET `/api/tickers/{ticker}` — ticker OHLCV data
+- GET `/api/live-signals` — live signal tickers
+
+### .sidebar (updated)
+- **Changed:** from fixed `width: 460px` to `flex-shrink: 0` (width now controlled dynamically via inline style from `sidebarWidth` state)
+- **Used by**: App.tsx sidebar element (L825)
+
+### .sidebar-resizer (L52-60)
+- **Purpose**: Drag handle between sidebar and main content for resizing
+- **Properties**: width 5px, flex-shrink 0, cursor col-resize, transparent background
+- **Hover**: background changes to `var(--bg-main)` for visual feedback
+- **Used by**: App.tsx (L1022)
+
+### .col-toggle-wrapper (L70-74)
+- **Purpose**: Container for the "Columns" button, positioned in sidebar header
+- **Properties**: relative positioning, display flex, margin-left auto
+
+### .col-toggle-btn (L76-86)
+- **Purpose**: "Columns" button that opens the column visibility dropdown
+- **Properties**: font-size 10px, uppercase, monospace, compact padding, border 1px
+- **Used by**: App.tsx (L831)
+
+### .col-toggle-menu (L88-148)
+- **Purpose**: Dropdown menu with checkboxes for toggling column visibility
+- **Properties**: absolute positioning, z-index 200, max-height 300px overflow auto
+- **Used by**: App.tsx (L835)
+
+### .col-price (L296-299)
+- **Purpose**: Price column cell styling for both ticker and basket rows
+- **Properties**: width 50px, text-align right, flex-shrink 0, font-size 10px, bold
+- **Used by**: App.tsx price column in `renderSignalCols` and basket row rendering
+
+### .col-price:not(.col-hdr) (L299)
+- **Purpose**: Non-header price cells — removes bold for data rows
+- **Properties**: font-weight normal

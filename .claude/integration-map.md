@@ -1,6 +1,6 @@
 # Monorepo Integration Map
 
-> Auto-generated 2026-03-16. Last updated 2026-03-18 (batch 6). Tracks all communication points between signals/ and app/backend/.
+> Auto-generated 2026-03-16. Last updated 2026-03-19 (batch 7). Tracks all communication points between signals/ and app/backend/.
 
 ## Signal Refresh Entry Point
 
@@ -35,7 +35,7 @@
   - `get_ticker_data()` reads all columns via unfiltered `read_parquet` (line 817)
   - `_compute_live_breadth()` reads `Ticker`, `Date`, `Close`, `Trend`, `Resistance_Pivot`, `Support_Pivot`, `Upper_Target`, `Lower_Target`, `Is_Breakout_Sequence` (lines 324-326)
   - `get_basket_correlation()` reads `Ticker`, `Date`, `Close` (line 1355)
-  - **Frontend** (`TVChart.tsx`, `BacktestPanel.tsx`): reads `RV_EMA` from `chart_data` returned by `/api/tickers/{ticker}`; annualizes as `RV_EMA * sqrt(252) * 100` for display as a Realized Volatility indicator pane (percentage)
+  - **Frontend** (`TVChart.tsx`, `BacktestPanel.tsx`): reads `RV_EMA` from `chart_data` returned by `/api/tickers/{ticker}`; annualizes as `RV_EMA * sqrt(252) * 100` for display as a Realized Volatility indicator pane (percentage). RV pane visibility controlled by `showRV` prop passed from `App.tsx`
 - **Also read by**: `app/backend/verify_backtest.py` — loads `Ticker`, `Date`, `Close`, `Is_{signal}`, and per-signal trade columns (`{sig}_Entry_Price`, `{sig}_Exit_Date`, `{sig}_Exit_Price`, `{sig}_Final_Change`, `{sig}_MFE`, `{sig}_MAE`) for independent backtest verification
 - **Dtype note**: `Close`, `Volume`, and most numeric columns are stored as `float32`. FastAPI's JSON encoder cannot serialize `numpy.float32` values — consumers must cast to native Python `float`/`int` before returning JSON responses.
 - **Columns written**: `Date`, `Ticker`, `Open`, `High`, `Low`, `Close`, `Volume`, `RV`, `RV_EMA`, `Trend` (float32: 1.0/0.0/NaN), `Resistance_Pivot`, `Support_Pivot`, `Rotation_Open`, `Up_Range`, `Down_Range`, `Up_Range_EMA`, `Down_Range_EMA`, `Upper_Target`, `Lower_Target`, `Is_Up_Rotation`, `Is_Down_Rotation`, `Is_Breakout`, `Is_Breakdown`, `Is_BTFD`, `Is_STFR`, `Is_Breakout_Sequence`, `Rotation_ID` (int32), `BTFD_Triggered`, `STFR_Triggered`, and for each of 6 signals (`Up_Rot`, `Down_Rot`, `Breakout`, `Breakdown`, `BTFD`, `STFR`): `{sig}_Entry_Price`, `{sig}_Change`, `{sig}_Exit_Date`, `{sig}_Exit_Price`, `{sig}_Final_Change`, `{sig}_MFE`, `{sig}_MAE`, `{sig}_Win_Rate`, `{sig}_Avg_Winner`, `{sig}_Avg_Loser`, `{sig}_Avg_Winner_Bars`, `{sig}_Avg_Loser_Bars`, `{sig}_Avg_MFE`, `{sig}_Avg_MAE`, `{sig}_Historical_EV`, `{sig}_Std_Dev`, `{sig}_Risk_Adj_EV`, `{sig}_EV_Last_3`, `{sig}_Risk_Adj_EV_Last_3`, `{sig}_Count`. Plus `Source='norgate'` on disk.
@@ -68,7 +68,7 @@
   - Naming glob: `{slug}_*_of_*_signals.parquet` (with `{slug}_of_*_signals.parquet` fallback) — `app/backend/main.py:92`
   - `get_basket_returns()` reads `Date`, `Close` columns — `app/backend/main.py:554` (slug discovery), `573` (date range scan), `619`/`673` (period & daily return computation)
 - **Columns**: Full signal schema (same as `signals_500.parquet`) plus `Uptrend_Pct`, `Downtrend_Pct`, `Breadth_EMA`, `Breakout_Pct`, `Breakdown_Pct`, `BO_Breadth_EMA`, `B_Trend`, `B_Resistance`, `B_Support`, `B_Up_Rot`, `B_Down_Rot`, `B_Rot_High`, `B_Rot_Low`, `B_Bull_Div`, `B_Bear_Div`, `BO_B_*` variants, `Correlation_Pct`, `Source='norgate'`
-  - **Frontend** (`TVChart.tsx`, `BacktestPanel.tsx`): reads `RV_EMA` from `chart_data` returned by `/api/baskets/{basket_name}`; annualizes as `RV_EMA * sqrt(252) * 100` for display as a Realized Volatility indicator pane (percentage)
+  - **Frontend** (`TVChart.tsx`, `BacktestPanel.tsx`): reads `RV_EMA` from `chart_data` returned by `/api/baskets/{basket_name}`; annualizes as `RV_EMA * sqrt(252) * 100` for display as a Realized Volatility indicator pane (percentage). RV pane visibility controlled by `showRV` prop passed from `App.tsx`
   - **`Correlation_Pct` implementation note** (updated 2026-03-17): Computed by `_compute_within_basket_correlation()` (`signals/rotations.py:3710`) using z-score variance decomposition: `avg_pairwise_corr = (n * Var(EW z-portfolio) - 1) / (n - 1)`. This replaced an earlier per-date `.corr()` approach. Values may differ from the old implementation by ~0.1 mean / ~8 max at quarter boundaries (where basket membership changes cause different ticker subsets). All frontend consumers verified working correctly.
 - **Status**: OK
 
@@ -160,18 +160,23 @@
    - **Analogs mode** (new): reads `Date`, `Close`, `Uptrend_Pct`, `Breakout_Pct`, `Correlation_Pct`, `RV_EMA` — builds cross-basket rank fingerprints for Spearman correlation similarity search
 2. **`live_basket_signals_500.parquet`** — reads `BasketName`/`Basket`, `Date`, `Close`. Builds a `live_closes` dict mapping slug to `(date, close)`. Live row is appended to each basket's close series in all modes.
 
-**Analogs mode data contract** (updated 2026-03-17):
+**Analogs mode data contract** (updated 2026-03-19):
 - Reads `['Date', 'Close', 'Uptrend_Pct', 'Breakout_Pct', 'Correlation_Pct', 'RV_EMA']` from every basket parquet
 - Computes rolling Spearman correlation across 5+ metrics: returns rank, uptrend rank, breakout rank, correlation rank, volatility rank, plus multi-timeframe return ranks (1Q/1Y/3Y/5Y) and cross-basket correlation similarity
-- `MULTI_TF = {"1Q": 63, "1Y": 252, "3Y": 756, "5Y": 1260}` — additional return timeframes computed via rolling windows on close prices
+- `MULTI_TF = {"1D": 1, "1W": 5, "1M": 21, "1Q": 63, "1Y": 252, "3Y": 756, "5Y": 1260}` — additional return timeframes computed via rolling windows on close prices
 - `cross_corr_series` — average pairwise cross-basket correlation computed from daily returns; used as an additional similarity dimension
 - Overall similarity is the mean of all active metric similarities (base 5 + active timeframe metrics + cross-basket correlation if available)
 - Greedy top-N selection with overlap exclusion (excludes windows within W/2 of each other)
 - Post-selection `threshold` filtering: analogs with `similarity < threshold` are dropped
-- Forward returns at 1M (21d), 3M (63d), 6M (126d) horizons computed from the basket close series
+- Forward returns at 1M (21d), 1Q (63d), 6M (126d), 1Y (252d) horizons computed from the basket close series (changed 2026-03-19: was 1M/3M/6M, now 1M/1Q/6M/1Y)
 - Forward series: daily cumulative forward returns per basket for up to 252 trading days past the analog window end
-- Aggregate statistics (mean/median/min/max/std/count) at 1M/3M/6M horizons across all post-threshold analogs, with per-basket breakdown
+- Aggregate statistics (mean/median/min/max/std/count) at 1M/1Q/6M/1Y horizons across all post-threshold analogs, with per-basket breakdown
 - **Column contract**: All 4 columns (`Uptrend_Pct`, `Breakout_Pct`, `Correlation_Pct`, `RV_EMA`) must be present in basket signals parquets — already satisfied (written by `_finalize_basket_signals_output()`)
+
+**Query mode data contract** (updated 2026-03-19):
+- `Q_HORIZONS = {"1W": 5, "1M": 21, "1Q": 63, "6M": 126, "1Y": 252}` — forward point-return horizons per query match (changed 2026-03-19: `3M` renamed to `1Q`, `1Y` added)
+- Forward series: daily cumulative forward returns per basket for up to 252 trading days past the match date (extended from 126 to 252 in 2026-03-19)
+- Aggregate statistics at 1W/1M/1Q/6M/1Y horizons
 
 **Response shape** (`mode=period`):
 ```
@@ -192,7 +197,7 @@
 }
 ```
 
-**Response shape** (`mode=analogs`, updated 2026-03-17):
+**Response shape** (`mode=analogs`, updated 2026-03-19):
 ```
 {
   "current": {
@@ -221,7 +226,7 @@
         "cross_corr": float                                                      // present when cross-basket corr available
       },
       "returns": {slug: float|null, ...},
-      "forward": {"1M": {slug: float|null, ...}|null, "3M": ..., "6M": ...},
+      "forward": {"1M": {slug: float|null, ...}|null, "1Q": ..., "6M": ..., "1Y": ...},
       "forward_series": {
         "dates": ["YYYY-MM-DD", ...],          // up to 252 trading days
         "baskets": {slug: [float|null, ...], ...}  // daily cumulative returns per basket
@@ -234,8 +239,9 @@
       "mean": float, "median": float, "min": float, "max": float, "std": float, "count": int,
       "per_basket": {slug: {"mean": float, "median": float, "min": float, "max": float, "std": float, "count": int}, ...}
     } | null,
-    "3M": ... | null,
-    "6M": ... | null
+    "1Q": ... | null,
+    "6M": ... | null,
+    "1Y": ... | null
   },
   "date_range": {"min": "YYYY-MM-DD"|null, "max": "YYYY-MM-DD"|null}
 }
@@ -554,12 +560,24 @@
 - **CSS changes** (`index.css`): Added `.backtest-pos-preset` / `.backtest-pos-preset.wide` button styles, uniform `.control-btn` sizing (120px x 32px), `.sidebar-header` and `.main-header` both pinned to `height: 114px` for alignment, `.backtest-results-header` height fixed to 41px to match accordion row heights.
 - **Impact**: No backend/data contract change. The request body already accepted `max_leverage`; preset buttons are a UI convenience only.
 
-### AnalogsPanel — Regime analog search UI (2026-03-17)
+### AnalogsPanel — Regime analog search UI (updated 2026-03-19)
 - **Component**: `app/frontend/src/components/AnalogsPanel.tsx`
 - **Backend endpoint**: `GET /api/baskets/returns?mode=analogs` (see endpoint section above for full request/response schema)
 - **Previous consumer**: `BasketReturnsChart` component in `BasketSummary.tsx` handled all three modes (period/daily/analogs). The `mode=analogs` consumer has been extracted to a dedicated top-level component.
-- **Renders**: Regime analog similarity results, forward series charts (daily cumulative returns per basket up to 252 days), similarity breakdown details, and aggregate statistics (mean/median/min/max/std at 1M/3M/6M horizons with per-basket breakdown).
+- **Tabs**: 3 tabs (`summary` | `forward` | `aggregate`) — reduced from 4 (previously Summary/Matches/Forward/Aggregate; Matches tab merged into Forward tab as sidebar, 2026-03-19)
+- **Summary tab**: Ranking table showing raw value to rank transformation per factor per basket (the fingerprint). Sortable columns (1D/1W/1M/1Q/1Y/3Y/5Y returns + Breadth% + BO% + Corr% + RV%). Click any cell to add a query condition.
+- **Forward tab** (redesigned 2026-03-19): 3-pane layout. Left sidebar: match date picker (scrollable list of matching dates with avg forward return — previously a separate Matches tab). Center: canvas cumulative forward returns chart per basket with horizon presets (1M/1Q/1Y). Right panel: sortable Basket/Chg legend with hover highlighting.
+- **Aggregate tab** (redesigned 2026-03-19): 3-pane layout (previously a table). Left sidebar: sortable basket picker (Basket/Avg columns) with horizon presets (1M/1Q/1Y). Center: canvas mean forward return path with +/-1 sigma shaded band; hovering a match in the right panel overlays that individual path. Right panel: sortable Date/Chg columns showing each match's return for the selected basket.
+- **Forward horizon presets**: 1M/1Q/1Y (frontend UI buttons). Backend returns data at 1M/1Q/6M/1Y horizons.
 - **Also referenced in**: `app/frontend/src/App.tsx` (imported and routed), `app/frontend/src/index.css` (styling)
+
+### App.tsx — RV% toggle for TVChart (added 2026-03-19)
+- **State**: `showRV` boolean state (`useState(true)`) at `app/frontend/src/App.tsx:133`
+- **UI**: `RV%` checkbox toggle rendered in the chart header for both ticker and basket views (lines 961, 970). Placed alongside other chart overlay toggles (Pivots, Targets, Volume/Breadth/Breakout/Correlation).
+- **Prop**: Passed as `showRV={showRV}` to `TVChart` component (line 1091).
+- **TVChart consumption**: `TVChart.tsx` accepts `showRV?: boolean` prop (line 21). Controls visibility of the RV pane — an annualized realized volatility line (`RV_EMA * sqrt(252) * 100`) rendered as a gold line (`#b58900`). The RV pane is available for both tickers and baskets.
+- **Previous behavior**: RV pane was already implemented in `TVChart.tsx` but was not controllable from `App.tsx` (always visible when data present).
+- **Current behavior**: RV pane visibility is toggled by the `showRV` prop, defaulting to visible. User can hide it via the header checkbox.
 
 ---
 

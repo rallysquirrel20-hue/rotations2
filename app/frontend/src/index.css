@@ -45,8 +45,18 @@ html, body, #root {
   background-color: var(--bg-sidebar);
   display: flex;
   flex-direction: column;
-  width: 460px;
-  border-right: 2px solid var(--border-color);
+  flex-shrink: 0;
+  border-right: none;
+}
+
+.sidebar-resizer {
+  width: 4px;
+  cursor: col-resize;
+  background: var(--border-color);
+  flex-shrink: 0;
+}
+.sidebar-resizer:hover {
+  background: var(--base01);
 }
 
 .sidebar-header {
@@ -54,6 +64,37 @@ html, body, #root {
   border-bottom: 2px solid var(--border-color);
   box-sizing: border-box;
   height: 114px;
+  position: relative;
+}
+
+.col-toggle-wrapper {
+  position: absolute;
+  bottom: 8px;
+  right: 8px;
+}
+
+.col-toggle-btn {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  color: var(--text-main);
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  padding: 3px 8px;
+  cursor: pointer;
+  font-weight: bold;
+}
+.col-toggle-btn:hover { background: var(--bg-main); }
+
+.col-toggle-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 4px;
+  background: var(--bg-main);
+  border: 1px solid var(--border-color);
+  padding: 4px;
+  z-index: 1000;
+  min-width: 110px;
 }
 
 .sidebar-brand {
@@ -251,6 +292,12 @@ html, body, #root {
 .col-ticker { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .col-wt, .col-lt, .col-st, .col-mr, .col-pct, .col-bkt {
   width: 40px; text-align: center; flex-shrink: 0; font-size: 10px; font-weight: bold;
+}
+.col-price {
+  width: 50px; text-align: right; flex-shrink: 0; font-size: 10px; font-weight: bold;
+}
+.col-price:not(.col-hdr) {
+  color: var(--text-main);
 }
 
 .col-hdr {

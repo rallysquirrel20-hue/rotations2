@@ -8,12 +8,15 @@ interface BacktestFilter {
   condition: string
   value: number | string
   source: string
+  lookback: number
 }
 
 interface LegConfig {
   target: string
   targetType: 'basket' | 'basket_tickers' | 'ticker'
   entrySignal: string
+  exitSignal: string | null
+  stopSignal: string | null
   allocationPct: number
   positionSize: number
   filters: BacktestFilter[]
@@ -120,16 +123,30 @@ interface BacktestPanelProps {
 
 /* ── Constants ─────────────────────────────────────────────────────── */
 
-const ENTRY_SIGNALS = ['Up_Rot', 'Down_Rot', 'Breakout', 'Breakdown', 'BTFD', 'STFR', 'Buy_Hold']
-const EXIT_MAP: Record<string, string> = {
+const ENTRY_SIGNALS = ['Breakout', 'Breakdown', 'Up_Rot', 'Down_Rot', 'BTFD', 'STFR', 'Long', 'Short']
+const EXIT_SIGNAL_OPTIONS = ['Up_Rot', 'Down_Rot', 'Breakout', 'Breakdown', 'BTFD', 'STFR']
+const DEFAULT_EXIT_MAP: Record<string, string> = {
   Up_Rot: 'Down_Rot', Down_Rot: 'Up_Rot',
   Breakout: 'Breakdown', Breakdown: 'Breakout',
   BTFD: 'Breakdown', STFR: 'Breakout',
-  Buy_Hold: 'End of Period',
+  Long: 'End of Period', Short: 'End of Period',
 }
 const LEG_COLORS = ['#1565C0', '#C2185B', '#2E7D32', '#E65100', '#6A1B9A', '#00838F']
-const PCT_METRICS = ['Uptrend_Pct', 'Breakout_Pct', 'Correlation_Pct', 'RV_EMA', 'Breakdown_Pct', 'Downtrend_Pct']
-const BOOL_METRICS = ['Is_Breakout_Sequence', 'Trend', 'BTFD_Triggered', 'STFR_Triggered']
+const METRIC_DISPLAY: Record<string, string> = {
+  Is_Breakout_Sequence: 'Long Term Uptrend', Uptrend_Pct: 'Breadth %',
+  Breakout_Pct: 'Breakout %', Correlation_Pct: 'Correlation %',
+  RV_EMA: 'Realized Vol', Volume: 'Volume', Return: 'Return',
+}
+const BASKET_STAT_METRICS = ['Uptrend_Pct', 'Breakout_Pct', 'Correlation_Pct', 'RV_EMA', 'Return']
+const BASKET_BOOL_METRICS = ['Is_Breakout_Sequence']
+const TICKER_STAT_METRICS = ['Volume', 'RV_EMA', 'Return']
+const TICKER_BOOL_METRICS = ['Is_Breakout_Sequence']
+const LOOKBACK_PRESETS = [
+  { label: '1M', value: 21 },
+  { label: '3M', value: 63 },
+  { label: '6M', value: 126 },
+  { label: '1Y', value: 252 },
+]
 const POS_PRESETS = [1, 5, 10, 25, 50, 100]
 const LEV_PRESETS = [100, 110, 125, 150, 200, 250]
 
@@ -162,7 +179,7 @@ const dollarFmt = (v: number) => {
 }
 
 function defaultLeg(): LegConfig {
-  return { target: '', targetType: 'basket_tickers', entrySignal: 'Breakout', allocationPct: 100, positionSize: 25, filters: [] }
+  return { target: '', targetType: 'basket_tickers', entrySignal: 'Breakout', exitSignal: null, stopSignal: null, allocationPct: 100, positionSize: 25, filters: [] }
 }
 
 type ResultTab = 'equity' | 'stats' | 'distribution' | 'path' | 'trades'
@@ -354,10 +371,14 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
   const totalAlloc = legs.reduce((s, l) => s + l.allocationPct, 0)
   const allocValid = isSingleLeg || Math.abs(totalAlloc - 100) < 1
   const allTargetsSet = legs.every(l => l.target !== '')
+  const exitsValid = legs.every(l =>
+    ['Long', 'Short'].includes(l.entrySignal) ||
+    (l.exitSignal !== 'none' || (l.stopSignal !== null && l.stopSignal !== 'none'))
+  )
 
   // ── Run backtest ──
   const runBacktest = useCallback(async () => {
-    if (!allocValid || !allTargetsSet) return
+    if (!allocValid || !allTargetsSet || !exitsValid) return
     setLoading(true)
     setError('')
     setBenchmarks({})
@@ -372,9 +393,15 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
             target: l.target,
             target_type: l.targetType,
             entry_signal: l.entrySignal,
+            exit_signal: l.exitSignal && l.exitSignal !== 'none' && !l.exitSignal.startsWith('rv_') ? l.exitSignal : undefined,
+            exit_rv_multiple: l.exitSignal?.startsWith('rv_') ? parseFloat(l.exitSignal.slice(3)) : undefined,
+            no_exit_target: l.exitSignal === 'none' ? true : undefined,
+            stop_signal: l.stopSignal && l.stopSignal !== 'none' && !l.stopSignal.startsWith('rv_') && !l.stopSignal.startsWith('trv_') ? l.stopSignal : undefined,
+            stop_rv_multiple: l.stopSignal?.startsWith('rv_') && !l.stopSignal.startsWith('trv_') ? parseFloat(l.stopSignal.slice(3)) : undefined,
+            trailing_stop_rv_multiple: l.stopSignal?.startsWith('trv_') ? parseFloat(l.stopSignal.slice(4)) : undefined,
             allocation_pct: isSingleLeg ? 1.0 : l.allocationPct / 100,
             position_size: l.positionSize / 100,
-            filters: l.filters,
+            filters: l.filters.map(f => ({ ...f, lookback: f.lookback || 21 })),
           })),
           start_date: startDate || null,
           end_date: endDate || null,
@@ -390,7 +417,7 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
       // Auto-fire benchmarks for single-leg backtests
       if (isSingleLeg && data.legs.length > 0) {
         const leg0 = legs[0]
-        const benchSignals = ENTRY_SIGNALS.filter(s => s !== 'Buy_Hold')
+        const benchSignals = ENTRY_SIGNALS.filter(s => !['Long', 'Short'].includes(s))
         const benchPromises = benchSignals.map(sig =>
           fetch(`${apiBase}/backtest/multi`, {
             method: 'POST',
@@ -1163,7 +1190,8 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
 
   // ── Filter helpers ──
   const addFilter = (legIdx: number) => {
-    updateLeg(legIdx, { filters: [...legs[legIdx].filters, { metric: 'Uptrend_Pct', condition: 'above', value: 50, source: 'self' }] })
+    const defaultMetric = legs[legIdx].targetType === 'basket' ? BASKET_STAT_METRICS[0] : TICKER_STAT_METRICS[0]
+    updateLeg(legIdx, { filters: [...legs[legIdx].filters, { metric: defaultMetric, condition: 'above', value: 50, source: 'self', lookback: 21 }] })
   }
   const removeFilter = (legIdx: number, fIdx: number) => {
     updateLeg(legIdx, { filters: legs[legIdx].filters.filter((_, i) => i !== fIdx) })
@@ -1628,7 +1656,7 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
       style={isMultiLeg ? { borderTop: `3px solid ${LEG_COLORS[i % LEG_COLORS.length]}` } : undefined}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <label className="backtest-label" style={isMultiLeg ? { color: LEG_COLORS[i % LEG_COLORS.length] } : undefined}>
-          {isMultiLeg ? `Leg ${i + 1}` : 'Target'}
+          {isMultiLeg ? `Leg ${i + 1}` : 'Ticker / Basket'}
         </label>
         {isMultiLeg && (
           <button className="backtest-remove-btn" onClick={() => removeLeg(i)}>X</button>
@@ -1692,20 +1720,100 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
       {leg.targetType !== 'ticker' && (
         <div className="backtest-pos-presets" style={{ marginTop: 4 }}>
           <button className={`backtest-pos-preset wide ${leg.targetType === 'basket' ? 'active' : ''}`}
-            onClick={() => updateLeg(i, { targetType: 'basket' })}>Basket Signal</button>
+            onClick={() => {
+              const validMetrics = [...BASKET_STAT_METRICS, ...BASKET_BOOL_METRICS]
+              const cleanedFilters = leg.filters.filter(f => validMetrics.includes(f.metric))
+              updateLeg(i, { targetType: 'basket', filters: cleanedFilters })
+            }}>Basket</button>
           <button className={`backtest-pos-preset wide ${leg.targetType === 'basket_tickers' ? 'active' : ''}`}
-            onClick={() => updateLeg(i, { targetType: 'basket_tickers' })}>Constituent Tickers</button>
+            onClick={() => {
+              const validMetrics = [...TICKER_STAT_METRICS, ...TICKER_BOOL_METRICS]
+              const cleanedFilters = leg.filters.filter(f => validMetrics.includes(f.metric))
+              updateLeg(i, { targetType: 'basket_tickers', filters: cleanedFilters })
+            }}>Constituents</button>
         </div>
       )}
 
       <div className="backtest-section">
         <label className="backtest-label">Entry Signal</label>
         <select className="backtest-select" value={leg.entrySignal}
-          onChange={e => updateLeg(i, { entrySignal: e.target.value })}>
-          {ENTRY_SIGNALS.map(s => <option key={s} value={s}>{s.replace(/_/g, ' ')}</option>)}
+          onChange={e => updateLeg(i, { entrySignal: e.target.value, exitSignal: null, stopSignal: null })}>
+          {ENTRY_SIGNALS.map(s => <option key={s} value={s}>{s === 'Long' ? 'Long' : s === 'Short' ? 'Short' : s.replace(/_/g, ' ')}</option>)}
         </select>
-        <span className="backtest-hint">Exit: {EXIT_MAP[leg.entrySignal]?.replace(/_/g, ' ')}</span>
+        {['Long', 'Short'].includes(leg.entrySignal) && (
+          <span className="backtest-hint">Exit: End of Period</span>
+        )}
       </div>
+
+      {!['Long', 'Short'].includes(leg.entrySignal) && (
+        <div className="backtest-section">
+          <div className="backtest-sizing-row">
+            <div className="backtest-sizing-field" style={{ flex: 1 }}>
+              <label className="backtest-label">Exit Target</label>
+              <select className="backtest-select"
+                value={leg.exitSignal === null ? 'default' : leg.exitSignal === 'none' ? 'none' : leg.exitSignal?.startsWith('rv_') ? 'rv' : leg.exitSignal}
+                onChange={e => {
+                  const v = e.target.value
+                  if (v === 'rv') updateLeg(i, { exitSignal: 'rv_2' })
+                  else if (v === 'default') updateLeg(i, { exitSignal: null })
+                  else if (v === 'none') updateLeg(i, { exitSignal: 'none' })
+                  else updateLeg(i, { exitSignal: v })
+                }}>
+                <option value="default">{DEFAULT_EXIT_MAP[leg.entrySignal]?.replace(/_/g, ' ')} (Default)</option>
+                <option value="none">None</option>
+                <optgroup label="Signal">
+                  {EXIT_SIGNAL_OPTIONS.filter(s => s !== DEFAULT_EXIT_MAP[leg.entrySignal] && s !== leg.stopSignal)
+                    .map(s => <option key={s} value={s}>{s.replace(/_/g, ' ')}</option>)}
+                </optgroup>
+                <optgroup label="Price Level">
+                  <option value="rv">RVol Target</option>
+                </optgroup>
+              </select>
+              {leg.exitSignal?.startsWith('rv_') && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 2, width: '100%' }}>
+                  <input type="number" step="0.5" min="0.1" className="backtest-input"
+                    value={parseFloat(leg.exitSignal.slice(3)) || 2}
+                    onChange={e => updateLeg(i, { exitSignal: `rv_${e.target.value}` })}
+                    style={{ width: '100%' }} />
+                </div>
+              )}
+            </div>
+            <div className="backtest-sizing-field" style={{ flex: 1 }}>
+              <label className="backtest-label">Stop</label>
+              <select className="backtest-select"
+                value={leg.stopSignal === null ? 'none' : leg.stopSignal?.startsWith('trv_') ? 'trv' : leg.stopSignal?.startsWith('rv_') ? 'rv' : leg.stopSignal}
+                onChange={e => {
+                  const v = e.target.value
+                  if (v === 'rv') updateLeg(i, { stopSignal: 'rv_1.5' })
+                  else if (v === 'trv') updateLeg(i, { stopSignal: 'trv_1.5' })
+                  else if (v === 'none') updateLeg(i, { stopSignal: null })
+                  else updateLeg(i, { stopSignal: v })
+                }}>
+                <option value="none">None</option>
+                <optgroup label="Signal">
+                  {EXIT_SIGNAL_OPTIONS.filter(s => s !== (leg.exitSignal || DEFAULT_EXIT_MAP[leg.entrySignal]))
+                    .map(s => <option key={s} value={s}>{s.replace(/_/g, ' ')}</option>)}
+                </optgroup>
+                <optgroup label="Price Level">
+                  <option value="rv">RVol Stop</option>
+                  <option value="trv">Trailing RVol Stop</option>
+                </optgroup>
+              </select>
+              {(leg.stopSignal?.startsWith('rv_') || leg.stopSignal?.startsWith('trv_')) && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 2, width: '100%' }}>
+                  <input type="number" step="0.5" min="0.1" className="backtest-input"
+                    value={parseFloat(leg.stopSignal.replace('trv_', '').replace('rv_', '')) || 1.5}
+                    onChange={e => {
+                      const prefix = leg.stopSignal?.startsWith('trv_') ? 'trv_' : 'rv_'
+                      updateLeg(i, { stopSignal: `${prefix}${e.target.value}` })
+                    }}
+                    style={{ width: '100%' }} />
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="backtest-section">
         <label className="backtest-label">Position Sizing</label>
@@ -1736,45 +1844,72 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
       </div>
 
       <div className="backtest-section">
-        <label className="backtest-label">Regime Filters</label>
+        <label className="backtest-label">Filters</label>
         {leg.filters.map((f, fi) => {
-          const isBool = BOOL_METRICS.includes(f.metric)
+          const isBasket = leg.targetType === 'basket'
+          const statMetrics = isBasket ? BASKET_STAT_METRICS : TICKER_STAT_METRICS
+          const boolMetrics = isBasket ? BASKET_BOOL_METRICS : TICKER_BOOL_METRICS
+          const isBool = boolMetrics.includes(f.metric)
+          const isReturn = f.metric === 'Return'
+          const showLookback = f.condition === 'increasing' || f.condition === 'decreasing' || isReturn
           return (
-            <div key={fi} className="backtest-filter-row">
-              <select className="backtest-select" value={f.metric}
-                onChange={e => {
-                  const m = e.target.value
-                  updateFilterField(i, fi, 'metric', m)
-                  if (BOOL_METRICS.includes(m)) updateFilterField(i, fi, 'condition', 'equals_true')
-                }}>
-                <optgroup label="Percentage">
-                  {PCT_METRICS.map(m => <option key={m} value={m}>{m}</option>)}
-                </optgroup>
-                <optgroup label="Boolean">
-                  {BOOL_METRICS.map(m => <option key={m} value={m}>{m}</option>)}
-                </optgroup>
-              </select>
-              <select className="backtest-select" value={f.condition}
-                onChange={e => updateFilterField(i, fi, 'condition', e.target.value)}>
-                {isBool ? (
-                  <>
-                    <option value="equals_true">= True</option>
-                    <option value="equals_false">= False</option>
-                  </>
-                ) : (
-                  <>
-                    <option value="above">Above</option>
-                    <option value="below">Below</option>
-                    <option value="increasing">Increasing</option>
-                    <option value="decreasing">Decreasing</option>
-                  </>
+            <div key={fi} style={{ marginBottom: 6 }}>
+              <div className="backtest-filter-row">
+                <select className="backtest-select" value={f.metric}
+                  onChange={e => {
+                    const m = e.target.value
+                    updateFilterField(i, fi, 'metric', m)
+                    if (boolMetrics.includes(m)) updateFilterField(i, fi, 'condition', 'equals_true')
+                    if (m === 'Return') updateFilterField(i, fi, 'lookback', 252)
+                  }}>
+                  <optgroup label="Stat">
+                    {statMetrics.map(m => <option key={m} value={m}>{METRIC_DISPLAY[m] || m}</option>)}
+                  </optgroup>
+                  <optgroup label="Boolean">
+                    {boolMetrics.map(m => <option key={m} value={m}>{METRIC_DISPLAY[m] || m}</option>)}
+                  </optgroup>
+                </select>
+                <select className="backtest-select" value={f.condition}
+                  onChange={e => updateFilterField(i, fi, 'condition', e.target.value)}>
+                  {isBool ? (
+                    <>
+                      <option value="equals_true">= True</option>
+                      <option value="equals_false">= False</option>
+                    </>
+                  ) : isReturn ? (
+                    <>
+                      <option value="above">Above</option>
+                      <option value="below">Below</option>
+                    </>
+                  ) : (
+                    <>
+                      <option value="above">Above</option>
+                      <option value="below">Below</option>
+                      <option value="increasing">Increasing</option>
+                      <option value="decreasing">Decreasing</option>
+                    </>
+                  )}
+                </select>
+                {!isBool && (f.condition === 'above' || f.condition === 'below') && (
+                  <input type="number" className="backtest-input" value={f.value}
+                    onChange={e => updateFilterField(i, fi, 'value', e.target.value)}
+                    style={{ width: 60 }} />
                 )}
-              </select>
-              {!isBool && f.condition !== 'increasing' && f.condition !== 'decreasing' && (
-                <input type="number" className="backtest-input" value={f.value}
-                  onChange={e => updateFilterField(i, fi, 'value', e.target.value)} />
+                <button className="backtest-remove-btn" onClick={() => removeFilter(i, fi)}>X</button>
+              </div>
+              {showLookback && (
+                <div className="backtest-pos-presets" style={{ marginTop: 2 }}>
+                  <span className="backtest-preset-label">{isReturn ? 'Period:' : 'Lookback:'}</span>
+                  {LOOKBACK_PRESETS.map(p => (
+                    <button key={p.value}
+                      className={`backtest-pos-preset ${f.lookback === p.value ? 'active' : ''}`}
+                      onClick={() => updateFilterField(i, fi, 'lookback', p.value)}>{p.label}</button>
+                  ))}
+                  <input type="number" className="backtest-input" value={f.lookback}
+                    onChange={e => updateFilterField(i, fi, 'lookback', Number(e.target.value))}
+                    style={{ width: 50, marginLeft: 4 }} />
+                </div>
               )}
-              <button className="backtest-remove-btn" onClick={() => removeFilter(i, fi)}>X</button>
             </div>
           )
         })}
@@ -1837,7 +1972,7 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
             </div>
 
             <button className="control-btn primary" onClick={runBacktest}
-              disabled={loading || (isMultiLeg && !allocValid) || !allTargetsSet}>
+              disabled={loading || (isMultiLeg && !allocValid) || !allTargetsSet || !exitsValid}>
               {loading ? 'Running...' : 'Run Backtest'}
             </button>
             {error && <div className="backtest-error">{error}</div>}
