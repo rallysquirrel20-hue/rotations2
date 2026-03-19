@@ -5,13 +5,16 @@
 ### ~~1. Repo Consolidation~~ — COMPLETED (2026-03-16)
 ~~Create a single "rotations" repo combining rotations_app and rotations_signals with organized CLAUDE.md and agent files for efficient project setup and editing.~~
 
-### ~~2. Backtest Accuracy~~ — IN PROGRESS (2026-03-18)
-Test backtest feature for accuracy. Completed sub-goals:
+### ~~2. Backtest Accuracy~~ — COMPLETED (2026-03-18)
+~~Test backtest feature for accuracy.~~ Completed sub-goals:
 - Quarterly universe membership filtering: backtests now use shifting quarterly universes instead of only the current quarter. Trades are filtered to only include tickers that were in the basket at the entry date.
 - Constituents overlay expanded to 6 sortable columns (Ticker, Entry, Ent.Wt, Return, Cur.Wt, Contrib) across all 3 chart types (TVChart, BacktestPanel, MultiBacktestPanel). Multi-leg adds a Leg column.
 - Entry date shows current stint start (gap > 5 trading days = new stint), not first-ever appearance.
 - Overlay sizing: constrained to chart area bounds (top: 4px, bottom: just above x-axis), scrollable.
 - BENCHMARK_TIMING enabled for live loop per-step timing.
+- `_was_taken` trade tracking: trades skipped due to leverage/cash constraints now properly counted as skipped, not executed. Stats computed only from taken trades.
+- Live data staleness guard: `_live_is_current()` prevents stale intraday data from overriding Norgate end-of-day data across 8 endpoints.
+- Analog rank direction fix: returns/uptrend/breakout now rank 1=highest (descending); correlation/volatility rank 1=lowest (ascending).
 
 ### ~~3. Equity Tab Improvements~~ — COMPLETED (2026-03-17)
 ~~Add constituent feature, scrolling/zooming, date range selector, chart colors, benchmark equity curves.~~
@@ -57,6 +60,8 @@ Remaining sub-goals:
 **Also completed in this session (2026-03-18):**
 - Multi-leg buy hold defaults to off (clean chart on first load)
 - Constituents overlay expanded + sortable (see Goal 2)
+- Strategy scanner script (`strategy_scanner.py`): sweeps backtest combinations (baskets x signals x filters x pos sizes x leverage) and collects results to CSV/JSON
+- `_was_taken` trade tracking fix: skipped trades due to leverage/cash constraints properly counted
 
 ### 10. Variable Position Sizing
 Add variable position sizing feature to backtest.
@@ -81,9 +86,10 @@ Export button properly functions with all features on the frontend, with titles 
 
 ### ~~17. Analogs Tab (Cross-Basket Analysis)~~ — COMPLETED (2026-03-18)
 ~~Add an "Analogs" tab to the cross-basket analysis panel.~~
-- **17a.** ~~Add all relevant factors (same list as backtesting filters)~~ — Multi-timeframe return fingerprints (1Q/1Y/3Y/5Y) with cross-basket rolling correlation
+- **17a.** ~~Add all relevant factors (same list as backtesting filters)~~ — Multi-timeframe return fingerprints (1D/1W/1M/1Q/1Y/3Y/5Y) with cross-basket rolling correlation
 - **17b.** ~~Add historical ranking system~~ — Value-to-rank fingerprint process with Summary tab showing ranking table
 - **17c.** ~~Cross-asset future returns tab (similar to intrabasket returns and backtest path tabs)~~ — Forward tab (cumulative line chart, 252 days per analog) + Aggregate tab (mean/median/min/max/std at 1M/3M/6M)
+- **17d.** ~~Condition-based query mode~~ — Replaced fingerprint-matching with condition builder (basket + metric + operator + value). Backend `mode=query` evaluates conditions across all dates, returns forward returns at 1W/1M/3M/6M. Frontend tabs reduced to 4 (Summary/Matches/Forward/Aggregate).
 
 ## Completed
 
@@ -95,3 +101,8 @@ Export button properly functions with all features on the frontend, with titles 
 6. **Analogs Tab** (2026-03-18): Elevated Analogs from sub-mode in BasketSummary to top-level AnalogsPanel component with 5 tabs (Summary, Analogs, Comparison, Forward, Aggregate). Backend expanded with multi-timeframe fingerprints, cross-basket correlation, forward_series, and aggregate stats. Cleaned up all analog code from BasketSummary.
 7. **Backtest Quarterly Universe Filtering** (2026-03-18): Fixed survivorship bias in `basket_tickers` backtests. Both `run_backtest()` and `_build_leg_trades()` now use `_get_universe_history()` to load quarterly membership and filter trades to only tickers in the basket at entry date. Union of tickers across date range loaded for signal data.
 8. **Constituents Overlay Overhaul** (2026-03-18): Expanded all 3 constituents overlays (TVChart, BacktestPanel, MultiBacktestPanel) from 4 to 6-7 sortable columns. Added entry_weight to backend daily_positions. TVChart candle-detail endpoint now returns stint-based entry date and EOD drifted weight. Overlay constrained to chart bounds with scrollable content.
+9. **Trade Tracking Fix** (2026-03-18): Added `_was_taken` flag so trades skipped due to leverage/cash constraints are properly excluded from stats. `compute_stats()` now reports met_criteria vs taken vs skipped.
+10. **Analogs Query Mode** (2026-03-18): Replaced fingerprint-matching analogs with condition-based historical query engine. Backend `mode=query` in `get_basket_returns()`. Frontend condition builder UI with basket/metric/operator/value. Tabs reduced from 5 to 4.
+11. **Live Data Staleness Guard** (2026-03-18): Added `_live_is_current()` helper across 8 endpoints to prevent stale intraday data from overriding Norgate end-of-day data after market close.
+12. **Analog Rank Direction Fix** (2026-03-18): Fixed ranking so returns/uptrend/breakout rank 1=highest (descending), correlation/volatility rank 1=lowest (ascending). Expanded multi-timeframe fingerprints from 4 to 7 windows.
+13. **Strategy Scanner** (2026-03-18): New `strategy_scanner.py` script sweeps backtest parameter combinations and collects results to CSV/JSON.

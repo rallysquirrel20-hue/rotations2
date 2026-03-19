@@ -1,7 +1,7 @@
 # Dependency Tree
-Updated: 2026-03-18 (incremental — backtest stats overhaul, unified BacktestPanel, initial_equity removal, position sizing fixes, leverage enforcement, contribution calculation fixes, entry date format change)
-Files scanned: 15
-Functions indexed: 228
+Updated: 2026-03-18 (incremental — _live_is_current stale-data guard, mode=query condition search, _was_taken trade tracking, strategy_scanner.py new file)
+Files scanned: 16
+Functions indexed: 241
 
 ---
 
@@ -27,7 +27,7 @@ Functions indexed: 228
 | signals/rotations.py | 6206 | 143 | Main pipeline: universe, signals, baskets, live, reports |
 | signals/rotations_old_outputs.py | 2177 | 35 | Extracted Group B report cells (Excel, correlations, charts, PDFs) |
 | signals/databento_test.py | 624 | 16 | Databento API connectivity tests |
-| app/backend/main.py | 3646 | 43 | FastAPI REST endpoints + WebSocket |
+| app/backend/main.py | 3963 | 44 | FastAPI REST endpoints + WebSocket |
 | signals/test_all_optimizations.py | 75 | 1 | Compares old vs new breadth/contributions/correlation values after rebuild |
 | signals/test_correlation_optimization.py | 207 | 5 | Step-by-step test harness: backup, compare, check returns_matrix, test API, restore |
 | app/backend/signals_engine.py | 534 | 2 | Live signal computation (parallel impl) |
@@ -36,6 +36,7 @@ Functions indexed: 228
 | app/backend/check_data.py | 5 | 0 | Quick data inspection script |
 | app/backend/check_pivots.py | 7 | 0 | Quick pivot inspection script |
 | signals/live_loop.py | 39 | 1 | PM2 daemon: reruns rotations.py every 15 min via runpy |
+| app/backend/strategy_scanner.py | 503 | 10 | Backtest strategy scanner (sweeps parameter combinations via API) |
 
 ---
 
@@ -97,8 +98,8 @@ Functions indexed: 228
 | `EMA_MULT` | 2.0/11.0 | signals/rotations.py | 1227 | Range EMA alpha |
 | `RV_EMA_ALPHA` | 2.0/11.0 | signals/rotations.py | 1228 | RV EMA span=10 alpha |
 | `SIGNALS` | ['Up_Rot','Down_Rot','Breakout','Breakdown','BTFD','STFR'] | signals/rotations.py | 1225 | Signal type list |
-| `SIGNAL_TYPES` | ['Breakout','Breakdown','Up_Rot','Down_Rot','BTFD','STFR','Buy_Hold'] | app/backend/main.py | 1440 | Backtest signal type list (includes Buy_Hold) |
-| `BACKTEST_DIRECTION` | {Up_Rot:'long', Down_Rot:'short', Breakout:'long', Breakdown:'short', BTFD:'long', STFR:'short', Buy_Hold:'long'} | app/backend/main.py | 1448 | Signal-to-direction map (includes Buy_Hold) |
+| `SIGNAL_TYPES` | ['Breakout','Breakdown','Up_Rot','Down_Rot','BTFD','STFR','Buy_Hold'] | app/backend/main.py | 1751 | Backtest signal type list (includes Buy_Hold) |
+| `BACKTEST_DIRECTION` | {Up_Rot:'long', Down_Rot:'short', Breakout:'long', Breakdown:'short', BTFD:'long', STFR:'short', Buy_Hold:'long'} | app/backend/main.py | 1759 | Signal-to-direction map (includes Buy_Hold) |
 
 ---
 
@@ -111,17 +112,17 @@ These functions exist in BOTH signals/rotations.py AND app/backend/signals_engin
 | `_build_signals_from_df` | L1804-1940 (numba-accelerated) | L85-343 (pure Python) | rotations.py uses `@numba.njit` for passes 1-5; signals_engine.py uses Python loops with set-based tracking |
 | `_build_signals_next_row` | L1943-2131 | L346-534 | Near-identical logic; both are Python; used for incremental 1-bar updates |
 | `RollingStatsAccumulator` | L1274-1351 (class, deque-based) | L11-82 (class, list-based) | Same interface; rotations.py uses `collections.deque(maxlen=3)`, signals_engine.py uses `list` with `pop(0)` |
-| `_build_leg_trades` | main.py L2212-2489 | — | Extracted trade-building logic; called only by `run_multi_backtest`; includes Buy_Hold early return; `run_backtest` still has its own inline trade-building logic; trade dicts include `entry_weight`/`exit_weight`/`contribution` fields |
+| `_build_leg_trades` | main.py L2518-2795 | — | Extracted trade-building logic; called only by `run_multi_backtest`; includes Buy_Hold early return; `run_backtest` still has its own inline trade-building logic; trade dicts include `entry_weight`/`exit_weight`/`contribution` fields |
 
 Functions in main.py that DUPLICATE logic from rotations.py (not exact copies but same purpose):
 
 | Function | main.py | rotations.py equivalent | Notes |
 |----------|---------|------------------------|-------|
-| `_find_basket_parquet` | L92-102 | L3510-3522 | Same glob logic, different folder source |
-| `_find_basket_meta` | L104-114 | L3525-3539 | Same glob logic, different folder source |
-| `_tally_breadth` | L261-306 | `compute_breadth_from_trend` L3020-3044 | Simplified live version, single-day |
-| `_compute_live_breadth` | L309-359 | `_compute_within_basket_correlation` L3710-3800 | Live version includes correlation |
-| `_quarter_str_to_date` | L179-185 | `_quarter_start_from_key` L427-432 | Same conversion, different name |
+| `_find_basket_parquet` | L110-120 | L3510-3522 | Same glob logic, different folder source |
+| `_find_basket_meta` | L122-132 | L3525-3539 | Same glob logic, different folder source |
+| `_tally_breadth` | L279-324 | `compute_breadth_from_trend` L3020-3044 | Simplified live version, single-day |
+| `_compute_live_breadth` | L327-377 | `_compute_within_basket_correlation` L3710-3800 | Live version includes correlation |
+| `_quarter_str_to_date` | L197-203 | `_quarter_start_from_key` L427-432 | Same conversion, different name |
 
 Functions in audit_basket.py that duplicate rotations.py logic:
 
@@ -138,7 +139,7 @@ Functions in verify_backtest.py that duplicate logic from other files (independe
 | Function | verify_backtest.py | Equivalent in other file |
 |----------|--------------------|--------------------------|
 | `find_basket_parquet` | L107-117 | rotations.py `_find_basket_parquet` L3510-3522 |
-| `quarter_str_to_date` | L140-146 | main.py `_quarter_str_to_date` L179-185 |
+| `quarter_str_to_date` | L140-146 | main.py `_quarter_str_to_date` L197-203 |
 | `build_trades` | L243-317 | main.py `run_backtest` trade-building |
 | `build_equity_curve` | L346-418 | main.py `run_backtest` equity replay |
 | `compute_stats` | L425-470 | main.py `run_backtest` `compute_stats` |
@@ -259,7 +260,7 @@ Functions in verify_backtest.py that duplicate logic from other files (independe
 
 #### `_quarter_start_from_key` (L427-432)
 - **Called by:** `_cache_build_quarter_lookup`, `_build_quarter_lookup`
-- **Parallel impl:** audit_basket.py L36-40, main.py `_quarter_str_to_date` L179-185
+- **Parallel impl:** audit_basket.py L36-40, main.py `_quarter_str_to_date` L197-203
 
 #### `_calc_beta_quarterly` / `_safe_calc_beta` (L425-455)
 - **Called by:** `build_quarter_beta_universes`
@@ -829,66 +830,67 @@ This file imports everything from rotations.py via `from rotations import *` plu
 
 ---
 
-### app/backend/main.py (3646 lines)
+### app/backend/main.py (3963 lines)
 
-#### `_read_live_parquet` (L80-90)
+#### `_read_live_parquet` (L80-91)
 - **Called by:** `_compute_live_breadth`, `get_basket_breadth`, `get_basket_returns`, `get_basket_data`, `list_live_signal_tickers`, `get_ticker_signals`, `get_ticker_data`, `get_basket_summary`
 
-#### `_find_basket_parquet` (L92-102)
+#### `_live_is_current` (L93-108)- **Called by:** `_compute_live_breadth`, `get_basket_breadth`, `get_basket_returns`, `get_basket_data`, `list_live_signal_tickers`, `get_ticker_signals`, `get_ticker_data`, `get_basket_summary`- **Purpose:** Returns True if the live parquet date is strictly newer than Norgate max date; prevents stale live overlay after market close when Norgate has already updated with end-of-day data- **Calls:** pd.to_datetime
+#### `_find_basket_parquet` (L110-120)
 - **Called by:** `get_basket_returns`, `get_basket_data`, `get_ticker_baskets`, `get_date_range`, `run_backtest`, `_build_leg_trades`
 - **PARALLEL IMPL:** signals/rotations.py L3510-3522
 
-#### `_find_basket_meta` (L104-114)
+#### `_find_basket_meta` (L122-132)
 - **Called by:** `get_meta_file_tickers`
 - **PARALLEL IMPL:** signals/rotations.py L3525-3539
 
-#### `clean_data_for_json` (L117-118)
+#### `clean_data_for_json` (L135-136)
 - **Called by:** `get_basket_data`, `get_ticker_data`
 
-#### `get_latest_universe_tickers` (L120-142)
+#### `get_latest_universe_tickers` (L138-160)
 - **Called by:** `_compute_live_breadth`, `get_basket_breadth`, `get_basket_data`, `get_basket_summary`, `get_basket_correlation`, `get_ticker_baskets`, `run_backtest`, `_build_leg_trades`
 - **Data I/O:** reads `gics_mappings_{SIZE}.json`, thematic JSON files
 
-#### `get_meta_file_tickers` (L144-156)
+#### `get_meta_file_tickers` (L162-174)
 - **Called by:** `get_basket_summary`, `get_basket_correlation`, `run_backtest`, `_build_leg_trades`
 
-#### `_get_universe_history` (L159-176)
+#### `_get_universe_history` (L177-194)
 - **Called by:** `_get_universe_tickers_for_range`, `_get_ticker_join_dates`, `_get_tickers_for_date`, `get_basket_summary`, `run_backtest`, `_build_leg_trades`
 - **Data I/O:** reads `gics_mappings_{SIZE}.json`, thematic JSON files
 
-#### `_quarter_str_to_date` (L179-185)
+#### `_quarter_str_to_date` (L197-203)
 - **Called by:** `_get_universe_tickers_for_range`, `_get_ticker_join_dates`, `_get_tickers_for_date`, `get_basket_summary`, `run_backtest`, `_build_leg_trades`
 - **PARALLEL IMPL:** signals/rotations.py `_quarter_start_from_key` L427-432
 
-#### `_get_universe_tickers_for_range` (L188-202)
+#### `_get_universe_tickers_for_range` (L206-220)
 - **Called by:** `run_backtest`, `_build_leg_trades`
 
-#### `_get_ticker_join_dates` (L205-217)
+#### `_get_ticker_join_dates` (L223-235)
 - **Called by:** `get_basket_summary`
 
-#### `_get_tickers_for_date` (L220-238)
+#### `_get_tickers_for_date` (L238-256)
 - **Called by:** `get_basket_correlation`
 
-#### `get_basket_weights_from_contributions` (L242-259)
+#### `get_basket_weights_from_contributions` (L260-277)
 - **Called by:** `get_basket_data`
 - **Data I/O:** reads contributions parquet via `_find_basket_contributions`
 
-#### `_tally_breadth` (L261-306)
+#### `_tally_breadth` (L279-324)
 - **Called by:** `_compute_live_breadth`, `get_basket_breadth`
 - **PARALLEL IMPL (simplified):** signals/rotations.py `compute_breadth_from_trend`
 
-#### `_compute_live_breadth` (L309-359)
+#### `_compute_live_breadth` (L327-377)
 - **Called by:** `get_basket_data`
-- **Calls:** `get_latest_universe_tickers`, `_read_live_parquet`, `_tally_breadth`
+- **Calls:** `get_latest_universe_tickers`, `_read_live_parquet`, `_live_is_current`, `_tally_breadth`
 - **Data I/O:** reads `live_signals_{SIZE}.parquet`, `signals_{SIZE}.parquet`
 
-#### `read_root` (L363) — GET /
-#### `list_baskets` (L366-381) — GET /api/baskets
-#### `get_basket_compositions` (L384-407) — GET /api/baskets/compositions
-#### `get_basket_breadth` (L410-541) — GET /api/baskets/breadth
-- **Calls:** `_tally_breadth`, `_read_live_parquet`, `get_latest_universe_tickers`
+#### `read_root` (L384) — GET /
+#### `list_baskets` (L387-402) — GET /api/baskets
+#### `get_basket_compositions` (L405-428) — GET /api/baskets/compositions
+#### `get_basket_breadth` (L431-566) — GET /api/baskets/breadth
+- **Calls:** `_tally_breadth`, `_read_live_parquet`, `_live_is_current`, `get_latest_universe_tickers`
 
-#### `get_basket_returns` (L544-1115) — GET /api/baskets/returns
+#### `get_basket_returns` (L568-1428) — GET /api/baskets/returns
 - **Calls:** `_find_basket_parquet`, `_read_live_parquet`
 - **Nested functions:**
   - `_categorize` (L558-564) — classifies slug as "theme", "sector", or "industry"
@@ -908,52 +910,52 @@ This file imports everything from rotations.py via `from rotations import *` plu
     - **Threshold filtering**: `threshold` param filters analogs by minimum similarity score before aggregation
     - **Aggregate stats**: mean/median/min/max/std/count of forward returns at 1M/3M/6M horizons, overall and per-basket
 
-#### `get_basket_data` (L1118-1173) — GET /api/baskets/{basket_name}
+#### `get_basket_data` (L1429-1484) — GET /api/baskets/{basket_name}
 - **Calls:** `_find_basket_parquet`, `_read_live_parquet`, `signals_engine._build_signals_from_df`, `_compute_live_breadth`, `get_basket_weights_from_contributions`, `get_latest_universe_tickers`, `clean_data_for_json`
 
-#### `list_tickers` (L1175-1188) — GET /api/tickers
-#### `list_tickers_by_quarter` (L1190-1201) — GET /api/tickers/quarters
-#### `list_live_signal_tickers` (L1204-1290) — GET /api/live-signals
+#### `list_tickers` (L1486-1499) — GET /api/tickers
+#### `list_tickers_by_quarter` (L1501-1512) — GET /api/tickers/quarters
+#### `list_live_signal_tickers` (L1515-1601) — GET /api/live-signals
 - **Calls:** `signals_engine._build_signals_next_row`, `_read_live_parquet`
 
-#### `get_ticker_signals` (L1292-1386) — GET /api/ticker-signals
+#### `get_ticker_signals` (L1603-1697) — GET /api/ticker-signals
 - **Calls:** `_read_live_parquet`
 
-#### `get_ticker_data` (L1388-1443) — GET /api/tickers/{ticker}
+#### `get_ticker_data` (L1699-1760) — GET /api/tickers/{ticker}
 - **Calls:** `signals_engine._build_signals_next_row`, `_read_live_parquet`
 
-#### `safe_float` / `safe_int` (L1456-1465) — utility formatters
+#### `safe_float` / `safe_int` (L1762-1771) — utility formatters
 
-#### `get_basket_summary` (L1467-1921) — GET /api/baskets/{basket_name}/summary
+#### `get_basket_summary` (L1773-2227) — GET /api/baskets/{basket_name}/summary
 - **Calls:** `get_latest_universe_tickers`, `get_meta_file_tickers`, `_get_universe_history`, `_quarter_str_to_date`, `_read_live_parquet`, `_find_basket_contributions`, `_get_ticker_join_dates`, `safe_float`, `safe_int`
 
-#### `get_basket_correlation` (L1923-1969) — GET /api/baskets/{basket_name}/correlation
+#### `get_basket_correlation` (L2229-2275) — GET /api/baskets/{basket_name}/correlation
 - **Calls:** `_get_tickers_for_date`, `get_latest_universe_tickers`, `get_meta_file_tickers`
 
-#### `_find_basket_contributions` (L1972-1982)
+#### `_find_basket_contributions` (L2278-2288)
 - **Called by:** `get_basket_contributions`, `get_basket_candle_detail`, `get_basket_summary`, `get_basket_weights_from_contributions`
 
-#### `get_basket_contributions` (L1985-2070) — GET /api/baskets/{basket_name}/contributions
+#### `get_basket_contributions` (L2291-2376) — GET /api/baskets/{basket_name}/contributions
 
-#### `get_basket_candle_detail` (L2073-2148) — GET /api/baskets/{basket_name}/candle-detail
+#### `get_basket_candle_detail` (L2379-2454) — GET /api/baskets/{basket_name}/candle-detail
 
-#### `get_ticker_baskets` (L2150-2178) — GET /api/ticker-baskets/{ticker}
+#### `get_ticker_baskets` (L2456-2484) — GET /api/ticker-baskets/{ticker}
 
-#### `BacktestFilter` (L2181-2185) — Pydantic model
+#### `BacktestFilter` (L2487-2491) — Pydantic model
 - **Fields:** `metric`, `condition`, `value`, `source`
 
-#### `BacktestRequest` (L2187-2195) — Pydantic model
+#### `BacktestRequest` (L2493-2501) — Pydantic model
 - **Fields:** `target`, `target_type`, `entry_signal`, `filters`, `start_date`, `end_date`, `position_size` (default 1.0), `max_leverage` (default 2.5)
 - **Removed:** `initial_equity` (no longer user-configurable; hardcoded to 1.0 internally for percentage-based equity)
 
-#### `MultiBacktestLeg` (L2197-2203) — Pydantic model
+#### `MultiBacktestLeg` (L2503-2509) — Pydantic model
 - **Fields:** `target`, `target_type`, `entry_signal`, `allocation_pct` (0-1 fraction), `position_size` (default 1.0), `filters`
 
-#### `MultiBacktestRequest` (L2205-2209) — Pydantic model
+#### `MultiBacktestRequest` (L2511-2517) — Pydantic model
 - **Fields:** `legs`, `start_date`, `end_date`, `max_leverage` (default 2.5)
 - **Removed:** `initial_equity` (no longer user-configurable; hardcoded to 1.0 internally for percentage-based equity)
 
-#### `_build_leg_trades` (L2212-2489)
+#### `_build_leg_trades` (L2518-2795)
 - **Purpose:** extracted from `run_backtest` — builds the trades list + ticker_closes dict for a single backtest leg
 - **Called by:** `run_multi_backtest`
 - **Calls:** `_find_basket_parquet`, `get_latest_universe_tickers`, `get_meta_file_tickers`, `_get_universe_history`, `_get_universe_tickers_for_range`, `_quarter_str_to_date`, `safe_float`
@@ -967,11 +969,11 @@ This file imports everything from rotations.py via `from rotations import *` plu
   - Skips open trades (no exit_date/exit_price)
   - Trade dicts include `entry_weight`, `exit_weight`, `contribution` fields (initialized to None, populated by equity engine)
 
-#### `get_date_range` (L2492-2508) — GET /api/date-range/{target_type}/{target}
+#### `get_date_range` (L2798-2814) — GET /api/date-range/{target_type}/{target}
 - **Calls:** `_find_basket_parquet`
 - **Data I/O:** reads `signals_500.parquet` (columns: Ticker, Date), basket parquets (column: Date)
 
-#### `_build_buy_hold` (L2510-2573)
+#### `_build_buy_hold` (L2816-2879)
 - **Purpose:** builds a complete buy-and-hold backtest result from the Close series
 - **Called by:** `run_backtest` (early return when `entry_signal == 'Buy_Hold'`)
 - **Calls:** `_find_basket_parquet`
@@ -984,7 +986,7 @@ This file imports everything from rotations.py via `from rotations import *` plu
   - Trade includes `entry_weight: 1.0`, `exit_weight: 1.0`, `contribution: total_return`
   - Stats: single trade, max_dd from cummax drawdown
 
-#### `run_backtest` (L2576-3075) — POST /api/backtest
+#### `run_backtest` (L2882-3393) — POST /api/backtest
 - **Calls:** `_build_buy_hold` (early return for Buy_Hold), `_find_basket_parquet`, `get_latest_universe_tickers`, `get_meta_file_tickers`, `_quarter_str_to_date`, `_get_universe_history`, `_get_universe_tickers_for_range`, `safe_float`
 - **Nested functions:**
   - `mtm_equity` — mark-to-market equity computation for open positions
@@ -1000,7 +1002,7 @@ This file imports everything from rotations.py via `from rotations import *` plu
   - Daily position snapshots keyed by date index with full position detail (entry_weight, weight, daily_return, contribution)
 - **Frontend callers:** BacktestPanel.tsx `runBacktest` now calls POST `/api/backtest/multi` for all backtests (single-leg wrapped as 1-leg multi)
 
-#### `run_multi_backtest` (L3078-3577) — POST /api/backtest/multi
+#### `run_multi_backtest` (L3395-3894) — POST /api/backtest/multi
 - **Calls:** `_build_leg_trades`, `_find_basket_parquet`
 - **Nested function:** `compute_stats` — NEW split structure: returns `{'portfolio': {...}, 'trade': {...}}` dict
   - `portfolio` stats: `strategy_return`, `cagr`, `volatility`, `max_dd`, `sharpe`, `sortino`, `contribution?`, `allocation?`
@@ -1017,7 +1019,7 @@ This file imports everything from rotations.py via `from rotations import *` plu
   - Inter-leg correlation matrix from daily returns of standalone equity curves
   - Per-leg contribution = alloc_frac * leg_return
 
-#### `uvicorn.run` (L3646) — entry point
+#### `uvicorn.run` (L3963) — entry point
 
 ---
 
