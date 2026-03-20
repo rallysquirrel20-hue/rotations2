@@ -1,17 +1,17 @@
 # Monorepo Integration Map
 
-> Auto-generated 2026-03-16. Last updated 2026-03-18 (batch 7). Tracks all communication points between signals/ and app/backend/.
+> Auto-generated 2026-03-16. Last updated 2026-03-20 (batch 8). Tracks all communication points between signals/ and app/backend/.
 
 ## Signal Refresh Entry Point
 
-### `signals/live_loop.py` — PM2-managed 15-minute refresh driver (added 2026-03-16)
+### `signals/live_loop.py` — PM2-managed 15-minute refresh driver (added 2026-03-16, updated 2026-03-20)
 
 - **Role**: Thin scheduler — the sole purpose is to invoke `signals/rotations.py` on a recurring interval. It does not read or write any data files itself.
 - **Mechanism**: Calls `runpy.run_path("signals/rotations.py", run_name="__main__")` inside an infinite `while True` loop with `time.sleep(900)` (15 minutes) between iterations. Each call gets a fresh module namespace.
-- **PM2 entry**: Registered as the `live-signals` app in `ecosystem.config.js`. Starting `pm2 start ecosystem.config.js` launches this loop as a managed background process.
+- **PM2 entry**: Registered as the `live-signals` app in `ecosystem.config.js`. Starting `pm2 start ecosystem.config.js` launches this loop as a managed background process. PM2 hardening (added 2026-03-20): `restart_delay=30000` (30s cooldown between restarts), `max_restarts=3` (stop after 3 consecutive crashes), `min_uptime=60000` (process must run 60s to be considered successfully started).
 - **Cache refresh cadence**: Because `live_loop.py` drives `rotations.py`, all signal caches in `~/Documents/Python_Outputs/Data_Storage/` (`signals_500.parquet`, basket parquets, `live_signals_500.parquet`, `live_basket_signals_500.parquet`, thematic universe JSONs, etc.) are refreshed on this 15-minute cycle during market hours.
 - **Market-hours gate**: `rotations.py`'s `_get_live_update_gate()` function no-ops outside Mon–Fri 09:25–16:15 ET, so the loop runs continuously but full I/O is suppressed outside trading hours. Cache guards (`is_*_current()`) additionally skip re-building already-current data within a run.
-- **Error isolation**: Exceptions from `rotations.py` are caught by a `try/except` in `live_loop.py` with `traceback.print_exc()`; the loop continues regardless, so a single failed run does not kill the PM2 process.
+- **Error isolation** (updated 2026-03-20): The `try/except` now catches `BaseException` (not just `Exception`) to prevent pm2 crash loops from uncaught `SystemExit`, `GeneratorExit`, or other `BaseException` subclasses raised by `rotations.py`. `KeyboardInterrupt` is explicitly re-raised via `break` to allow clean shutdown. All other exceptions (including `BaseException` subclasses) are logged via `traceback.print_exc()` and the loop continues.
 
 ---
 
@@ -29,11 +29,12 @@
 ### `signals_500.parquet`
 - **Written by**: `load_or_build_signals()` / `_incremental_update_signals()` — `signals/rotations.py:2462` / `signals/rotations.py:2228`
   - Parquet write at line 2619 (full build, `SIGNALS_CACHE_FILE`) and line 5091 (live append via `append_live_today_to_signals_parquet()` at line 5031)
-- **Read by**: `_compute_live_breadth()`, `get_basket_summary()`, `get_basket_correlation()`, `get_ticker_data()`, `get_ticker_signals()` — `app/backend/main.py:326`, `930`, `1355`, `817`, `727`
+- **Read by**: `_compute_live_breadth_batch()`, `_compute_live_breadth()`, `get_basket_summary()`, `get_basket_correlation()`, `get_ticker_data()`, `get_ticker_signals()` — `app/backend/main.py:392`, `460`, `930`, `1355`, `817`, `727`
   - `get_basket_summary()` reads `BTFD_Triggered` and `STFR_Triggered` columns (added to `cols_needed` at line 925)
   - `get_ticker_signals()` reads `Close` and `Volume` columns (line 723)
   - `get_ticker_data()` reads all columns via unfiltered `read_parquet` (line 817)
-  - `_compute_live_breadth()` reads `Ticker`, `Date`, `Close`, `Trend`, `Resistance_Pivot`, `Support_Pivot`, `Upper_Target`, `Lower_Target`, `Is_Breakout_Sequence` (lines 324-326)
+  - `_compute_live_breadth_batch()` (added 2026-03-20) reads `Ticker`, `Date`, `Close`, `Trend`, `Resistance_Pivot`, `Support_Pivot`, `Upper_Target`, `Lower_Target`, `Is_Breakout_Sequence` once for all tickers across all requested baskets (line 389-393), plus a second read of `Ticker`, `Date`, `Close` for the correlation pivot (line 408)
+  - `_compute_live_breadth()` reads the same columns but for a single basket (lines 458-460)
   - `get_basket_correlation()` reads `Ticker`, `Date`, `Close` (line 1355)
   - **Frontend** (`TVChart.tsx`, `BacktestPanel.tsx`): reads `RV_EMA` from `chart_data` returned by `/api/tickers/{ticker}`; annualizes as `RV_EMA * sqrt(252) * 100` for display as a Realized Volatility indicator pane (percentage)
 - **Also read by**: `app/backend/verify_backtest.py` — loads `Ticker`, `Date`, `Close`, `Is_{signal}`, and per-signal trade columns (`{sig}_Entry_Price`, `{sig}_Exit_Date`, `{sig}_Exit_Price`, `{sig}_Final_Change`, `{sig}_MFE`, `{sig}_MAE`) for independent backtest verification
@@ -101,7 +102,8 @@
 ### `live_signals_500.parquet`
 - **Written by**: `export_today_signals()` — `signals/rotations.py:4817`
   - First write path at line 4854 (fresh context), second at line 4888 (cached context)
-- **Read by**: `_compute_live_breadth()`, `get_ticker_signals()`, `get_ticker_data()` — `app/backend/main.py:315`, `669`, `821`
+- **Read by**: `_compute_live_breadth_batch()`, `_compute_live_breadth()`, `get_ticker_signals()`, `get_ticker_data()` — `app/backend/main.py:373`, `453`, `669`, `821`
+  - `_compute_live_breadth_batch()` (added 2026-03-20) reads this file once at the top (line 373) and uses it for all baskets in a single pass, avoiding redundant per-basket reads
 - **Columns written**: `Date`, `Ticker`, `Open`, `High`, `Low`, `Close` (pure OHLC, no signal columns, no `Source`)
 - **OHLC source**: `get_live_ohlc_bars()` — `signals/rotations.py:4602` — all four fields (Open, High, Low, Close) derived from Databento Historical `ohlcv-1m` aggregation since 9:30 ET. Close is the last 1-minute bar's close price. (Previously Close was overridden by an `mbp-1` live-feed mid-price; that feed was removed 2026-03-16.)
 - **Status**: OK
@@ -137,14 +139,46 @@
 
 ---
 
+## Backend Helper Functions
+
+### `_compute_live_breadth_batch()` — batch live breadth computation (added 2026-03-20)
+
+**Location**: `app/backend/main.py:370`
+
+**Purpose**: Compute live `Uptrend_Pct`, `Breakout_Pct`, and `Correlation_Pct` for multiple baskets in a single pass, avoiding redundant per-basket file reads of `signals_500.parquet` and `live_signals_500.parquet`.
+
+**Data sources read**:
+1. `live_signals_500.parquet` — read once (line 373) via `_read_live_parquet(LIVE_SIGNALS_FILE)` for live close prices
+2. `signals_500.parquet` — read once (line 392) with columns `['Ticker', 'Date', 'Close', 'Trend', 'Resistance_Pivot', 'Support_Pivot', 'Upper_Target', 'Lower_Target', 'Is_Breakout_Sequence']` filtered to the union of all tickers across all requested baskets. A second read (line 408) fetches `['Ticker', 'Date', 'Close']` for the correlation pivot.
+
+**Algorithm**:
+1. Gathers all tickers across all input basket slugs via `get_latest_universe_tickers()`.
+2. Reads historical signals once for the full ticker union.
+3. Checks `_live_is_current()` — returns empty if live data is stale.
+4. Builds a close-price pivot table (Date x Ticker) from historical data, appends live prices as a new row, and computes 1-day returns.
+5. For each basket:
+   - Calls `_tally_breadth()` (line 421) to get `Uptrend_Pct` and `Breakout_Pct` from constituent pivot/trend logic.
+   - Computes `Correlation_Pct` from the last 21 rows of the pre-computed returns pivot (upper-triangle mean of pairwise correlation, line 429-439).
+
+**Return value**: `{slug: {'Uptrend_Pct': float, 'Breakout_Pct': float, 'Correlation_Pct': float}, ...}` — missing keys when data is unavailable.
+
+**Callers**:
+- `get_basket_returns()` analogs mode — `app/backend/main.py:848`
+- `get_basket_returns()` query mode — `app/backend/main.py:1345`
+
+**Replaces**: Previously, analogs and query modes did not compute live breadth metrics for the appended live row — they used `NaN` for `Uptrend_Pct`, `Breakout_Pct`, `Correlation_Pct`. The single-basket `_compute_live_breadth()` (line 447) still exists for per-basket overlay in `get_basket_data()` (line 1789).
+
+---
+
 ## Backend Endpoint Notes
 
-### `GET /api/baskets/returns` — cross-basket and single-basket return data (added 2026-03-17, extended with `analogs` mode)
+### `GET /api/baskets/returns` — cross-basket and single-basket return data (added 2026-03-17, extended with `analogs` and `query` modes)
 
 **Endpoint**: `app/backend/main.py:543` — `get_basket_returns()`
 
 **Query parameters**:
-- `mode`: `"period"` (default) — one return value per basket; `"daily"` — day-by-day return series for a single basket; `"analogs"` — regime analog search (new, added HEAD commit)
+- `mode`: `"period"` (default) — one return value per basket; `"daily"` — day-by-day return series for a single basket; `"analogs"` — regime analog search; `"query"` — condition-based analog query (added 2026-03-20)
+- `conditions`: JSON string — condition array for query mode (see query mode section below)
 - `start`, `end`: Date range (strings, `YYYY-MM-DD`). Defaults to trailing 1Y from the latest available date in period mode.
 - `basket`: Basket slug (required for `mode=daily`)
 - `group`: `"all"` (default), `"themes"`, `"sectors"`, `"industries"` — filters baskets in period and analogs modes
@@ -157,10 +191,18 @@
    - Global date range computation (reads `Date` column only)
    - Period mode: reads `Date`, `Close` — computes `(last_close / first_close) - 1` per basket
    - Daily mode: reads `Date`, `Close` — computes `Close.pct_change()` for a single basket
-   - **Analogs mode** (new): reads `Date`, `Close`, `Uptrend_Pct`, `Breakout_Pct`, `Correlation_Pct`, `RV_EMA` — builds cross-basket rank fingerprints for Spearman correlation similarity search
+   - **Analogs mode**: reads `Date`, `Close`, `Uptrend_Pct`, `Breakout_Pct`, `Correlation_Pct`, `RV_EMA` — builds cross-basket rank fingerprints for Spearman correlation similarity search
+   - **Query mode**: reads the same 6 columns as analogs mode — builds lookback return and change matrices for condition evaluation
 2. **`live_basket_signals_500.parquet`** — reads `BasketName`/`Basket`, `Date`, `Close`. Builds a `live_closes` dict mapping slug to `(date, close)`. Live row is appended to each basket's close series in all modes.
+3. **`signals_500.parquet`** + **`live_signals_500.parquet`** — read indirectly via `_compute_live_breadth_batch()` (analogs and query modes only, 2026-03-20) to compute real-time `Uptrend_Pct`, `Breakout_Pct`, `Correlation_Pct` for the live row.
 
-**Analogs mode data contract** (updated 2026-03-17):
+**Live row computation** (updated 2026-03-20 for analogs and query modes):
+- Previously, live rows appended to basket DataFrames used `NaN` for `Uptrend_Pct`, `Breakout_Pct`, and `Correlation_Pct`.
+- Now, `_compute_live_breadth_batch(slugs)` is called once before the basket loop (analogs: line 848, query: line 1345) to get real constituent-derived metrics.
+- `RV_EMA` is computed inline from the previous row's `RV_EMA` and the live return: `live_rv_ema = 2/11 * |live_close/prev_close - 1| + (1 - 2/11) * prev_rv_ema` (analogs: lines 868-872, query: lines 1361-1365). This is an EMA(|return|, span=10) step.
+- The live row for each basket now contains: `Close` (from `live_basket_signals_500.parquet`), `Uptrend_Pct` (from batch breadth), `Breakout_Pct` (from batch breadth), `Correlation_Pct` (from batch breadth), `RV_EMA` (from inline EMA step).
+
+**Analogs mode data contract** (updated 2026-03-20 — live metrics now real, not NaN):
 - Reads `['Date', 'Close', 'Uptrend_Pct', 'Breakout_Pct', 'Correlation_Pct', 'RV_EMA']` from every basket parquet
 - Computes rolling Spearman correlation across 5+ metrics: returns rank, uptrend rank, breakout rank, correlation rank, volatility rank, plus multi-timeframe return ranks (1Q/1Y/3Y/5Y) and cross-basket correlation similarity
 - `MULTI_TF = {"1Q": 63, "1Y": 252, "3Y": 756, "5Y": 1260}` — additional return timeframes computed via rolling windows on close prices
@@ -172,6 +214,16 @@
 - Forward series: daily cumulative forward returns per basket for up to 252 trading days past the analog window end
 - Aggregate statistics (mean/median/min/max/std/count) at 1M/3M/6M horizons across all post-threshold analogs, with per-basket breakdown
 - **Column contract**: All 4 columns (`Uptrend_Pct`, `Breakout_Pct`, `Correlation_Pct`, `RV_EMA`) must be present in basket signals parquets — already satisfied (written by `_finalize_basket_signals_output()`)
+
+**Query mode data contract** (added 2026-03-20, `app/backend/main.py:1329`):
+- Reads the same 6 columns as analogs mode from every basket parquet
+- Live row appended with real computed metrics (same as analogs mode) via `_compute_live_breadth_batch()` (line 1345)
+- Builds lookback return matrices: `LOOKBACKS = {"return_1D": 1, "return_1W": 5, "return_1M": 21, "return_1Q": 63, "return_1Y": 252}` — percentage change of close prices over each lookback window
+- Builds timeframe-qualified change matrices for non-return metrics (line 1423-1438): for each of `uptrend_pct`, `breakout_pct`, `correlation_pct`, `rv_ema`, computes absolute difference (NOT percentage change) over each lookback `{"1D": 1, "1W": 5, "1M": 21, "1Q": 63, "1Y": 252}`, yielding keys like `uptrend_pct_1D`, `rv_ema_1Q`, etc.
+- Combined `metric_mats` dict contains: 5 return matrices + 20 change matrices (4 metrics x 5 timeframes) + 4 raw level matrices for backward compatibility
+- Rank matrices computed per-date across baskets (rank 1 = lowest value)
+- Conditions evaluated as boolean mask over dates; matching dates produce forward returns and forward series
+- **Condition schema**: `{"basket": str, "metric": str, "operator": str, "value": float}` — `basket` can be a specific slug or `"*sectors"/"*themes"/"*industries"` for group-level conditions; `operator` is `"positive"/"negative"/"above"/"below"/"top_n"/"bottom_n"/"top_pct"/"bottom_pct"`
 
 **Response shape** (`mode=period`):
 ```
@@ -244,6 +296,7 @@
 **Frontend consumers**:
 - `mode=period` and `mode=daily`: `BasketReturnsChart` component in `app/frontend/src/components/BasketSummary.tsx` — renders cross-basket ranked bar chart (period mode) and single-basket daily return bar chart (daily mode) with date presets and live intraday overlay.
 - `mode=analogs`: `AnalogsPanel` top-level component in `app/frontend/src/components/AnalogsPanel.tsx` — dedicated panel for regime analog search, rendering similarity results, forward series charts, and aggregate statistics. Also referenced in `app/frontend/src/App.tsx` (imported and routed) and styled in `app/frontend/src/index.css`.
+- `mode=query`: `AnalogsPanel` — condition-based query builder (Summary tab) sends conditions as JSON string parameter.
 
 ---
 
