@@ -32,8 +32,10 @@ while True:
     log(f"{'='*60}")
     try:
         runpy.run_path(script, run_name="__main__")
-    except Exception:
+    except BaseException as exc:
         traceback.print_exc()
+        if isinstance(exc, KeyboardInterrupt):
+            break
     log(f"[live_loop] Cycle {cycle} finished at {datetime.now():%Y-%m-%d %H:%M:%S}")
     log(f"[live_loop] Sleeping {INTERVAL // 60} minutes...")
     time.sleep(INTERVAL)

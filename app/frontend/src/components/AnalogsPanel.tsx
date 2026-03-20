@@ -49,7 +49,8 @@ interface QueryResponse {
 interface Condition {
   id: number
   basket: string    // slug, "*sectors", "*themes", "*industries"
-  metric: string    // return_1D, return_1W, return_1M, return_1Q, return_1Y, uptrend_pct, etc.
+  metric: string    // return, uptrend_pct, breakout_pct, correlation_pct, rv_ema
+  timeframe: string // 1D, 1W, 1M, 1Q, 1Y
   operator: string  // positive, negative, top_n, bottom_n, above, below
   value: number
 }
@@ -65,15 +66,19 @@ interface AnalogsPanelProps {
 type AnalogTab = 'summary' | 'forward' | 'aggregate'
 
 const METRIC_OPTIONS = [
-  { value: 'return_1D', label: '1D Return' },
-  { value: 'return_1W', label: '1W Return' },
-  { value: 'return_1M', label: '1M Return' },
-  { value: 'return_1Q', label: '1Q Return' },
-  { value: 'return_1Y', label: '1Y Return' },
-  { value: 'uptrend_pct', label: 'Uptrend%' },
-  { value: 'breakout_pct', label: 'Breakout%' },
-  { value: 'correlation_pct', label: 'Corr%' },
+  { value: 'return', label: 'Return' },
   { value: 'rv_ema', label: 'Volatility' },
+  { value: 'correlation_pct', label: 'Correlation' },
+  { value: 'uptrend_pct', label: 'Breadth' },
+  { value: 'breakout_pct', label: 'Breakout' },
+]
+
+const TF_OPTIONS = [
+  { value: '1D', label: '1D' },
+  { value: '1W', label: '1W' },
+  { value: '1M', label: '1M' },
+  { value: '1Q', label: '1Q' },
+  { value: '1Y', label: '1Y' },
 ]
 
 const OPERATOR_OPTIONS = [
@@ -85,12 +90,14 @@ const OPERATOR_OPTIONS = [
   { value: 'below', label: 'Below' },
 ]
 
-// Map summary grid factors to condition metrics
-const FACTOR_TO_METRIC: Record<string, string> = {
-  returns_1D: 'return_1D', returns_1W: 'return_1W', returns_1M: 'return_1M',
-  returns_1Q: 'return_1Q', returns_1Y: 'return_1Y', returns_3Y: 'return_1Y', returns_5Y: 'return_1Y',
-  uptrend_pct: 'uptrend_pct', breakout_pct: 'breakout_pct',
-  correlation_pct: 'correlation_pct', rv_ema: 'rv_ema',
+// Map summary grid factors to condition metric + timeframe
+const FACTOR_TO_COND: Record<string, { metric: string; timeframe: string }> = {}
+for (const tf of ['1D', '1W', '1M', '1Q', '1Y', '3Y']) {
+  FACTOR_TO_COND[`returns_${tf}`] = { metric: 'return', timeframe: tf }
+  FACTOR_TO_COND[`rv_ema_${tf}`] = { metric: 'rv_ema', timeframe: tf }
+  FACTOR_TO_COND[`correlation_pct_${tf}`] = { metric: 'correlation_pct', timeframe: tf }
+  FACTOR_TO_COND[`uptrend_pct_${tf}`] = { metric: 'uptrend_pct', timeframe: tf }
+  FACTOR_TO_COND[`breakout_pct_${tf}`] = { metric: 'breakout_pct', timeframe: tf }
 }
 
 function rankColor(rank: number, total: number): string {
@@ -132,8 +139,8 @@ export function AnalogsPanel({ apiBase, exportTrigger }: AnalogsPanelProps) {
   const [fwdHorizon, setFwdHorizon] = useState<number>(252) // max trading days to show
   const [fwdSortCol, setFwdSortCol] = useState<'basket' | 'change'>('change')
   const [fwdSortAsc, setFwdSortAsc] = useState(false)
-  const [summarySortCol, setSummarySortCol] = useState<string>('returns_1Q')
-  const [summarySortAsc, setSummarySortAsc] = useState(false)
+  const [summarySortCol, setSummarySortCol] = useState<string>('returns_1Y')
+  const [summarySortAsc, setSummarySortAsc] = useState(true)
   const [summaryShowRanks, setSummaryShowRanks] = useState(false)
   const [aggSelectedBasket, setAggSelectedBasket] = useState<string | null>(null)
 
@@ -215,10 +222,11 @@ export function AnalogsPanel({ apiBase, exportTrigger }: AnalogsPanelProps) {
   }, [tab])
 
   // ── Condition management ──
-  const addCondition = (basket: string, metric: string, rank: number, B: number) => {
+  const addCondition = (basket: string, factor: string, rank: number, B: number) => {
     const op = rank <= B / 2 ? 'bottom_n' : 'top_n'
+    const mapped = FACTOR_TO_COND[factor] || { metric: 'return', timeframe: '1D' }
     setConditions(prev => [...prev, {
-      id: condIdCounter, basket, metric: FACTOR_TO_METRIC[metric] || metric,
+      id: condIdCounter, basket, metric: mapped.metric, timeframe: mapped.timeframe,
       operator: op, value: 5,
     }])
     setCondIdCounter(prev => prev + 1)
@@ -227,7 +235,7 @@ export function AnalogsPanel({ apiBase, exportTrigger }: AnalogsPanelProps) {
   const addEmptyCondition = () => {
     setConditions(prev => [...prev, {
       id: condIdCounter, basket: sortedSlugs[0] || '',
-      metric: 'return_1D', operator: 'negative', value: 0,
+      metric: 'return', timeframe: '1D', operator: 'negative', value: 0,
     }])
     setCondIdCounter(prev => prev + 1)
   }
@@ -246,7 +254,7 @@ export function AnalogsPanel({ apiBase, exportTrigger }: AnalogsPanelProps) {
     const params = new URLSearchParams({
       mode: 'query', group: 'all',
       conditions: JSON.stringify(conditions.map(c => ({
-        basket: c.basket, metric: c.metric, operator: c.operator, value: c.value,
+        basket: c.basket, metric: `${c.metric}_${c.timeframe}`, operator: c.operator, value: c.value,
       }))),
     })
     axios.get(`${apiBase}/baskets/returns?${params}`)
@@ -259,20 +267,35 @@ export function AnalogsPanel({ apiBase, exportTrigger }: AnalogsPanelProps) {
       .finally(() => setQueryLoading(false))
   }
 
-  // ── SUMMARY: Fingerprint ranking table ──
-  const SUMMARY_FACTORS = ['returns_1D', 'returns_1W', 'returns_1M', 'returns_1Q', 'returns_1Y', 'returns_3Y', 'returns_5Y', 'uptrend_pct', 'breakout_pct', 'correlation_pct', 'rv_ema'] as const
-  const FACTOR_LABELS: Record<string, string> = {
-    returns_1D: '1D', returns_1W: '1W', returns_1M: '1M',
-    returns_1Q: '1Q', returns_1Y: '1Y', returns_3Y: '3Y', returns_5Y: '5Y',
-    uptrend_pct: 'Breadth%', breakout_pct: 'BO%',
-    correlation_pct: 'Corr%', rv_ema: 'RV%',
+  // ── SUMMARY: 5 metric grids ──
+  type SummaryMetric = 'returns' | 'rv_ema' | 'correlation_pct' | 'uptrend_pct' | 'breakout_pct'
+  const [summaryMetric, setSummaryMetric] = useState<SummaryMetric>('returns')
+  const SUMMARY_METRIC_OPTIONS: { value: SummaryMetric; label: string }[] = [
+    { value: 'returns', label: 'Returns' },
+    { value: 'rv_ema', label: 'Volatility' },
+    { value: 'correlation_pct', label: 'Correlation' },
+    { value: 'uptrend_pct', label: 'Breadth' },
+    { value: 'breakout_pct', label: 'Breakout%' },
+  ]
+  const TF_LABELS = ['1D', '1W', '1M', '1Q', '1Y', '3Y'] as const
+  const summaryFactors = useMemo(() =>
+    TF_LABELS.map(tf => summaryMetric === 'returns' ? `returns_${tf}` : `${summaryMetric}_${tf}`),
+    [summaryMetric]
+  )
+  const FACTOR_LABELS: Record<string, string> = {}
+  for (const tf of TF_LABELS) {
+    FACTOR_LABELS[`returns_${tf}`] = tf
+    FACTOR_LABELS[`rv_ema_${tf}`] = tf
+    FACTOR_LABELS[`correlation_pct_${tf}`] = tf
+    FACTOR_LABELS[`uptrend_pct_${tf}`] = tf
+    FACTOR_LABELS[`breakout_pct_${tf}`] = tf
   }
 
   const summaryRows = useMemo(() => {
     if (!data?.current) return { rows: [] as { slug: string; cells: { factor: string; value: number | null; rank: number | null }[]; avgRank: number; B: number }[], factors: [] as string[], B: 0 }
     const { returns, metrics, ranks, basket_count } = data.current
     const B = basket_count
-    const factors = (SUMMARY_FACTORS as readonly string[]).filter(f => ranks[f] !== undefined)
+    const factors = summaryFactors.filter(f => ranks[f] !== undefined)
     const rows = sortedSlugs.map(slug => {
       const cells: { factor: string; value: number | null; rank: number | null }[] = []
       for (const f of factors) {
@@ -298,7 +321,7 @@ export function AnalogsPanel({ apiBase, exportTrigger }: AnalogsPanelProps) {
       }
     }
     return { rows, factors, B }
-  }, [data, sortedSlugs, summarySortCol, summarySortAsc])
+  }, [data, sortedSlugs, summarySortCol, summarySortAsc, summaryFactors])
 
   const handleSummarySort = (col: string) => {
     if (summarySortCol === col) setSummarySortAsc(prev => !prev)
@@ -731,6 +754,10 @@ export function AnalogsPanel({ apiBase, exportTrigger }: AnalogsPanelProps) {
                 style={{ fontSize: 10, padding: '2px 4px', minWidth: 90, background: 'var(--bg-main)', color: 'var(--text-main)', border: '1px solid var(--border-color)' }}>
                 {METRIC_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
               </select>
+              <select value={cond.timeframe} onChange={e => updateCondition(cond.id, 'timeframe', e.target.value)}
+                style={{ fontSize: 10, padding: '2px 4px', minWidth: 40, background: 'var(--bg-main)', color: 'var(--text-main)', border: '1px solid var(--border-color)' }}>
+                {TF_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+              </select>
               <select value={cond.operator} onChange={e => updateCondition(cond.id, 'operator', e.target.value)}
                 style={{ fontSize: 10, padding: '2px 4px', minWidth: 70, background: 'var(--bg-main)', color: 'var(--text-main)', border: '1px solid var(--border-color)' }}>
                 {OPERATOR_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
@@ -760,6 +787,15 @@ export function AnalogsPanel({ apiBase, exportTrigger }: AnalogsPanelProps) {
                   <strong>Current Environment</strong> ({data.current.start} to {data.current.end})
                   <br />
                   Click any cell to add a condition. Rank 1 = best.
+                </div>
+                <div style={{ display: 'flex', gap: 4, marginBottom: 8 }}>
+                  {SUMMARY_METRIC_OPTIONS.map(opt => (
+                    <button key={opt.value}
+                      className={`contrib-toggle-btn ${summaryMetric === opt.value ? 'active' : ''}`}
+                      onClick={() => { setSummaryMetric(opt.value); if (summaryMetric !== opt.value) { setSummarySortCol(opt.value === 'returns' ? 'returns_1Y' : `${opt.value}_1Y`); setSummarySortAsc(true) } }}>
+                      {opt.label}
+                    </button>
+                  ))}
                 </div>
                 {data.current.metrics.cross_basket_corr !== undefined && data.current.metrics.cross_basket_corr !== null && (
                   <div style={{ marginBottom: 6, fontSize: 10, color: 'var(--base01)' }}>
@@ -792,8 +828,13 @@ export function AnalogsPanel({ apiBase, exportTrigger }: AnalogsPanelProps) {
                               onClick={() => { if (cell.rank !== null) addCondition(row.slug, cell.factor, cell.rank, row.B) }}
                             >
                               {(() => {
-                                const isRaw = cell.factor === 'uptrend_pct' || cell.factor === 'breakout_pct' || cell.factor === 'correlation_pct'
-                                const display = cell.value !== null ? (isRaw ? cell.value.toFixed(1) + '%' : (cell.value * 100).toFixed(1) + '%') : '--'
+                                const isReturn = cell.factor.startsWith('returns_')
+                                const isRV = cell.factor.startsWith('rv_ema_')
+                                const display = cell.value !== null
+                                  ? isReturn ? (cell.value * 100).toFixed(1) + '%'
+                                  : isRV ? (cell.value * Math.sqrt(252) * 100).toFixed(1)
+                                  : cell.value.toFixed(1) + '%'
+                                  : '--'
                                 return summaryShowRanks ? (
                                   <span>
                                     <span style={{ opacity: 0.7, fontSize: 9 }}>{display}</span>

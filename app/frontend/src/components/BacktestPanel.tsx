@@ -13,7 +13,7 @@ interface BacktestFilter {
 
 interface LegConfig {
   target: string
-  targetType: 'basket' | 'basket_tickers' | 'ticker'
+  targetType: 'basket' | 'basket_tickers' | 'ticker' | 'etf'
   entrySignal: string
   exitSignal: string | null
   stopSignal: string | null
@@ -117,7 +117,7 @@ interface MultiBacktestResult {
 interface BacktestPanelProps {
   apiBase: string
   target?: string
-  targetType?: 'basket' | 'ticker'
+  targetType?: 'basket' | 'ticker' | 'etf'
   exportTrigger?: number
 }
 
@@ -182,7 +182,507 @@ function defaultLeg(): LegConfig {
   return { target: '', targetType: 'basket_tickers', entrySignal: 'Breakout', exitSignal: null, stopSignal: null, allocationPct: 100, positionSize: 25, filters: [] }
 }
 
-type ResultTab = 'equity' | 'stats' | 'distribution' | 'path' | 'trades'
+type ResultTab = 'equity' | 'stats' | 'distribution' | 'path' | 'trades' | 'multi_returns' | 'single_returns'
+
+/* ── Backtest Returns View ─────────────────────────────────────────── */
+
+const RETURNS_PRESETS = [
+  { label: '1M', days: 30 }, { label: '3M', days: 90 }, { label: '6M', days: 182 },
+  { label: 'YTD', days: -1 }, { label: '1Y', days: 365 }, { label: '3Y', days: 1095 },
+  { label: '5Y', days: 1825 }, { label: 'ALL', days: 0 },
+] as const
+
+function BacktestReturnsView({ dates, series, viewMode = 'single' }: {
+  dates: string[]
+  series: { key: string; label: string; curve: number[]; color: string }[]
+  viewMode?: 'single' | 'multi'
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const containerRef = useRef<HTMLDivElement>(null)
+  const [dims, setDims] = useState({ w: 800, h: 400 })
+  const [selectedKey, setSelectedKey] = useState('strategy')
+  const [barPeriod, setBarPeriod] = useState<'1D'|'1W'|'1M'|'1Q'|'1Y'>('1D')
+  const [hoveredName, setHoveredName] = useState<string | null>(null)
+  const [legendSortCol, setLegendSortCol] = useState<'name' | 'change'>('change')
+  const [legendSortAsc, setLegendSortAsc] = useState(false)
+  const [chartView, setChartView] = useState<'bar' | 'line'>('line')
+  const [visibleKeys, setVisibleKeys] = useState<Set<string>>(new Set())
+  // Init all visible on mount
+  useEffect(() => { setVisibleKeys(new Set(series.map(s => s.key))) }, [series.length])
+  const [activePreset, setActivePreset] = useState('ALL')
+  const [startDate, setStartDate] = useState('')
+  const [endDate, setEndDate] = useState('')
+  const [hoveredIdx, setHoveredIdx] = useState<number | null>(null)
+  const [scrollUnit, setScrollUnit] = useState<'1D'|'1W'|'1M'|'1Y'>('1Y')
+
+  const dateBoundsMin = dates.length > 0 ? dates[0] : ''
+  const dateBoundsMax = dates.length > 0 ? dates[dates.length - 1] : ''
+
+  // Init date range
+  useEffect(() => {
+    if (dates.length > 0) {
+      setStartDate(dates[0])
+      setEndDate(dates[dates.length - 1])
+    }
+  }, [dates])
+
+  // ResizeObserver
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const obs = new ResizeObserver(entries => {
+      const { width, height } = entries[0].contentRect
+      if (width > 0 && height > 0) setDims({ w: width, h: height })
+    })
+    obs.observe(el)
+    return () => obs.disconnect()
+  }, [])
+
+  // Compute period returns from equity curve
+  const barData = useMemo(() => {
+    const sel = series.find(s => s.key === selectedKey)
+    if (!sel || dates.length === 0) return { dates: [] as string[], returns: [] as number[] }
+
+    // Slice to date range
+    let si = 0, ei = dates.length - 1
+    for (let i = 0; i < dates.length; i++) { if (dates[i] >= startDate) { si = i; break } }
+    for (let i = dates.length - 1; i >= 0; i--) { if (dates[i] <= endDate) { ei = i; break } }
+    if (si > 0) si-- // anchor row
+    const slicedDates = dates.slice(si, ei + 1)
+    const slicedCurve = sel.curve.slice(si, ei + 1)
+    if (slicedCurve.length < 2) return { dates: [] as string[], returns: [] as number[] }
+
+    if (barPeriod === '1D') {
+      const retDates: string[] = []
+      const rets: number[] = []
+      for (let i = 1; i < slicedCurve.length; i++) {
+        const prev = slicedCurve[i - 1]
+        const cur = slicedCurve[i]
+        if (prev !== 0) {
+          retDates.push(slicedDates[i])
+          rets.push(cur / prev - 1)
+        }
+      }
+      // Filter to only dates >= startDate (drop anchor)
+      const out = retDates.reduce<{ dates: string[]; returns: number[] }>((acc, d, i) => {
+        if (d >= startDate) { acc.dates.push(d); acc.returns.push(rets[i]) }
+        return acc
+      }, { dates: [], returns: [] })
+      return out
+    }
+
+    // Aggregate into period buckets
+    const pad = (n: number) => n < 10 ? '0' + n : '' + n
+    const getPeriodKey = (dateStr: string) => {
+      const [y, m, d] = dateStr.split('-').map(Number)
+      if (barPeriod === '1W') {
+        const dt = new Date(y, m - 1, d)
+        const dow = dt.getDay()
+        const mon = new Date(dt)
+        mon.setDate(dt.getDate() - ((dow + 6) % 7))
+        return `${mon.getFullYear()}-${pad(mon.getMonth() + 1)}-${pad(mon.getDate())}`
+      }
+      if (barPeriod === '1M') return `${y}-${pad(m)}`
+      if (barPeriod === '1Q') return `${y}-Q${Math.ceil(m / 3)}`
+      return `${y}` // 1Y
+    }
+
+    // Group by period, take first and last curve value in each period
+    const periods: { key: string; lastDate: string; firstVal: number; lastVal: number }[] = []
+    let curKey = ''
+    let firstVal = 0
+    let lastDate = ''
+    for (let i = 0; i < slicedCurve.length; i++) {
+      const pk = getPeriodKey(slicedDates[i])
+      if (pk !== curKey) {
+        if (curKey && i > 0) {
+          periods.push({ key: curKey, lastDate, firstVal, lastVal: slicedCurve[i - 1] })
+        }
+        curKey = pk
+        firstVal = slicedCurve[i]
+      }
+      lastDate = slicedDates[i]
+    }
+    if (curKey) periods.push({ key: curKey, lastDate, firstVal, lastVal: slicedCurve[slicedCurve.length - 1] })
+
+    // Compute returns, skip first period (anchor)
+    const retDates: string[] = []
+    const rets: number[] = []
+    for (let i = 1; i < periods.length; i++) {
+      const prev = periods[i - 1].lastVal
+      if (prev !== 0) {
+        retDates.push(periods[i].lastDate)
+        rets.push(periods[i].lastVal / prev - 1)
+      }
+    }
+    return { dates: retDates.filter(d => d >= startDate), returns: rets.slice(rets.length - retDates.filter(d => d >= startDate).length) }
+  }, [series, selectedKey, dates, startDate, endDate, barPeriod])
+
+  // Multi-strat: rebased cumulative series within date range
+  const multiData = useMemo(() => {
+    if (viewMode !== 'multi' || dates.length === 0) return { dates: [] as string[], series: [] as { key: string; label: string; color: string; values: number[]; lastVal: number }[] }
+    let si = 0, ei = dates.length - 1
+    for (let i = 0; i < dates.length; i++) { if (dates[i] >= startDate) { si = i; break } }
+    for (let i = dates.length - 1; i >= 0; i--) { if (dates[i] <= endDate) { ei = i; break } }
+    if (si > ei) return { dates: [] as string[], series: [] as { key: string; label: string; color: string; values: number[]; lastVal: number }[] }
+    const slicedDates = dates.slice(si, ei + 1)
+    const out = series.map(s => {
+      const sliced = s.curve.slice(si, ei + 1)
+      const base = sliced[0] || 1
+      const rebased = sliced.map(v => v / base - 1)
+      return { key: s.key, label: s.label, color: s.color, values: rebased, lastVal: rebased[rebased.length - 1] || 0 }
+    })
+    return { dates: slicedDates, series: out }
+  }, [viewMode, series, dates, startDate, endDate])
+
+  // Filter multiData series by visibility
+  const visibleMultiSeries = useMemo(() => multiData.series.filter(s => visibleKeys.has(s.key)), [multiData.series, visibleKeys])
+
+  // Multi-bar: period returns for each visible strategy (for bar chart)
+  const multiBarData = useMemo(() => {
+    if (viewMode !== 'multi' || dates.length === 0) return [] as { key: string; label: string; color: string; ret: number }[]
+    let si = 0, ei = dates.length - 1
+    for (let i = 0; i < dates.length; i++) { if (dates[i] >= startDate) { si = i; break } }
+    for (let i = dates.length - 1; i >= 0; i--) { if (dates[i] <= endDate) { ei = i; break } }
+    if (si > 0) si--
+    return series.filter(s => visibleKeys.has(s.key)).map(s => {
+      const sliced = s.curve.slice(si, ei + 1)
+      if (sliced.length < 2 || sliced[0] === 0) return { key: s.key, label: s.label, color: s.color, ret: 0 }
+      return { key: s.key, label: s.label, color: s.color, ret: sliced[sliced.length - 1] / sliced[0] - 1 }
+    })
+  }, [viewMode, series, dates, startDate, endDate, visibleKeys])
+
+  const sortedMultiSeries = useMemo(() => {
+    const s = [...visibleMultiSeries]
+    s.sort((a, b) => {
+      let cmp = legendSortCol === 'name' ? a.label.localeCompare(b.label) : a.lastVal - b.lastVal
+      return legendSortAsc ? cmp : -cmp
+    })
+    return s
+  }, [visibleMultiSeries, legendSortCol, legendSortAsc])
+
+  // Canvas rendering
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    const dpr = window.devicePixelRatio || 1
+    canvas.width = dims.w * dpr
+    canvas.height = dims.h * dpr
+    ctx.scale(dpr, dpr)
+    ctx.clearRect(0, 0, dims.w, dims.h)
+    ctx.fillStyle = '#fdf6e3'
+    ctx.fillRect(0, 0, dims.w, dims.h)
+
+    if (viewMode === 'multi' && chartView === 'line') {
+      // Rebased cumulative line chart
+      const vs = visibleMultiSeries
+      if (multiData.dates.length === 0 || vs.length === 0) return
+      const p = { top: 20, right: 60, bottom: 50, left: 20 }
+      const plotW = dims.w - p.left - p.right
+      const plotH = dims.h - p.top - p.bottom
+      let yMin = 0, yMax = 0
+      vs.forEach(s => s.values.forEach(v => { yMin = Math.min(yMin, v); yMax = Math.max(yMax, v) }))
+      const yPad = (yMax - yMin) * 0.1 || 0.05
+      yMin -= yPad; yMax += yPad
+      const numDates = multiData.dates.length
+      const xScale = (i: number) => p.left + (numDates > 1 ? (i / (numDates - 1)) * plotW : plotW / 2)
+      const yScale = (v: number) => p.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH
+      ctx.strokeStyle = '#e9ecef'; ctx.lineWidth = 1
+      for (let i = 0; i <= 6; i++) {
+        const v = yMin + (yMax - yMin) * (i / 6)
+        const y = yScale(v)
+        ctx.beginPath(); ctx.moveTo(p.left, y); ctx.lineTo(dims.w - p.right, y); ctx.stroke()
+        ctx.fillStyle = '#6c757d'; ctx.font = '10px monospace'; ctx.textAlign = 'left'
+        ctx.fillText((v * 100).toFixed(1) + '%', dims.w - p.right + 5, y + 3)
+      }
+      ctx.strokeStyle = '#adb5bd'; ctx.lineWidth = 1; ctx.setLineDash([4, 4])
+      ctx.beginPath(); ctx.moveTo(p.left, yScale(0)); ctx.lineTo(dims.w - p.right, yScale(0)); ctx.stroke()
+      ctx.setLineDash([])
+      const labelInterval = Math.max(1, Math.floor(numDates / 8))
+      ctx.fillStyle = '#6c757d'; ctx.font = '10px monospace'; ctx.textAlign = 'center'
+      for (let i = 0; i < numDates; i += labelInterval) ctx.fillText(multiData.dates[i].slice(0, 7), xScale(i), dims.h - p.bottom + 15)
+      vs.forEach(s => {
+        const isHovered = hoveredName === s.key
+        const isOther = hoveredName !== null && !isHovered
+        ctx.strokeStyle = isOther ? '#dee2e6' : s.color
+        ctx.lineWidth = isHovered ? 2.5 : 1.5
+        ctx.globalAlpha = isOther ? 0.3 : 1
+        ctx.beginPath()
+        let started = false
+        s.values.forEach((v, i) => {
+          const x = xScale(i), y = yScale(v)
+          if (!started) { ctx.moveTo(x, y); started = true } else ctx.lineTo(x, y)
+        })
+        ctx.stroke()
+        ctx.globalAlpha = 1
+      })
+    } else if (viewMode === 'multi' && chartView === 'bar') {
+      // Multi-strat bar chart — one bar per strategy
+      const items = multiBarData
+      const n = items.length
+      if (n === 0) return
+      const labelFontSize = Math.min(11, Math.max(7, Math.floor((dims.w - 110) / n * 0.7 * 0.7)))
+      ctx.font = `${labelFontSize}px monospace`
+      let maxLabelW = 0
+      for (const it of items) { const w = ctx.measureText(it.label).width; if (w > maxLabelW) maxLabelW = w }
+      const dynamicBottom = Math.min(Math.ceil(maxLabelW * 0.707) + 16, Math.floor(dims.h * 0.4))
+      const p = { top: 12, right: 50, bottom: dynamicBottom, left: 60 }
+      const plotW = dims.w - p.left - p.right
+      const plotH = dims.h - p.top - p.bottom
+      const barW = Math.max(2, Math.min(40, (plotW / n) * 0.75))
+      const gap = (plotW - barW * n) / (n + 1)
+      let yMin = 0, yMax = 0
+      items.forEach(b => { yMin = Math.min(yMin, b.ret); yMax = Math.max(yMax, b.ret) })
+      const yPad = (yMax - yMin) * 0.1 || 0.005
+      yMin -= yPad; yMax += yPad
+      const yScale = (v: number) => p.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH
+      const zeroY = yScale(0)
+      ctx.strokeStyle = '#e9ecef'; ctx.lineWidth = 1
+      for (let i = 0; i <= 6; i++) {
+        const v = yMin + (yMax - yMin) * (i / 6)
+        const y = yScale(v)
+        ctx.beginPath(); ctx.moveTo(p.left, y); ctx.lineTo(dims.w - p.right, y); ctx.stroke()
+        ctx.fillStyle = '#6c757d'; ctx.font = '10px monospace'; ctx.textAlign = 'right'
+        ctx.fillText((v * 100).toFixed(2) + '%', p.left - 5, y + 3)
+      }
+      ctx.strokeStyle = '#adb5bd'; ctx.lineWidth = 1; ctx.setLineDash([4, 4])
+      ctx.beginPath(); ctx.moveTo(p.left, zeroY); ctx.lineTo(dims.w - p.right, zeroY); ctx.stroke()
+      ctx.setLineDash([])
+      for (let i = 0; i < n; i++) {
+        const x = p.left + gap + i * (barW + gap)
+        const val = items[i].ret
+        const bTop = val >= 0 ? yScale(val) : zeroY
+        const bBot = val >= 0 ? zeroY : yScale(val)
+        const isHovered = hoveredName === items[i].key
+        ctx.fillStyle = isHovered ? items[i].color : (val >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)')
+        ctx.fillRect(x, bTop, barW, Math.max(1, bBot - bTop))
+      }
+      ctx.save()
+      ctx.fillStyle = '#586e75'; ctx.font = `${labelFontSize}px monospace`; ctx.textAlign = 'right'
+      for (let i = 0; i < n; i++) {
+        const x = p.left + gap + i * (barW + gap) + barW / 2
+        ctx.save(); ctx.translate(x, dims.h - p.bottom + 8); ctx.rotate(-Math.PI / 4)
+        ctx.fillText(items[i].label, 0, 0); ctx.restore()
+      }
+      ctx.restore()
+    } else {
+      // Bar chart (single strat)
+      const n = barData.returns.length
+      if (n === 0) return
+      const p = { top: 12, right: 50, bottom: 60, left: 60 }
+      const plotW = dims.w - p.left - p.right
+      const plotH = dims.h - p.top - p.bottom
+      const barW = Math.max(1, (plotW / n) * 0.75)
+      const gap = (plotW - barW * n) / (n + 1)
+      let yMin = 0, yMax = 0
+      barData.returns.forEach(r => { yMin = Math.min(yMin, r); yMax = Math.max(yMax, r) })
+      const yPad = (yMax - yMin) * 0.1 || 0.005
+      yMin -= yPad; yMax += yPad
+      const yScale = (v: number) => p.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH
+      const zeroY = yScale(0)
+      ctx.strokeStyle = '#e9ecef'; ctx.lineWidth = 1
+      for (let i = 0; i <= 6; i++) {
+        const v = yMin + (yMax - yMin) * (i / 6)
+        const y = yScale(v)
+        ctx.beginPath(); ctx.moveTo(p.left, y); ctx.lineTo(dims.w - p.right, y); ctx.stroke()
+        ctx.fillStyle = '#6c757d'; ctx.font = '10px monospace'; ctx.textAlign = 'right'
+        ctx.fillText((v * 100).toFixed(2) + '%', p.left - 5, y + 3)
+      }
+      ctx.strokeStyle = '#adb5bd'; ctx.lineWidth = 1; ctx.setLineDash([4, 4])
+      ctx.beginPath(); ctx.moveTo(p.left, zeroY); ctx.lineTo(dims.w - p.right, zeroY); ctx.stroke()
+      ctx.setLineDash([])
+      for (let i = 0; i < n; i++) {
+        const x = p.left + gap + i * (barW + gap)
+        const val = barData.returns[i]
+        const bTop = val >= 0 ? yScale(val) : zeroY
+        const bBot = val >= 0 ? zeroY : yScale(val)
+        const isHovered = hoveredIdx === i
+        ctx.fillStyle = isHovered ? (series.find(s => s.key === selectedKey)?.color || '#657b83') : (val >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)')
+        ctx.fillRect(x, bTop, barW, Math.max(1, bBot - bTop))
+      }
+      ctx.fillStyle = '#93a1a1'; ctx.font = '9px monospace'; ctx.textAlign = 'center'
+      const nLabels = Math.min(8, n)
+      for (let li = 0; li < nLabels; li++) {
+        const idx = n === 1 ? 0 : Math.round(li * (n - 1) / (nLabels - 1))
+        ctx.fillText(barData.dates[idx], p.left + gap + idx * (barW + gap) + barW / 2, dims.h - p.bottom + 14)
+      }
+    }
+  }, [barData, dims, hoveredIdx, series, selectedKey, viewMode, multiData, hoveredName, chartView, visibleMultiSeries, multiBarData])
+
+  // Mouse hover
+  const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (viewMode === 'multi') return // hover via legend
+    if (!canvasRef.current) return
+    const rect = canvasRef.current.getBoundingClientRect()
+    const mx = (e.clientX - rect.left) * (dims.w / rect.width)
+    const n = barData.returns.length
+    if (!n) return
+    const p = { left: 60, right: 50 }
+    const plotW = dims.w - p.left - p.right
+    const barW = Math.max(1, (plotW / n) * 0.75)
+    const gap = (plotW - barW * n) / (n + 1)
+    let found = -1
+    for (let i = 0; i < n; i++) {
+      const x = p.left + gap + i * (barW + gap)
+      if (mx >= x && mx <= x + barW) { found = i; break }
+    }
+    setHoveredIdx(found >= 0 ? found : null)
+  }
+
+  const hovered = hoveredIdx !== null && barData.dates[hoveredIdx]
+    ? { date: barData.dates[hoveredIdx], ret: barData.returns[hoveredIdx] }
+    : null
+
+  const handlePreset = (p: typeof RETURNS_PRESETS[number]) => {
+    if (!dateBoundsMax) return
+    setActivePreset(p.label)
+    if (p.days === 0) { setStartDate(dateBoundsMin); setEndDate(dateBoundsMax); return }
+    if (p.days === -1) { setStartDate(`${dateBoundsMax.slice(0, 4)}-01-01`); setEndDate(dateBoundsMax); return }
+    const d = new Date(dateBoundsMax)
+    d.setDate(d.getDate() - p.days)
+    const pad2 = (n: number) => n < 10 ? '0' + n : '' + n
+    const s = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
+    setStartDate(s < dateBoundsMin ? dateBoundsMin : s)
+    setEndDate(dateBoundsMax)
+  }
+
+  const scrollPeriod = (dir: number) => {
+    if (!dateBoundsMax || !dateBoundsMin) return
+    const pad2 = (n: number) => n < 10 ? '0' + n : '' + n
+    const fmt = (d: Date) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
+    const parse = (s: string) => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d) }
+    const anchor = parse(startDate || dateBoundsMax)
+    let ns: string, ne: string
+
+    if (scrollUnit === '1D') {
+      const cur = endDate || dateBoundsMax
+      // Use trading dates from the backtest
+      const idx = dates.indexOf(cur)
+      const target = idx >= 0 ? idx + dir : -1
+      if (target < 0 || target >= dates.length) return
+      ns = ne = dates[target]
+    } else if (scrollUnit === '1W') {
+      const dow = anchor.getDay()
+      const mon = new Date(anchor)
+      mon.setDate(anchor.getDate() - ((dow + 6) % 7))
+      mon.setDate(mon.getDate() + dir * 7)
+      const fri = new Date(mon); fri.setDate(mon.getDate() + 4)
+      ns = fmt(mon); ne = fmt(fri)
+    } else if (scrollUnit === '1M') {
+      const newMonth = anchor.getMonth() + dir
+      const s = new Date(anchor.getFullYear(), newMonth, 1)
+      const e = new Date(s.getFullYear(), s.getMonth() + 1, 0)
+      ns = fmt(s); ne = fmt(e)
+    } else {
+      const yr = anchor.getFullYear() + dir
+      ns = `${yr}-01-01`; ne = `${yr}-12-31`
+    }
+    if (ne < dateBoundsMin || ns > dateBoundsMax) return
+    if (ns < dateBoundsMin) ns = dateBoundsMin
+    if (ne > dateBoundsMax) ne = dateBoundsMax
+    setStartDate(ns); setEndDate(ne); setActivePreset('')
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+      <div className="analysis-date-controls">
+        {viewMode === 'multi' && (
+          <>
+            <div className="basket-returns-presets">
+              {series.map(s => (
+                <button key={s.key} className={`basket-returns-preset-btn ${visibleKeys.has(s.key) ? 'active' : ''}`}
+                  style={visibleKeys.has(s.key) ? { background: s.color, borderColor: s.color, color: '#fff' } : undefined}
+                  onClick={() => setVisibleKeys(prev => { const next = new Set(prev); if (next.has(s.key)) next.delete(s.key); else next.add(s.key); return next })}>{s.label}</button>
+              ))}
+            </div>
+            <span style={{ color: 'var(--border-color)', margin: '0 1px' }}>|</span>
+            <button className={`basket-returns-preset-btn ${chartView === 'bar' ? 'active' : ''}`} onClick={() => setChartView('bar')}>BAR</button>
+            <button className={`basket-returns-preset-btn ${chartView === 'line' ? 'active' : ''}`} onClick={() => setChartView('line')}>LINE</button>
+            <span style={{ color: 'var(--border-color)', margin: '0 1px' }}>|</span>
+          </>
+        )}
+        {viewMode === 'single' && (
+          <>
+            <span style={{ fontSize: 9, fontWeight: 'bold', color: 'var(--text-bold)', whiteSpace: 'nowrap' }}>Strategy</span>
+            <div className="basket-returns-presets">
+              {series.map(s => (
+                <button key={s.key} className={`basket-returns-preset-btn ${selectedKey === s.key ? 'active' : ''}`}
+                  style={selectedKey === s.key ? { background: s.color, borderColor: s.color, color: '#fff' } : undefined}
+                  onClick={() => setSelectedKey(s.key)}>{s.label}</button>
+              ))}
+            </div>
+            <span style={{ color: 'var(--border-color)', margin: '0 1px' }}>|</span>
+            <span style={{ fontSize: 9, fontWeight: 'bold', color: 'var(--text-bold)', whiteSpace: 'nowrap' }}>Timeframe</span>
+            <div className="basket-returns-presets">
+              {(['1D','1W','1M','1Q','1Y'] as const).map(p => (
+                <button key={p} className={`basket-returns-preset-btn ${barPeriod === p ? 'active' : ''}`} onClick={() => setBarPeriod(p)}>{p}</button>
+              ))}
+            </div>
+            <span style={{ color: 'var(--border-color)', margin: '0 1px' }}>|</span>
+          </>
+        )}
+        <span style={{ fontSize: 9, fontWeight: 'bold', color: 'var(--text-bold)', whiteSpace: 'nowrap' }}>Date Range</span>
+        <div className="basket-returns-presets">
+          {RETURNS_PRESETS.map(p => (
+            <button key={p.label} className={`basket-returns-preset-btn ${activePreset === p.label ? 'active' : ''}`} onClick={() => handlePreset(p)}>{p.label}</button>
+          ))}
+        </div>
+        <div style={{ flex: 1 }} />
+        <div className="basket-returns-presets">
+          <button className="basket-returns-preset-btn" onClick={() => scrollPeriod(-1)} title="Previous period">{'\u25C0'}</button>
+          {(['1D','1W','1M','1Y'] as const).map(u => (
+            <button key={u} className={`basket-returns-preset-btn ${scrollUnit === u ? 'active' : ''}`} onClick={() => setScrollUnit(u)}>{u}</button>
+          ))}
+          <button className="basket-returns-preset-btn" onClick={() => scrollPeriod(1)} title="Next period">{'\u25B6'}</button>
+        </div>
+        <input type="date" className="date-input" value={startDate} min={dateBoundsMin} max={dateBoundsMax} onChange={e => { setStartDate(e.target.value); setActivePreset('') }} />
+        <span style={{ fontSize: 10, color: 'var(--text-main)' }}>to</span>
+        <input type="date" className="date-input" value={endDate} min={dateBoundsMin} max={dateBoundsMax} onChange={e => { setEndDate(e.target.value); setActivePreset('') }} />
+      </div>
+      <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
+        <div style={{ flex: 1, minWidth: 0, position: 'relative' }} ref={containerRef}>
+          <canvas ref={canvasRef} style={{ width: '100%', height: '100%' }}
+            onMouseMove={handleMouseMove} onMouseLeave={() => { setHoveredIdx(null); setHoveredName(null) }} />
+          {viewMode === 'single' && hovered && (
+            <div className="candle-detail-overlay" style={{ minWidth: 140 }}>
+              <div className="candle-detail-title">{hovered.date}</div>
+              <div className="candle-detail-row">
+                <span>Return</span>
+                <span className="ret" style={{ color: hovered.ret >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)' }}>
+                  {(hovered.ret * 100).toFixed(2)}%
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
+        {viewMode === 'multi' && chartView === 'line' && (
+          <div className="backtest-path-legend">
+            <div className="path-legend-header">
+              <span className="path-legend-col ticker" onClick={() => { if (legendSortCol === 'name') setLegendSortAsc(v => !v); else { setLegendSortCol('name'); setLegendSortAsc(true) } }}>
+                Strategy{legendSortCol === 'name' ? (legendSortAsc ? ' \u25B2' : ' \u25BC') : ''}
+              </span>
+              <span className="path-legend-col change" onClick={() => { if (legendSortCol === 'change') setLegendSortAsc(v => !v); else { setLegendSortCol('change'); setLegendSortAsc(false) } }}>
+                Chg{legendSortCol === 'change' ? (legendSortAsc ? ' \u25B2' : ' \u25BC') : ''}
+              </span>
+            </div>
+            {sortedMultiSeries.map(s => (
+              <div key={s.key}
+                   className={`path-legend-row ${hoveredName === s.key ? 'highlighted' : ''}`}
+                   style={{ color: s.color }}
+                   onMouseEnter={() => setHoveredName(s.key)}
+                   onMouseLeave={() => setHoveredName(null)}>
+                <span className="path-legend-col ticker">{s.label}</span>
+                <span className="path-legend-col change">{(s.lastVal * 100).toFixed(1)}%</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
 
 /* ── Component ─────────────────────────────────────────────────────── */
 
@@ -190,16 +690,18 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
   // ── Basket & ticker lists ──
   const [baskets, setBaskets] = useState<Record<string, string[]>>({})
   const [allTickers, setAllTickers] = useState<string[]>([])
+  const [etfTickers, setEtfTickers] = useState<string[]>([])
   useEffect(() => {
     fetch(`${apiBase}/baskets`).then(r => r.json()).then(setBaskets).catch(() => {})
     fetch(`${apiBase}/tickers`).then(r => r.json()).then(setAllTickers).catch(() => {})
+    fetch(`${apiBase}/etfs`).then(r => r.json()).then(setEtfTickers).catch(() => {})
   }, [apiBase])
 
   // ── Per-leg search state ──
   const [legSearchOpen, setLegSearchOpen] = useState<number | null>(null)
   const [legSearchQuery, setLegSearchQuery] = useState('')
   const [legSearchHighlight, setLegSearchHighlight] = useState(0)
-  const [legSearchFilter, setLegSearchFilter] = useState<'all' | 'Themes' | 'Sectors' | 'Industries' | 'Tickers'>('all')
+  const [legSearchFilter, setLegSearchFilter] = useState<'all' | 'Themes' | 'Sectors' | 'Industries' | 'Tickers' | 'ETFs'>('all')
   const legSearchRef = useRef<HTMLInputElement>(null)
 
   const legSearchResults = useMemo(() => {
@@ -218,8 +720,9 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
     add(baskets.Sectors || [], 'Sectors')
     add(baskets.Industries || [], 'Industries')
     add(allTickers, 'Tickers')
+    add(etfTickers, 'ETFs')
     return q ? results.slice(0, 25) : results
-  }, [legSearchQuery, legSearchFilter, baskets, allTickers])
+  }, [legSearchQuery, legSearchFilter, baskets, allTickers, etfTickers])
 
   // ── Legs config ──
   // Initialize with target from props if provided
@@ -227,7 +730,7 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
     const initial = defaultLeg()
     if (target) {
       initial.target = target
-      initial.targetType = targetType === 'ticker' ? 'ticker' : 'basket_tickers'
+      initial.targetType = targetType === 'ticker' ? 'ticker' : targetType === 'etf' ? 'etf' : 'basket_tickers'
     }
     return [initial]
   })
@@ -237,7 +740,7 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
     if (target) {
       setLegs(prev => {
         if (prev.length === 1 && prev[0].target === '') {
-          return [{ ...prev[0], target, targetType: targetType === 'ticker' ? 'ticker' : 'basket_tickers' as const }]
+          return [{ ...prev[0], target, targetType: (targetType === 'ticker' ? 'ticker' : targetType === 'etf' ? 'etf' : 'basket_tickers') as LegConfig['targetType'] }]
         }
         return prev
       })
@@ -254,8 +757,8 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
     setLegSearchOpen(null)
     setLegSearchQuery('')
     setLegSearchHighlight(0)
-    const isTicker = r.category === 'Tickers'
-    setLegs(prev => prev.map((l, idx) => idx === legIdx ? { ...l, target: r.name, targetType: isTicker ? 'ticker' : 'basket_tickers' as const } : l))
+    const tt = r.category === 'ETFs' ? 'etf' : r.category === 'Tickers' ? 'ticker' : 'basket_tickers'
+    setLegs(prev => prev.map((l, idx) => idx === legIdx ? { ...l, target: r.name, targetType: tt as LegConfig['targetType'] } : l))
   }, [])
 
   const handleLegSearchKeyDown = useCallback((legIdx: number, e: React.KeyboardEvent) => {
@@ -414,8 +917,8 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
       }
       const data: MultiBacktestResult = await resp.json()
 
-      // Auto-fire benchmarks for single-leg backtests
-      if (isSingleLeg && data.legs.length > 0) {
+      // Auto-fire benchmarks for all backtests (using first leg's target)
+      if (data.legs.length > 0) {
         const leg0 = legs[0]
         const benchSignals = ENTRY_SIGNALS.filter(s => !['Long', 'Short'].includes(s))
         const benchPromises = benchSignals.map(sig =>
@@ -1224,10 +1727,13 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
         </div>
 
         <div className="summary-tabs" style={{ padding: '0 12px' }}>
-          {(['equity', 'stats', 'distribution', 'path', 'trades'] as ResultTab[]).map(tab => (
-            <button key={tab} className={`summary-tab ${resultTab === tab ? 'active' : ''}`}
-              onClick={() => setResultTab(tab)}>{tab.charAt(0).toUpperCase() + tab.slice(1)}</button>
-          ))}
+          {(['equity', 'stats', 'distribution', 'path', 'trades', 'multi_returns', 'single_returns'] as ResultTab[]).map(tab => {
+            const label = tab === 'multi_returns' ? 'Multi-Strat Returns' : tab === 'single_returns' ? 'Single-Strat Returns' : tab.charAt(0).toUpperCase() + tab.slice(1)
+            return (
+              <button key={tab} className={`summary-tab ${resultTab === tab ? 'active' : ''}`}
+                onClick={() => setResultTab(tab)}>{label}</button>
+            )
+          })}
         </div>
 
         <div className="backtest-body">
@@ -1565,6 +2071,28 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
                 </div>
               )}
 
+              {/* ── Multi-Strat Returns tab ── */}
+              {(resultTab === 'multi_returns' || resultTab === 'single_returns') && (() => {
+                const eq = result.combined.equity_curve
+                const allSeries: { key: string; label: string; curve: number[]; color: string }[] = []
+                if (resultIsMultiLeg) {
+                  allSeries.push({ key: 'combined', label: 'Combined', curve: eq.combined, color: '#8BC34A' })
+                  result.legs.forEach((leg, i) => {
+                    if (eq.per_leg[i]) {
+                      allSeries.push({ key: `leg_${i}`, label: `${leg.target} ${leg.entry_signal}`, curve: eq.per_leg[i], color: LEG_COLORS[i % LEG_COLORS.length] })
+                    }
+                  })
+                } else {
+                  allSeries.push({ key: 'strategy', label: `${result.legs[0].target} ${result.legs[0].entry_signal}`, curve: eq.combined, color: '#8BC34A' })
+                }
+                allSeries.push({ key: 'buy_hold', label: 'Buy & Hold', curve: eq.buy_hold, color: '#93a1a1' })
+                for (const sig of Object.keys(benchmarks)) {
+                  if (benchmarks[sig]?.length > 0) {
+                    allSeries.push({ key: sig, label: sig.replace(/_/g, ' '), curve: benchmarks[sig], color: BENCHMARK_COLORS[sig] || '#657b83' })
+                  }
+                }
+                return <BacktestReturnsView dates={eq.dates} series={allSeries} viewMode={resultTab === 'multi_returns' ? 'multi' : 'single'} />
+              })()}
               {/* ── Trades tab ── */}
               {resultTab === 'trades' && (
                 <div style={{ padding: '8px 12px', overflowY: 'auto', flex: 1, minHeight: 0 }}>
@@ -1679,14 +2207,14 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
           ) : (
             <div className="bt-search-display">
               <span className="bt-search-display-name">{leg.target ? leg.target.replace(/_/g, ' ') : 'Select target...'}</span>
-              {leg.target && <span className="bt-search-display-tag">{leg.targetType === 'ticker' ? 'Ticker' : 'Basket'}</span>}
+              {leg.target && <span className="bt-search-display-tag">{leg.targetType === 'ticker' ? 'Ticker' : leg.targetType === 'etf' ? 'ETF' : 'Basket'}</span>}
             </div>
           )}
         </div>
         {legSearchOpen === i && (
           <div className="bt-search-dropdown">
             <div className="search-filters">
-              {(['all', 'Themes', 'Sectors', 'Industries', 'Tickers'] as const).map(f => (
+              {(['all', 'Themes', 'Sectors', 'Industries', 'Tickers', 'ETFs'] as const).map(f => (
                 <button
                   key={f}
                   className={`search-filter-btn ${legSearchFilter === f ? 'active' : ''}`}
@@ -1717,7 +2245,7 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
         )}
       </div>
 
-      {leg.targetType !== 'ticker' && (
+      {leg.targetType !== 'ticker' && leg.targetType !== 'etf' && (
         <div className="backtest-pos-presets" style={{ marginTop: 4 }}>
           <button className={`backtest-pos-preset wide ${leg.targetType === 'basket' ? 'active' : ''}`}
             onClick={() => {

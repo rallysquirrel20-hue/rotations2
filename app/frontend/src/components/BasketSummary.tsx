@@ -61,7 +61,7 @@ interface BasketSummaryProps {
 }
 
 type SortKey = keyof OpenSignal
-type TabType = 'breakout' | 'rotation' | 'btfd' | 'breakout_closed' | 'rotation_closed' | 'btfd_closed' | 'correlation' | 'returns' | 'contribution' | 'basket_returns'
+type TabType = 'breakout' | 'rotation' | 'btfd' | 'breakout_closed' | 'rotation_closed' | 'btfd_closed' | 'correlation' | 'returns' | 'contribution' | 'cross_returns' | 'single_returns'
 
 const SIGNAL_FILTERS: Record<'breakout' | 'rotation' | 'btfd', string[]> = {
   breakout: ['Breakout', 'Breakdown'],
@@ -1057,27 +1057,39 @@ function applyPreset(preset: typeof BASKET_RETURN_PRESETS[number], maxDate: stri
   return { start: start < minDate ? minDate : start, end }
 }
 
-function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; exportTrigger?: number }) {
+export function BasketReturnsChart({ apiBase, exportTrigger, mode, initialBasket }: { apiBase: string; exportTrigger?: number; mode: BasketReturnMode; initialBasket?: string }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const [dims, setDims] = useState({ w: 800, h: 400 })
-  const [mode, setMode] = useState<BasketReturnMode>('cross')
   const [group, setGroup] = useState<BasketReturnGroup>('all')
   const [dateBounds, setDateBounds] = useState<{ min: string; max: string }>({ min: '', max: '' })
   const [startDate, setStartDate] = useState('')
   const [endDate, setEndDate] = useState('')
-  const [activePreset, setActivePreset] = useState('1Y')
+  const [activePreset, setActivePreset] = useState('YTD')
+  const [scrollUnit, setScrollUnit] = useState<'1D'|'1W'|'1M'|'1Y'>('1Y')
+  const [chartView, setChartView] = useState<'bar' | 'line'>('bar')
   const [loading, setLoading] = useState(false)
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null)
+  const [hoveredName, setHoveredName] = useState<string | null>(null)
+  const [legendSortCol, setLegendSortCol] = useState<'name' | 'change'>('change')
+  const [legendSortAsc, setLegendSortAsc] = useState(false)
+  const [barPeriod, setBarPeriod] = useState<'1D'|'1W'|'1M'|'1Q'|'1Y'>('1D')
+  const [metric, setMetric] = useState<'returns'|'volatility'|'correlation'>('returns')
 
   // Cross-basket data
   const [baskets, setBaskets] = useState<BasketReturnItem[]>([])
+  // Cumulative line chart data
+  const [cumDates, setCumDates] = useState<string[]>([])
+  const [cumSeries, setCumSeries] = useState<{ name: string; group: string; values: (number | null)[] }[]>([])
   // Daily data
-  const [dailyBasket, setDailyBasket] = useState('')
+  const [dailyBasket, setDailyBasket] = useState(initialBasket || '')
+  useEffect(() => { if (initialBasket) setDailyBasket(initialBasket) }, [initialBasket])
   const [dailyDates, setDailyDates] = useState<string[]>([])
   const [dailyReturns, setDailyReturns] = useState<number[]>([])
   // Available baskets for daily mode picker
   const [availableBaskets, setAvailableBaskets] = useState<string[]>([])
+  // Trading dates for 1D scroll (skip holidays/weekends)
+  const [tradingDates, setTradingDates] = useState<string[]>([])
   // Basket search state
   const [basketSearch, setBasketSearch] = useState('')
   const [basketSearchOpen, setBasketSearchOpen] = useState(false)
@@ -1097,13 +1109,16 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
         const dr = res.data.date_range
         if (dr) {
           setDateBounds(dr)
-          const preset = BASKET_RETURN_PRESETS.find(p => p.label === '1Y')!
+          const preset = BASKET_RETURN_PRESETS.find(p => p.label === 'YTD')!
           const { start, end } = applyPreset(preset, dr.max, dr.min)
           setStartDate(start)
           setEndDate(end)
         }
         if (res.data.baskets) {
           setAvailableBaskets(res.data.baskets.map((b: BasketReturnItem) => b.name).sort())
+        }
+        if (res.data.trading_dates) {
+          setTradingDates(res.data.trading_dates)
         }
       })
       .catch(() => {})
@@ -1114,20 +1129,34 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
     if (!apiBase || !startDate || !endDate) return
     setLoading(true)
     if (mode === 'cross') {
-      const params = new URLSearchParams({ start: startDate, end: endDate, mode: 'period', group })
-      axios.get(`${apiBase}/baskets/returns?${params}`)
-        .then(res => {
-          const sorted = (res.data.baskets || []).sort((a: BasketReturnItem, b: BasketReturnItem) => a.return - b.return)
-          setBaskets(sorted)
-          if (res.data.baskets) {
-            setAvailableBaskets(res.data.baskets.map((b: BasketReturnItem) => b.name).sort())
-          }
-        })
-        .catch(() => setBaskets([]))
-        .finally(() => setLoading(false))
+      if (chartView === 'line') {
+        const params = new URLSearchParams({ start: startDate, end: endDate, mode: 'cumulative', group, metric })
+        axios.get(`${apiBase}/baskets/returns?${params}`)
+          .then(res => {
+            setCumDates(res.data.dates || [])
+            setCumSeries(res.data.series || [])
+            if (res.data.series) {
+              setAvailableBaskets(res.data.series.map((s: { name: string }) => s.name).sort())
+            }
+          })
+          .catch(() => { setCumDates([]); setCumSeries([]) })
+          .finally(() => setLoading(false))
+      } else {
+        const params = new URLSearchParams({ start: startDate, end: endDate, mode: 'period', group, metric })
+        axios.get(`${apiBase}/baskets/returns?${params}`)
+          .then(res => {
+            const sorted = (res.data.baskets || []).sort((a: BasketReturnItem, b: BasketReturnItem) => a.return - b.return)
+            setBaskets(sorted)
+            if (res.data.baskets) {
+              setAvailableBaskets(res.data.baskets.map((b: BasketReturnItem) => b.name).sort())
+            }
+          })
+          .catch(() => setBaskets([]))
+          .finally(() => setLoading(false))
+      }
     } else {
       if (!dailyBasket) { setLoading(false); return }
-      const params = new URLSearchParams({ start: startDate, end: endDate, mode: 'daily', basket: dailyBasket })
+      const params = new URLSearchParams({ start: startDate, end: endDate, mode: 'daily', basket: dailyBasket, bar_period: barPeriod })
       axios.get(`${apiBase}/baskets/returns?${params}`)
         .then(res => {
           setDailyDates(res.data.dates || [])
@@ -1136,7 +1165,7 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
         .catch(() => { setDailyDates([]); setDailyReturns([]) })
         .finally(() => setLoading(false))
     }
-  }, [apiBase, startDate, endDate, mode, group, dailyBasket])
+  }, [apiBase, startDate, endDate, mode, group, dailyBasket, chartView, barPeriod, metric])
 
   // ResizeObserver
   useEffect(() => {
@@ -1183,6 +1212,12 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
       URL.revokeObjectURL(url)
     }, 'image/png')
   }, [exportTrigger])
+
+  // Value formatting: all metrics are now indexed % change (decimal, ×100 for display)
+  const isRawPct = false
+  const fmtVal = (v: number, decimals = 2) => (v * 100).toFixed(decimals) + '%'
+  const fmtLegend = (v: number) => (v * 100).toFixed(1) + '%'
+  const metricLabel = metric === 'volatility' ? 'Vol Chg' : metric === 'correlation' ? 'Corr Chg' : 'Chg'
 
   // Canvas rendering
   useEffect(() => {
@@ -1240,7 +1275,7 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
           const y = yScale(v)
           _ctx.beginPath(); _ctx.moveTo(pad.left, y); _ctx.lineTo(_w - pad.right, y); _ctx.stroke()
           _ctx.fillStyle = '#6c757d'; _ctx.font = '10px monospace'; _ctx.textAlign = 'right'
-          _ctx.fillText((v * 100).toFixed(2) + '%', pad.left - 5, y + 3)
+          _ctx.fillText(fmtVal(v), pad.left - 5, y + 3)
         }
       }
 
@@ -1278,7 +1313,77 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
       }
     }
 
-    if (mode === 'cross') {
+    if (mode === 'cross' && chartView === 'line') {
+      // Rebased cumulative line chart
+      if (cumDates.length === 0 || cumSeries.length === 0) return
+      const pad = { top: 20, right: 60, bottom: 50, left: 20 }
+      const plotW = dims.w - pad.left - pad.right
+      const plotH = dims.h - pad.top - pad.bottom
+
+      let yMin = 0, yMax = 0
+      cumSeries.forEach(s => s.values.forEach(v => {
+        if (v !== null) { yMin = Math.min(yMin, v); yMax = Math.max(yMax, v) }
+      }))
+      const yPad = (yMax - yMin) * 0.1 || 0.05
+      yMin -= yPad; yMax += yPad
+
+      const numDates = cumDates.length
+      const xScale = (i: number) => pad.left + (numDates > 1 ? (i / (numDates - 1)) * plotW : plotW / 2)
+      const yScale = (v: number) => pad.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH
+
+      // Grid
+      ctx.strokeStyle = '#e9ecef'; ctx.lineWidth = 1
+      const nTicks = 6
+      for (let i = 0; i <= nTicks; i++) {
+        const v = yMin + (yMax - yMin) * (i / nTicks)
+        const y = yScale(v)
+        ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(dims.w - pad.right, y); ctx.stroke()
+        ctx.fillStyle = '#6c757d'; ctx.font = '10px monospace'; ctx.textAlign = 'left'
+        ctx.fillText(fmtVal(v, 1), dims.w - pad.right + 5, y + 3)
+      }
+
+      // Zero line
+      const zeroY = yScale(0)
+      ctx.strokeStyle = '#adb5bd'; ctx.lineWidth = 1; ctx.setLineDash([4, 4])
+      ctx.beginPath(); ctx.moveTo(pad.left, zeroY); ctx.lineTo(dims.w - pad.right, zeroY); ctx.stroke()
+      ctx.setLineDash([])
+
+      // X axis labels
+      const labelInterval = Math.max(1, Math.floor(numDates / 8))
+      ctx.fillStyle = '#6c757d'; ctx.font = '10px monospace'; ctx.textAlign = 'center'
+      for (let i = 0; i < numDates; i += labelInterval) {
+        ctx.fillText(cumDates[i].slice(0, 7), xScale(i), dims.h - pad.bottom + 15)
+      }
+
+      // Sort series by final return value (best first)
+      const sorted = cumSeries.map((s, idx) => {
+        let lastVal = 0
+        for (let i = s.values.length - 1; i >= 0; i--) {
+          if (s.values[i] !== null) { lastVal = s.values[i]!; break }
+        }
+        return { ...s, idx, lastVal }
+      }).sort((a, b) => b.lastVal - a.lastVal)
+
+      // Draw lines
+      const totalSeries = sorted.length
+      sorted.forEach((s, rank) => {
+        const isHovered = hoveredName === s.name
+        const isOther = hoveredName !== null && !isHovered
+        ctx.strokeStyle = isOther ? '#dee2e6' : rankColor(rank, totalSeries)
+        ctx.lineWidth = isHovered ? 2.5 : 1.2
+        ctx.globalAlpha = isOther ? 0.3 : 1
+        ctx.beginPath()
+        let inSegment = false
+        s.values.forEach((v, i) => {
+          if (v === null) { inSegment = false; return }
+          const x = xScale(i), y = yScale(v)
+          if (!inSegment) { ctx.moveTo(x, y); inSegment = true }
+          else ctx.lineTo(x, y)
+        })
+        ctx.stroke()
+        ctx.globalAlpha = 1
+      })
+    } else if (mode === 'cross') {
       const items = baskets.map(b => ({ name: b.name, ret: b.return }))
       drawBarChart(ctx, dims.w, dims.h, items, hoveredIdx, true)
     } else {
@@ -1339,11 +1444,30 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
         }
       }
     }
-  }, [baskets, dailyReturns, dailyDates, dims, hoveredIdx, mode])
+  }, [baskets, dailyReturns, dailyDates, dims, hoveredIdx, hoveredName, mode, chartView, cumDates, cumSeries, isRawPct])
+
+  // Sorted cumulative series for legend (memoized)
+  const sortedCumSeries = useMemo(() => {
+    const withLast = cumSeries.map((s, idx) => {
+      let lastVal = 0
+      for (let i = s.values.length - 1; i >= 0; i--) {
+        if (s.values[i] !== null) { lastVal = s.values[i]!; break }
+      }
+      return { ...s, idx, lastVal }
+    })
+    withLast.sort((a, b) => {
+      let cmp = 0
+      if (legendSortCol === 'name') cmp = a.name.localeCompare(b.name)
+      else cmp = a.lastVal - b.lastVal
+      return legendSortAsc ? cmp : -cmp
+    })
+    return withLast
+  }, [cumSeries, legendSortCol, legendSortAsc])
 
   // Mouse hover
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!canvasRef.current) return
+    if (mode === 'cross' && chartView === 'line') return // hover via legend only
     const rect = canvasRef.current.getBoundingClientRect()
     const scaleX = dims.w / rect.width
     const mx = (e.clientX - rect.left) * scaleX
@@ -1378,7 +1502,7 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
     }
   }
 
-  const hovered = hoveredIdx !== null ? (mode === 'cross' && baskets[hoveredIdx]
+  const hovered = hoveredIdx !== null ? (mode === 'cross' && chartView === 'bar' && baskets[hoveredIdx]
     ? { name: baskets[hoveredIdx].name.replace(/_/g, ' '), ret: baskets[hoveredIdx].return, group: baskets[hoveredIdx].group }
     : mode === 'daily' && dailyDates[hoveredIdx] !== undefined
       ? { name: dailyDates[hoveredIdx], ret: dailyReturns[hoveredIdx], group: dailyBasket.replace(/_/g, ' ') }
@@ -1391,6 +1515,64 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
     const { start, end } = applyPreset(p, dateBounds.max, dateBounds.min)
     setStartDate(start)
     setEndDate(end)
+  }
+
+  const scrollPeriod = (dir: number) => {
+    if (!dateBounds.max || !dateBounds.min) return
+    const pad = (n: number) => n < 10 ? '0' + n : '' + n
+    const fmt = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+    const parse = (s: string) => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d) }
+    const anchor = parse(startDate || dateBounds.max)
+
+    let ns: string, ne: string
+
+    if (scrollUnit === '1D') {
+      const cur = endDate || dateBounds.max
+      if (tradingDates.length > 0) {
+        // Snap to next/prev trading date
+        let idx = -1
+        for (let i = 0; i < tradingDates.length; i++) {
+          if (tradingDates[i] >= cur) { idx = i; break }
+        }
+        if (idx === -1) idx = tradingDates.length - 1
+        const target = idx + dir
+        if (target < 0 || target >= tradingDates.length) return
+        ns = ne = tradingDates[target]
+      } else {
+        const d = parse(cur)
+        d.setDate(d.getDate() + dir)
+        ns = ne = fmt(d)
+      }
+    } else if (scrollUnit === '1W') {
+      const dow = anchor.getDay()
+      const mon = new Date(anchor)
+      mon.setDate(anchor.getDate() - ((dow + 6) % 7))
+      mon.setDate(mon.getDate() + dir * 7)
+      const fri = new Date(mon)
+      fri.setDate(mon.getDate() + 4)
+      ns = fmt(mon)
+      ne = fmt(fri)
+    } else if (scrollUnit === '1M') {
+      const newMonth = anchor.getMonth() + dir
+      const s = new Date(anchor.getFullYear(), newMonth, 1)
+      const e = new Date(s.getFullYear(), s.getMonth() + 1, 0)
+      ns = fmt(s)
+      ne = fmt(e)
+    } else {
+      const yr = anchor.getFullYear() + dir
+      ns = `${yr}-01-01`
+      ne = `${yr}-12-31`
+    }
+
+    // Block only if entire period is outside data range
+    if (ne < dateBounds.min || ns > dateBounds.max) return
+    // Clamp edges to data bounds
+    if (ns < dateBounds.min) ns = dateBounds.min
+    if (ne > dateBounds.max) ne = dateBounds.max
+
+    setStartDate(ns)
+    setEndDate(ne)
+    setActivePreset('')
   }
 
   const selectBasket = (b: string) => {
@@ -1410,30 +1592,26 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
     <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
       {/* Controls bar */}
       <div className="analysis-date-controls">
-        {/* Mode toggle */}
-        {(['cross', 'daily'] as BasketReturnMode[]).map(m => (
-          <button
-            key={m}
-            className={`basket-returns-preset-btn ${mode === m ? 'active' : ''}`}
-            style={{ padding: '3px 8px', fontSize: '10px' }}
-            onClick={() => setMode(m)}
-          >
-            {m === 'cross' ? 'CROSS' : 'SINGLE'}
-          </button>
-        ))}
-        {/* Group filter (cross mode) */}
+        {/* Group filter + view toggle (cross mode) */}
         {mode === 'cross' && (
           <>
-            <span style={{ color: 'var(--border-color)', margin: '0 1px' }}>|</span>
             {(['all', 'themes', 'sectors', 'industries'] as BasketReturnGroup[]).map(g => (
               <button key={g} className={`basket-returns-preset-btn ${group === g ? 'active' : ''}`} onClick={() => setGroup(g)}>
                 {g === 'all' ? 'ALL' : g === 'themes' ? 'T' : g === 'sectors' ? 'S' : 'I'}
               </button>
             ))}
+            <span style={{ color: 'var(--border-color)', margin: '0 1px' }}>|</span>
+            <button className={`basket-returns-preset-btn ${metric === 'returns' ? 'active' : ''}`} onClick={() => setMetric('returns')}>Returns</button>
+            <button className={`basket-returns-preset-btn ${metric === 'volatility' ? 'active' : ''}`} onClick={() => setMetric('volatility')}>Volatility</button>
+            <button className={`basket-returns-preset-btn ${metric === 'correlation' ? 'active' : ''}`} onClick={() => setMetric('correlation')}>Correlation</button>
+            <span style={{ color: 'var(--border-color)', margin: '0 1px' }}>|</span>
+            <button className={`basket-returns-preset-btn ${chartView === 'bar' ? 'active' : ''}`} onClick={() => setChartView('bar')}>BAR</button>
+            <button className={`basket-returns-preset-btn ${chartView === 'line' ? 'active' : ''}`} onClick={() => setChartView('line')}>LINE</button>
           </>
         )}
-        {/* Basket search (single/daily mode) */}
+        {/* Basket search + bar period (single/daily mode) */}
         {mode === 'daily' && (
+          <>
           <div className="search-container" style={{ position: 'relative' }}>
             <input
               ref={basketSearchRef}
@@ -1468,8 +1646,17 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
               </>
             )}
           </div>
+          <span style={{ color: 'var(--border-color)', margin: '0 1px' }}>|</span>
+          <span style={{ fontSize: 9, fontWeight: 'bold', color: 'var(--text-bold)', whiteSpace: 'nowrap' }}>Timeframe</span>
+          <div className="basket-returns-presets">
+            {(['1D','1W','1M','1Q','1Y'] as const).map(p => (
+              <button key={p} className={`basket-returns-preset-btn ${barPeriod === p ? 'active' : ''}`} onClick={() => setBarPeriod(p)}>{p}</button>
+            ))}
+          </div>
+          </>
         )}
         <span style={{ color: 'var(--border-color)', margin: '0 1px' }}>|</span>
+        <span style={{ fontSize: 9, fontWeight: 'bold', color: 'var(--text-bold)', whiteSpace: 'nowrap' }}>Date Range</span>
         <div className="basket-returns-presets">
           {BASKET_RETURN_PRESETS.map(p => (
             <button key={p.label} className={`basket-returns-preset-btn ${activePreset === p.label ? 'active' : ''}`} onClick={() => handlePreset(p)}>
@@ -1479,31 +1666,62 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
         </div>
         {loading && <span className="analysis-loading-hint">Loading...</span>}
         <div style={{ flex: 1 }} />
+        <div className="basket-returns-presets">
+          <button className="basket-returns-preset-btn" onClick={() => scrollPeriod(-1)} title="Previous period">{'\u25C0'}</button>
+          {(['1D','1W','1M','1Y'] as const).map(u => (
+            <button key={u} className={`basket-returns-preset-btn ${scrollUnit === u ? 'active' : ''}`} onClick={() => setScrollUnit(u)}>{u}</button>
+          ))}
+          <button className="basket-returns-preset-btn" onClick={() => scrollPeriod(1)} title="Next period">{'\u25B6'}</button>
+        </div>
         <input type="date" className="date-input" value={startDate} min={dateBounds.min} max={dateBounds.max} onChange={e => { setStartDate(e.target.value); setActivePreset('') }} />
         <span style={{ fontSize: 10, color: 'var(--text-main)' }}>to</span>
         <input type="date" className="date-input" value={endDate} min={dateBounds.min} max={dateBounds.max} onChange={e => { setEndDate(e.target.value); setActivePreset('') }} />
       </div>
       {/* Chart area */}
-      <div style={{ flex: 1, minHeight: 0, position: 'relative' }} ref={containerRef}>
-        <canvas
-          ref={canvasRef}
-          style={{ width: '100%', height: '100%' }}
-          onMouseMove={handleMouseMove}
-          onMouseLeave={() => setHoveredIdx(null)}
-        />
-        {hovered && (
-          <div className="candle-detail-overlay" style={{ minWidth: 140 }}>
-            <div className="candle-detail-title">{hovered.name}</div>
-            <div className="candle-detail-row">
-              <span>Return</span>
-              <span className="ret" style={{ color: hovered.ret >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)' }}>
-                {(hovered.ret * 100).toFixed(2)}%
+      <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
+        <div style={{ flex: 1, minWidth: 0, position: 'relative' }} ref={containerRef}>
+          <canvas
+            ref={canvasRef}
+            style={{ width: '100%', height: '100%' }}
+            onMouseMove={handleMouseMove}
+            onMouseLeave={() => { setHoveredIdx(null); setHoveredName(null) }}
+          />
+          {hovered && (
+            <div className="candle-detail-overlay" style={{ minWidth: 140 }}>
+              <div className="candle-detail-title">{hovered.name}</div>
+              <div className="candle-detail-row">
+                <span>{metric === 'volatility' ? 'Vol' : metric === 'correlation' ? 'Corr' : 'Return'}</span>
+                <span className="ret" style={{ color: hovered.ret >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)' }}>
+                  {fmtVal(hovered.ret)}
+                </span>
+              </div>
+              <div className="candle-detail-row">
+                <span>Group</span>
+                <span className="ret">{hovered.group}</span>
+              </div>
+            </div>
+          )}
+        </div>
+        {mode === 'cross' && chartView === 'line' && (
+          <div className="backtest-path-legend">
+            <div className="path-legend-header">
+              <span className="path-legend-col ticker" onClick={() => { if (legendSortCol === 'name') setLegendSortAsc(v => !v); else { setLegendSortCol('name'); setLegendSortAsc(true) } }}>
+                Basket{legendSortCol === 'name' ? (legendSortAsc ? ' \u25B2' : ' \u25BC') : ''}
+              </span>
+              <span className="path-legend-col change" onClick={() => { if (legendSortCol === 'change') setLegendSortAsc(v => !v); else { setLegendSortCol('change'); setLegendSortAsc(false) } }}>
+                {metricLabel}{legendSortCol === 'change' ? (legendSortAsc ? ' \u25B2' : ' \u25BC') : ''}
               </span>
             </div>
-            <div className="candle-detail-row">
-              <span>Group</span>
-              <span className="ret">{hovered.group}</span>
-            </div>
+            {sortedCumSeries.map((s, rank) => (
+              <div key={s.name}
+                   className={`path-legend-row ${hoveredName === s.name ? 'highlighted' : ''}`}
+                   style={{ color: rankColor(rank, sortedCumSeries.length) }}
+                   onMouseEnter={() => setHoveredName(s.name)}
+                   onMouseLeave={() => setHoveredName(null)}>
+                <span className="path-legend-col ticker">{s.name.replace(/_/g, ' ')}</span>
+                <span className="path-legend-col change">{fmtLegend(s.lastVal)}</span>
+              </div>
+            ))}
           </div>
         )}
       </div>
@@ -1512,7 +1730,7 @@ function BasketReturnsChart({ apiBase, exportTrigger }: { apiBase: string; expor
 }
 
 export function BasketSummary({ data, loading, basketName, apiBase, quarterDateRange, exportTrigger, analysisMode = 'intra', allBaskets, onBasketSelect }: BasketSummaryProps) {
-  const [tab, setTab] = useState<TabType>(analysisMode === 'cross' ? 'basket_returns' : 'breakout')
+  const [tab, setTab] = useState<TabType>(analysisMode === 'cross' ? 'cross_returns' : 'breakout')
   const [intraSearch, setIntraSearch] = useState('')
   const [intraSearchOpen, setIntraSearchOpen] = useState(false)
   const [intraSearchHighlight, setIntraSearchHighlight] = useState(0)
@@ -1533,24 +1751,28 @@ export function BasketSummary({ data, loading, basketName, apiBase, quarterDateR
   const prevMode = useRef(analysisMode)
   if (analysisMode !== prevMode.current) {
     prevMode.current = analysisMode
-    if (analysisMode === 'cross' && tab !== 'basket_returns') {
-      setTab('basket_returns')
-    } else if (analysisMode === 'intra' && tab === 'basket_returns') {
+    if (analysisMode === 'cross' && tab !== 'cross_returns' && tab !== 'single_returns') {
+      setTab('cross_returns')
+    } else if (analysisMode === 'intra' && (tab === 'cross_returns' || tab === 'single_returns')) {
       setTab('breakout')
     }
   }
 
   // Cross-basket mode — no summary data needed
   if (analysisMode === 'cross') {
+    const crossTab = tab === 'single_returns' ? 'single_returns' : 'cross_returns'
     return (
       <div className="summary-panel">
         <div className="summary-tabs">
-          <button className="summary-tab active">
-            Basket Returns
+          <button className={`summary-tab ${crossTab === 'cross_returns' ? 'active' : ''}`} onClick={() => setTab('cross_returns')}>
+            Cross-Basket Returns
+          </button>
+          <button className={`summary-tab ${crossTab === 'single_returns' ? 'active' : ''}`} onClick={() => setTab('single_returns')}>
+            Single-Basket Returns
           </button>
         </div>
         <div className="summary-content">
-          <BasketReturnsChart apiBase={apiBase} exportTrigger={exportTrigger} />
+          <BasketReturnsChart apiBase={apiBase} exportTrigger={exportTrigger} mode={crossTab === 'cross_returns' ? 'cross' : 'daily'} />
         </div>
       </div>
     )

@@ -73,15 +73,16 @@ interface BasketSummaryData {
   correlation: CorrelationData
   cumulative_returns: CumulativeReturnsData
 }
-type ViewType = 'Themes' | 'Sectors' | 'Industries' | 'Tickers' | 'LiveSignals';
-type SearchCategory = 'all' | 'Themes' | 'Sectors' | 'Industries' | 'Tickers';
+type ViewType = 'Themes' | 'Sectors' | 'Industries' | 'Tickers' | 'LiveSignals' | 'ETFs';
+type SearchCategory = 'all' | 'Themes' | 'Sectors' | 'Industries' | 'Tickers' | 'ETFs';
 interface SearchResult { name: string; category: ViewType; displayName: string; }
 interface TickerSignalSummary { lt_trend: string | null; st_trend: string | null; mean_rev: string | null; pct_change: number | null; dollar_vol: number | null; last_price: number | null; }
-type SignalSortCol = 'ticker' | 'wt' | 'lt' | 'st' | 'mr' | 'price' | 'pct'
+type SignalSortCol = 'ticker' | 'name' | 'wt' | 'lt' | 'st' | 'mr' | 'price' | 'pct'
 type BasketSortCol = 'name' | 'bo' | 'br' | 'cor' | 'lt' | 'st' | 'mr' | 'price' | 'chg'
 
-function getSigSortVal(ticker: string, col: SignalSortCol, sigs: Record<string, TickerSignalSummary>): string | number {
+function getSigSortVal(ticker: string, col: SignalSortCol, sigs: Record<string, TickerSignalSummary>, names?: Record<string, string>): string | number {
   if (col === 'ticker') return ticker
+  if (col === 'name') return names?.[ticker] || ''
   const sig = sigs[ticker]
   if (!sig) return (col === 'pct' || col === 'price') ? -Infinity : ''
   switch (col) {
@@ -97,14 +98,14 @@ function getSigSortVal(ticker: string, col: SignalSortCol, sigs: Record<string, 
 
 function applySortFilter(tickers: string[], sortCol: SignalSortCol, sortDir: 1|-1,
                          fLT: string|null, fST: string|null, fMR: string|null,
-                         sigs: Record<string, TickerSignalSummary>): string[] {
+                         sigs: Record<string, TickerSignalSummary>, names?: Record<string, string>): string[] {
   let list = tickers
   if (fLT) list = list.filter(t => sigs[t]?.lt_trend === fLT)
   if (fST) list = list.filter(t => sigs[t]?.st_trend === fST)
   if (fMR) list = list.filter(t => sigs[t]?.mean_rev === fMR)
   return [...list].sort((a, b) => {
-    const va = getSigSortVal(a, sortCol, sigs)
-    const vb = getSigSortVal(b, sortCol, sigs)
+    const va = getSigSortVal(a, sortCol, sigs, names)
+    const vb = getSigSortVal(b, sortCol, sigs, names)
     if (typeof va === 'number' && typeof vb === 'number') return (va - vb) * sortDir
     return String(va).localeCompare(String(vb)) * sortDir
   })
@@ -113,10 +114,11 @@ function applySortFilter(tickers: string[], sortCol: SignalSortCol, sortDir: 1|-
 function App() {
   const [baskets, setBaskets] = useState<BasketsData>({ Themes: [], Sectors: [], Industries: [] })
   const [tickers, setTickers] = useState<string[]>([])
+  const [tickerNames, setTickerNames] = useState<Record<string, string>>({})
   const [liveSignalTickers, setLiveSignalTickers] = useState<LiveSignalTicker[]>([])
   const [basketBreadth, setBasketBreadth] = useState<Record<string, { uptrend_pct?: number; breakout_pct?: number; corr_pct?: number; lt_trend?: string; st_trend?: string; mean_rev?: string; pct_change?: number }>>({})
-  const [viewType, setViewType] = useState<ViewType>('LiveSignals')
-  const [expandedViews, setExpandedViews] = useState<Set<ViewType>>(new Set(['LiveSignals']))
+  const [viewType, setViewType] = useState<ViewType>('ETFs')
+  const [expandedViews, setExpandedViews] = useState<Set<ViewType>>(new Set(['ETFs']))
   const [expandedBasket, setExpandedBasket] = useState<string | null>(null)
 
   const [selectedItem, setSelectedItem] = useState<string>('')
@@ -174,6 +176,15 @@ function App() {
   const [cFilterOpen, setCFilterOpen] = useState<SignalSortCol | null>(null)
   const [lsFilterOpen, setLsFilterOpen] = useState<SignalSortCol | null>(null)
 
+  // ETF state
+  const [etfTickers, setEtfTickers] = useState<string[]>([])
+  const [eSortCol, setESortCol] = useState<SignalSortCol>('wt')
+  const [eSortDir, setESortDir] = useState<1 | -1>(-1)
+  const [eFilterLT, setEFilterLT] = useState<string | null>(null)
+  const [eFilterST, setEFilterST] = useState<string | null>(null)
+  const [eFilterMR, setEFilterMR] = useState<string | null>(null)
+  const [eFilterOpen, setEFilterOpen] = useState<SignalSortCol | null>(null)
+
   // Basket sort/filter state
   const [bSortCol, setBSortCol] = useState<BasketSortCol>('name')
   const [bSortDir, setBSortDir] = useState<1 | -1>(1)
@@ -184,6 +195,7 @@ function App() {
 
   // Quarter universe state
   const [quarterData, setQuarterData] = useState<Record<string, string[]>>({})
+  const [etfQuarterData, setEtfQuarterData] = useState<Record<string, string[]>>({})
   const [quarterKeys, setQuarterKeys] = useState<string[]>([])
   const [quarterStart, setQuarterStart] = useState('')
   const [quarterEnd, setQuarterEnd] = useState('')
@@ -194,7 +206,7 @@ function App() {
   // Single derived flag: is quarter mode on?
   const isQuarterMode = quarterActive && !!quarterStart && !!quarterEnd
 
-  const isTicker = viewType === 'Tickers' || viewType === 'LiveSignals'
+  const isTicker = viewType === 'Tickers' || viewType === 'LiveSignals' || viewType === 'ETFs'
   const isBasketView = !isTicker && !activeTicker
   const canShowSummary = isBasketView
 
@@ -243,6 +255,23 @@ function App() {
     return [...quarterFilteredTickers].sort()
   }, [tickers, quarterFilteredTickers])
 
+  const quarterFilteredETFs = useMemo<Set<string> | null>(() => {
+    if (!isQuarterMode) return null
+    const union = new Set<string>()
+    for (const q of Object.keys(etfQuarterData)) {
+      if (q >= quarterStart && q <= quarterEnd) {
+        const list = etfQuarterData[q]
+        if (list) for (const t of list) union.add(t)
+      }
+    }
+    return union.size > 0 ? union : null
+  }, [isQuarterMode, quarterStart, quarterEnd, etfQuarterData])
+
+  const filteredETFs = useMemo(() => {
+    if (!quarterFilteredETFs) return etfTickers
+    return [...quarterFilteredETFs].sort()
+  }, [etfTickers, quarterFilteredETFs])
+
   // Merge live signal overrides into ticker signals so LT/ST/MR reflect live state
   const [effectiveSignals, liveOverrides] = useMemo(() => {
     const merged = { ...tickerSignals }
@@ -271,13 +300,18 @@ function App() {
   }, [tickerSignals, liveSignalTickers])
 
   const sortedTickers = useMemo(() =>
-    applySortFilter(filteredTickers, tSortCol, tSortDir, tFilterLT, tFilterST, tFilterMR, effectiveSignals),
-    [filteredTickers, effectiveSignals, tSortCol, tSortDir, tFilterLT, tFilterST, tFilterMR]
+    applySortFilter(filteredTickers, tSortCol, tSortDir, tFilterLT, tFilterST, tFilterMR, effectiveSignals, tickerNames),
+    [filteredTickers, effectiveSignals, tSortCol, tSortDir, tFilterLT, tFilterST, tFilterMR, tickerNames]
   )
 
   const sortedLiveSignals = useMemo(() =>
-    applySortFilter(liveSignalTickers.map(t => t.symbol), lsSortCol, lsSortDir, lsFilterLT, lsFilterST, lsFilterMR, effectiveSignals),
-    [liveSignalTickers, effectiveSignals, lsSortCol, lsSortDir, lsFilterLT, lsFilterST, lsFilterMR]
+    applySortFilter(liveSignalTickers.map(t => t.symbol), lsSortCol, lsSortDir, lsFilterLT, lsFilterST, lsFilterMR, effectiveSignals, tickerNames),
+    [liveSignalTickers, effectiveSignals, lsSortCol, lsSortDir, lsFilterLT, lsFilterST, lsFilterMR, tickerNames]
+  )
+
+  const sortedETFs = useMemo(() =>
+    applySortFilter(filteredETFs, eSortCol, eSortDir, eFilterLT, eFilterST, eFilterMR, effectiveSignals, tickerNames),
+    [filteredETFs, effectiveSignals, eSortCol, eSortDir, eFilterLT, eFilterST, eFilterMR, tickerNames]
   )
 
   const searchResults = useMemo(() => {
@@ -293,26 +327,27 @@ function App() {
         }
       }
     }
+    add(filteredETFs, 'ETFs')
     add(baskets.Themes, 'Themes')
     add(baskets.Sectors, 'Sectors')
     add(baskets.Industries, 'Industries')
     add(filteredTickers, 'Tickers')
     return results.slice(0, 25)
-  }, [searchQuery, searchFilter, baskets, filteredTickers])
+  }, [searchQuery, searchFilter, baskets, filteredTickers, filteredETFs])
 
   const handleSearchSelect = (result: SearchResult) => {
     setSearchOpen(false)
     setSearchQuery('')
     setSearchHighlight(0)
-    if (result.category === 'Tickers') {
-      setViewType('Tickers')
+    if (result.category === 'Tickers' || result.category === 'ETFs') {
+      setViewType(result.category)
       setSelectedItem(result.name)
       setActiveTicker(null)
       setShowSummary(false)
       setSummaryData(null)
       setShowBacktest(false)
       setExpandedBasket(null)
-      setExpandedViews(prev => new Set(prev).add('Tickers'))
+      setExpandedViews(prev => new Set(prev).add(result.category))
     } else {
       setViewType(result.category)
       setSelectedItem(result.name)
@@ -370,6 +405,9 @@ function App() {
     axios.get(`${API_BASE}/baskets/breadth`).then(res => setBasketBreadth(res.data || {})).catch(err => console.error(err));
     axios.get(`${API_BASE}/live-signals`).then(res => setLiveSignalTickers(res.data)).catch(err => console.error(err));
     axios.get(`${API_BASE}/ticker-signals`).then(res => setTickerSignals(res.data)).catch(err => console.error(err));
+    axios.get(`${API_BASE}/etfs`).then(res => setEtfTickers(res.data)).catch(err => console.error(err));
+    axios.get(`${API_BASE}/etfs/quarters`).then(res => setEtfQuarterData(res.data.etfs_by_quarter || {})).catch(err => console.error(err));
+    axios.get(`${API_BASE}/ticker-names`).then(res => setTickerNames(res.data || {})).catch(err => console.error(err));
   }, [])
 
   // Load chart data when selection changes
@@ -487,12 +525,12 @@ function App() {
       .catch(() => setBacktestBaskets([]))
   }, [showBacktest, isTicker, activeTicker, selectedItem])
 
-  // Auto-select first live signal ticker once data arrives
+  // Auto-select top dollar-volume ETF once signals data arrives
   useEffect(() => {
-    if (viewType === 'LiveSignals' && liveSignalTickers.length > 0 && !selectedItem) {
-      setSelectedItem(liveSignalTickers[0].symbol);
+    if (viewType === 'ETFs' && sortedETFs.length > 0 && !selectedItem && Object.keys(effectiveSignals).length > 0) {
+      setSelectedItem(sortedETFs[0]);
     }
-  }, [liveSignalTickers, viewType, selectedItem])
+  }, [sortedETFs, viewType, selectedItem, effectiveSignals])
 
   const toggleView = (view: ViewType) => {
     setExpandedViews(prev => {
@@ -513,6 +551,7 @@ function App() {
       setShowSummary(false)
       setSummaryData(null)
       setShowBacktest(false)
+      setShowAnalogs(false)
       setIntraBasketTarget(item)
     }
   }
@@ -524,6 +563,7 @@ function App() {
     setShowSummary(false)
     setSummaryData(null)
     setShowBacktest(false)
+    setShowAnalogs(false)
     setExpandedBasket(null)
     setIntraBasketTarget('')
   }
@@ -547,7 +587,7 @@ function App() {
     const hasFilter = !!(filterLT || filterST || filterMR)
 
     const handleClick = (col: SignalSortCol) => {
-      if (col === 'ticker' || col === 'pct' || col === 'wt' || col === 'price') {
+      if (col === 'ticker' || col === 'name' || col === 'pct' || col === 'wt' || col === 'price') {
         doSort(col, sortCol, sortDir, setCol, setDir)
         setFilterOpen(null)
       } else {
@@ -598,6 +638,11 @@ function App() {
         <span className={`col-ticker col-hdr ${sortCol === 'ticker' ? 'active' : ''}`} onClick={() => handleClick('ticker')}>
           Ticker{arrow('ticker')}
         </span>
+        {!hiddenCols.has('name') && (
+          <span className={`col-name col-hdr ${sortCol === 'name' ? 'active' : ''}`} onClick={() => handleClick('name')}>
+            Name{arrow('name')}
+          </span>
+        )}
         {(showWeight || showDV) && !hiddenCols.has('wt') && (
           <span className={`col-wt col-hdr ${sortCol === 'wt' ? 'active' : ''}`} onClick={() => handleClick('wt')}>
             {showWeight ? 'Wt' : 'DV'}{arrow('wt')}
@@ -834,6 +879,7 @@ function App() {
                   <div className="col-filter-backdrop" onClick={() => setColMenuOpen(false)}></div>
                   <div className="col-toggle-menu" onClick={e => e.stopPropagation()}>
                     {[
+                      { key: 'name', label: 'Name' },
                       { key: 'wt', label: 'Wt / DV' },
                       { key: 'bo', label: 'BO%' },
                       { key: 'br', label: 'Breadth%' },
@@ -861,6 +907,32 @@ function App() {
           </div>
           <div className="sidebar-scrollable-content">
             <div className="accordion-section">
+              <button className="accordion-header" onClick={() => toggleView('ETFs')}>
+                <span className={`accordion-chevron ${expandedViews.has('ETFs') ? 'expanded' : ''}`}>{'>'}</span>
+                ETFs
+              </button>
+              {expandedViews.has('ETFs') && (
+                <>
+                  {renderColHeader(eSortCol, eSortDir, setESortCol, setESortDir, eFilterLT, eFilterST, eFilterMR, setEFilterLT, setEFilterST, setEFilterMR, eFilterOpen, setEFilterOpen, false, true)}
+                  {sortedETFs.length === 0 ? (
+                    <div className="accordion-item" style={{color: 'var(--text-muted)', fontStyle: 'italic'}}>
+                      {etfTickers.length === 0 ? 'No ETFs available' : 'No matches for filter'}
+                    </div>
+                  ) : sortedETFs.map(t => (
+                    <div
+                      key={t}
+                      className={`accordion-item accordion-item-flex ${selectedItem === t && viewType === 'ETFs' && !activeTicker ? 'active' : ''}`}
+                      onClick={() => handleItemSelect(t, 'ETFs')}
+                    >
+                      <span className="col-ticker ticker-symbol">{t}</span>
+                      {!hiddenCols.has('name') && <span className="col-name" title={tickerNames[t] || ''}>{tickerNames[t] || ''}</span>}
+                      {renderSignalCols(t, undefined, true)}
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+            <div className="accordion-section">
               <button className="accordion-header" onClick={() => toggleView('LiveSignals')}>
                 <span className={`accordion-chevron ${expandedViews.has('LiveSignals') ? 'expanded' : ''}`}>{'>'}</span>
                 Live Signals
@@ -879,6 +951,7 @@ function App() {
                       onClick={() => handleItemSelect(t, 'LiveSignals')}
                     >
                       <span className="col-ticker ticker-symbol">{t}</span>
+                      {!hiddenCols.has('name') && <span className="col-name" title={tickerNames[t] || ''}>{tickerNames[t] || ''}</span>}
                       {renderSignalCols(t, undefined, true)}
                     </div>
                   ))}
@@ -900,6 +973,7 @@ function App() {
                       onClick={() => handleItemSelect(t, 'Tickers')}
                     >
                       <span className="col-ticker ticker-symbol">{t}</span>
+                      {!hiddenCols.has('name') && <span className="col-name" title={tickerNames[t] || ''}>{tickerNames[t] || ''}</span>}
                       {renderSignalCols(t, undefined, true)}
                     </div>
                   ))}
@@ -1007,6 +1081,7 @@ function App() {
                               onClick={() => { setActiveTicker(t.symbol); setSummaryData(null); }}
                             >
                               <span className="col-ticker ticker-symbol">{t.symbol}</span>
+                              {!hiddenCols.has('name') && <span className="col-name" title={tickerNames[t.symbol] || ''}>{tickerNames[t.symbol] || ''}</span>}
                               {renderSignalCols(t.symbol, t.weight)}
                             </div>
                           ))}
@@ -1048,7 +1123,7 @@ function App() {
               {searchOpen && searchQuery.trim() && (
                 <div className="search-dropdown">
                   <div className="search-filters">
-                    {(['all', 'Themes', 'Sectors', 'Industries', 'Tickers'] as const).map(f => (
+                    {(['all', 'ETFs', 'Themes', 'Sectors', 'Industries', 'Tickers'] as const).map(f => (
                       <button
                         key={f}
                         className={`search-filter-btn ${searchFilter === f ? 'active' : ''}`}
@@ -1194,7 +1269,7 @@ function App() {
               <BacktestPanel
                 apiBase={API_BASE}
                 target={activeTicker || selectedItem}
-                targetType={activeTicker || isTicker ? 'ticker' : 'basket'}
+                targetType={viewType === 'ETFs' && !activeTicker ? 'etf' : activeTicker || isTicker ? 'ticker' : 'basket'}
                 exportTrigger={exportTrigger}
               />
             ) : showSummary ? (

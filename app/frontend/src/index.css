@@ -289,7 +289,8 @@ html, body, #root {
   padding-left: 48px;
 }
 
-.col-ticker { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.col-ticker { width: 42px; flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.col-name { flex: 1; min-width: 40px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; color: var(--text-muted); padding-left: 4px; }
 .col-wt, .col-lt, .col-st, .col-mr, .col-pct, .col-bkt {
   width: 40px; text-align: center; flex-shrink: 0; font-size: 10px; font-weight: bold;
 }

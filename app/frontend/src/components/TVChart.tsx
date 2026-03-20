@@ -683,7 +683,8 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
           });
           const arrow = (col: typeof cdSortCol) => cdSortCol === col ? (cdSortAsc ? ' \u25b2' : ' \u25bc') : '';
           return (
-            <div className="candle-detail-overlay" style={{ ...(pinnedDetail ? { pointerEvents: 'auto' as const, borderColor: 'rgb(50, 50, 255)' } : {}), minWidth: 480 }}>
+            <div style={{ position: 'absolute', top: 4, left: 8, bottom: 32, pointerEvents: 'none', zIndex: 200, display: 'flex', flexDirection: 'column' }}>
+            <div className="candle-detail-overlay" style={{ ...(pinnedDetail ? { pointerEvents: 'auto' as const, borderColor: 'rgb(50, 50, 255)' } : {}), minWidth: 480, position: 'relative', top: 'auto', left: 'auto', maxHeight: '100%' }}>
               <div className="candle-detail-title">
                 {detail.date}
                 {pinnedDetail
@@ -724,6 +725,7 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
                   </span>
                 </div>
               )}
+            </div>
             </div>
           );
         })()}

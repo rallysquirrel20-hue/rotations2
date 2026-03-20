@@ -406,6 +406,110 @@ def get_universe(date):
 
 QUARTER_UNIVERSE = load_or_build_universe()
 
+# --- ETF Universe ---
+
+ETF_SIZE = 50
+ETF_CACHE_FILE = DATA_FOLDER / 'etf_universes_50.json'
+
+
+def build_quarter_etf_universe():
+    etf_symbols = []
+
+    for db_name in ('US Equities', 'US Equities Delisted'):
+        try:
+            symbols = norgatedata.database_symbols(db_name)
+            subtypes = {norgatedata.subtype1(s) for s in symbols[:20]}
+            print(f"[ETF] {db_name}: sample subtype1 values = {subtypes}")
+            etf_symbols.extend(s for s in symbols if norgatedata.subtype1(s) == 'Exchange Traded Product')
+        except Exception:
+            pass
+
+    etf_symbols = list(set(etf_symbols))
+    print(f"[ETF] Total unique ETFs found: {len(etf_symbols)}")
+
+    all_data = []
+    total = len(etf_symbols)
+    last_milestone = 0
+
+    with ThreadPoolExecutor() as ex:
+        for i, rows in enumerate(ex.map(get_quarterly_vol, etf_symbols), start=1):
+            all_data.extend(rows)
+            percent = int((i / total) * 100) if total else 100
+            milestone = percent // 10 * 10
+            if milestone > last_milestone and milestone % 10 == 0:
+                print(f"  [ETF] {milestone}% complete ({i} / {total})")
+                last_milestone = milestone
+
+    df = pd.DataFrame(all_data, columns=['Date', 'Ticker', 'Vol'])
+    universe = {}
+    for date, grp in df.groupby('Date'):
+        universe[f"{date.year} Q{date.quarter}"] = set(grp.nlargest(ETF_SIZE, 'Vol')['Ticker'])
+
+    return universe
+
+
+def load_or_build_etf_universe():
+    if ETF_CACHE_FILE.exists():
+        try:
+            universe = _json_to_universe(ETF_CACHE_FILE.read_text(encoding='utf-8'))
+            if is_universe_current(universe):
+                print("[ETF] Universe loaded from cache (up to date)")
+                return universe
+            print("[ETF] Universe outdated, rebuilding...")
+        except Exception:
+            print("[ETF] Universe cache invalid, rebuilding...")
+
+    universe = build_quarter_etf_universe()
+    WriteThroughPath(ETF_CACHE_FILE).write_text(_universe_to_json(universe))
+    latest_key = max(universe.keys(), key=lambda k: (int(k.split()[0]), int(k.split()[1].replace('Q', '')))) if universe else None
+    if latest_key:
+        print(f"[ETF] Saved: {ETF_CACHE_FILE} ({len(universe.get(latest_key, set()))} ETFs, {len(universe)} quarters)")
+    return universe
+
+
+ETF_UNIVERSE = load_or_build_etf_universe()
+
+# --- Ticker Names Cache ---
+
+TICKER_NAMES_FILE = DATA_FOLDER / 'ticker_names.json'
+
+
+def _build_ticker_names():
+    """Build ticker → security name mapping for all stocks + ETFs."""
+    all_tickers = sorted(
+        {t for tickers in QUARTER_UNIVERSE.values() for t in tickers}
+        | {t for tickers in ETF_UNIVERSE.values() for t in tickers}
+    )
+    # Load existing cache
+    existing = {}
+    if TICKER_NAMES_FILE.exists():
+        try:
+            existing = json.loads(TICKER_NAMES_FILE.read_text(encoding='utf-8'))
+        except Exception:
+            pass
+
+    # Only fetch names for tickers not already cached
+    missing = [t for t in all_tickers if t not in existing]
+    if not missing:
+        print(f"Ticker names loaded from cache ({len(existing)} names)")
+        return existing
+
+    print(f"Fetching {len(missing)} ticker names from Norgate...")
+    names = dict(existing)
+    for t in missing:
+        try:
+            name = norgatedata.security_name(t)
+            if name:
+                names[t] = name
+        except Exception:
+            pass
+    WriteThroughPath(TICKER_NAMES_FILE).write_text(json.dumps(names, sort_keys=True))
+    print(f"Saved: {TICKER_NAMES_FILE} ({len(names)} names)")
+    return names
+
+
+TICKER_NAMES = _build_ticker_names()
+
 # --- Beta Universe ---
 
 THEME_SIZE = 25
@@ -962,6 +1066,7 @@ def build_quarter_dividend_universes():
 
     high_yield = {}
     div_growth = {}
+    div_with_growth = {}
 
     for key in sorted(QUARTER_UNIVERSE.keys()):
         year_str, q_str = key.split()
@@ -981,38 +1086,47 @@ def build_quarter_dividend_universes():
         if not grp_yield.empty:
             high_yield[key] = set(grp_yield.sort_values('Yield', ascending=False).head(DIV_THEME_SIZE)['Ticker'])
 
-        # Basket 2: Dividend Growth — top DIV_THEME_SIZE by YoY growth in trailing 12M
-        # ordinary dividends per share.  Growth = (divs_now / divs_1yr_ago) - 1.
+        # Basket 2 & 3: need dividend growth data
         if df_divs.empty:
             continue
         current_divs = df_divs[(df_divs['Date'] == ranking_date) & (df_divs['Ticker'].isin(prev_universe))]
         if current_divs.empty:
             continue
         prev_year_date = ranking_date - pd.DateOffset(years=1)
-        # Â±45-day window handles edge cases where a ticker has no data on the exact date
         prior_divs = df_divs[
             df_divs['Date'].between(prev_year_date - pd.Timedelta(days=45),
                                      prev_year_date + pd.Timedelta(days=45))
             & df_divs['Ticker'].isin(prev_universe)
         ].copy()
-        if not prior_divs.empty:
-            prior_divs['_dist'] = (prior_divs['Date'] - prev_year_date).abs()
-            prior_divs = prior_divs.sort_values('_dist').drop_duplicates('Ticker')
-            prior_divs = prior_divs.rename(columns={'TrailingDivs': 'PriorDivs'})[['Ticker', 'PriorDivs']]
-            merged = current_divs.merge(prior_divs, on='Ticker', how='inner')
-            merged = merged[(merged['TrailingDivs'] > 0) & (merged['PriorDivs'] > 0)].copy()
-            if not merged.empty:
-                merged['Growth'] = (merged['TrailingDivs'] / merged['PriorDivs']) - 1.0
-                div_growth[key] = set(merged.sort_values('Growth', ascending=False).head(DIV_THEME_SIZE)['Ticker'])
+        if prior_divs.empty:
+            continue
+        prior_divs['_dist'] = (prior_divs['Date'] - prev_year_date).abs()
+        prior_divs = prior_divs.sort_values('_dist').drop_duplicates('Ticker')
+        prior_divs = prior_divs.rename(columns={'TrailingDivs': 'PriorDivs'})[['Ticker', 'PriorDivs']]
+        merged = current_divs.merge(prior_divs, on='Ticker', how='inner')
+        merged = merged[(merged['TrailingDivs'] > 0) & (merged['PriorDivs'] > 0)].copy()
+        if merged.empty:
+            continue
+        merged['Growth'] = (merged['TrailingDivs'] / merged['PriorDivs']) - 1.0
 
-    return high_yield, div_growth
+        # Basket 2: Dividend Growth — top DIV_THEME_SIZE by YoY growth
+        div_growth[key] = set(merged.sort_values('Growth', ascending=False).head(DIV_THEME_SIZE)['Ticker'])
+
+        # Basket 3: Dividend with Growth — top DIV_THEME_SIZE by yield, filtered to >0% growth
+        growing_tickers = set(merged.loc[merged['Growth'] > 0, 'Ticker'])
+        if growing_tickers and not grp_yield.empty:
+            filtered = grp_yield[grp_yield['Ticker'].isin(growing_tickers)]
+            if not filtered.empty:
+                div_with_growth[key] = set(filtered.sort_values('Yield', ascending=False).head(DIV_THEME_SIZE)['Ticker'])
+
+    return high_yield, div_growth, div_with_growth
 
 
 def is_dividend_universes_current(cached):
     today = datetime.today()
     current_key = f"{today.year} Q{(today.month - 1) // 3 + 1}"
-    high, growth = cached
-    return current_key in high and current_key in growth
+    high, growth, with_growth = cached
+    return current_key in high and current_key in growth and current_key in with_growth
 
 
 def load_or_build_dividend_universes():
@@ -1020,7 +1134,8 @@ def load_or_build_dividend_universes():
         try:
             d = json.loads(DIVIDEND_CACHE_FILE.read_text(encoding='utf-8'))
             cached = ({k: set(v) for k, v in d['high_yield'].items()},
-                      {k: set(v) for k, v in d['div_growth'].items()})
+                      {k: set(v) for k, v in d['div_growth'].items()},
+                      {k: set(v) for k, v in d.get('div_with_growth', {}).items()})
             if is_dividend_universes_current(cached):
                 print("Dividend universes loaded from cache (up to date)")
                 return cached
@@ -1029,20 +1144,261 @@ def load_or_build_dividend_universes():
             print("Dividend universe cache invalid, rebuilding...")
 
     result = build_quarter_dividend_universes()
-    high_yield, div_growth = result
+    high_yield, div_growth, div_with_growth = result
     WriteThroughPath(DIVIDEND_CACHE_FILE).write_text(
         json.dumps({'high_yield': {k: sorted(v) for k, v in high_yield.items()},
-                    'div_growth': {k: sorted(v) for k, v in div_growth.items()}})
+                    'div_growth': {k: sorted(v) for k, v in div_growth.items()},
+                    'div_with_growth': {k: sorted(v) for k, v in div_with_growth.items()}})
     )
     _latest = max(high_yield.keys(), key=lambda k: (int(k.split()[0]), int(k.split()[1].replace('Q', '')))) if high_yield else None
     _hy_count = len(high_yield.get(_latest, set())) if _latest else 0
     _dg_count = len(div_growth.get(_latest, set())) if _latest else 0
-    print(f"Saved: {DIVIDEND_CACHE_FILE} (High Yield: {_hy_count}, Dividend Growth: {_dg_count})")
+    _dwg_count = len(div_with_growth.get(_latest, set())) if _latest else 0
+    print(f"Saved: {DIVIDEND_CACHE_FILE} (High Yield: {_hy_count}, Dividend Growth: {_dg_count}, Div with Growth: {_dwg_count})")
     return result
 
 
 print("Building high dividend yield & dividend growth groups...")
-HIGH_YIELD_UNIVERSE, DIV_GROWTH_UNIVERSE = load_or_build_dividend_universes()
+HIGH_YIELD_UNIVERSE, DIV_GROWTH_UNIVERSE, DIV_WITH_GROWTH_UNIVERSE = load_or_build_dividend_universes()
+
+# --- Size (Dollar Volume) Universe ---
+
+SIZE_CACHE_FILE = paths.thematic_basket_cache / f'size_universes_{SIZE}.json'
+
+
+def _calc_avg_dollar_volume_quarterly(ticker):
+    df = norgatedata.price_timeseries(
+        ticker,
+        stock_price_adjustment_setting=norgatedata.StockPriceAdjustmentType.TOTALRETURN,
+        padding_setting=norgatedata.PaddingType.NONE,
+        timeseriesformat='pandas-dataframe'
+    )
+    if df is None or df.empty:
+        return None
+    df = df.reset_index()
+    date_col = df.columns[0]
+    df[date_col] = pd.to_datetime(df[date_col]).dt.normalize()
+    df.set_index(date_col, inplace=True)
+    dollar_vol = df['Close'] * df['Volume']
+    quarterly = dollar_vol.resample('QE-DEC').mean()
+    return quarterly
+
+
+def _safe_calc_dollar_volume(ticker):
+    try:
+        result = _calc_avg_dollar_volume_quarterly(ticker)
+        if result is None:
+            return ticker, []
+        rows = [(d, ticker, v) for d, v in result.items()
+                if d.year >= START_YEAR and pd.notna(v) and v > 0]
+        return ticker, rows
+    except Exception:
+        return ticker, []
+
+
+def build_quarter_size_universes():
+    symbols = sorted({t for tickers in QUARTER_UNIVERSE.values() for t in tickers})
+    print(f"Unique stocks in size universe: {len(symbols)}")
+
+    all_data = []
+    total = len(symbols)
+    last_milestone = 0
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = [ex.submit(_safe_calc_dollar_volume, t) for t in symbols]
+        for i, fut in enumerate(futures, start=1):
+            _, rows = fut.result()
+            all_data.extend(rows)
+            percent = int((i / total) * 100)
+            milestone = percent // 10 * 10
+            if milestone > last_milestone and milestone % 10 == 0:
+                print(f"  {milestone}% complete ({i} / {total} stocks)")
+                last_milestone = milestone
+
+    if not all_data:
+        return {}
+
+    df = pd.DataFrame(all_data, columns=['Date', 'Ticker', 'DollarVol'])
+
+    universe = {}
+    for key in sorted(QUARTER_UNIVERSE.keys()):
+        year_str, q_str = key.split()
+        year = int(year_str)
+        quarter = int(q_str.replace("Q", ""))
+        if quarter == 1:
+            prev_key = f"{year - 1} Q4"
+        else:
+            prev_key = f"{year} Q{quarter - 1}"
+        if prev_key not in QUARTER_UNIVERSE:
+            continue
+        ranking_date = _quarter_end_from_key(prev_key)
+        prev_universe = QUARTER_UNIVERSE[prev_key]
+        grp = df[(df['Date'] == ranking_date) & (df['Ticker'].isin(prev_universe))]
+        if grp.empty:
+            continue
+        sorted_desc = grp.sort_values('DollarVol', ascending=False)
+        universe[key] = set(sorted_desc.head(THEME_SIZE)['Ticker'])
+
+    return universe
+
+
+def is_size_universe_current(cached):
+    today = datetime.today()
+    current_key = f"{today.year} Q{(today.month - 1) // 3 + 1}"
+    return current_key in cached
+
+
+def load_or_build_size_universes():
+    if SIZE_CACHE_FILE.exists():
+        try:
+            cached = {k: set(v) for k, v in
+                      json.loads(SIZE_CACHE_FILE.read_text(encoding='utf-8')).items()}
+            if is_size_universe_current(cached):
+                print("Size universe loaded from cache (up to date)")
+                return cached
+            print("Size universe outdated, rebuilding...")
+        except Exception:
+            print("Size universe cache invalid, rebuilding...")
+
+    result = build_quarter_size_universes()
+    WriteThroughPath(SIZE_CACHE_FILE).write_text(
+        json.dumps({k: sorted(v) for k, v in result.items()})
+    )
+    _latest = max(result.keys(), key=lambda k: (int(k.split()[0]), int(k.split()[1].replace('Q', '')))) if result else None
+    print(f"Saved: {SIZE_CACHE_FILE} ({len(result.get(_latest, set())) if _latest else 0} tickers)")
+    return result
+
+
+print("Building size (dollar volume) group...")
+SIZE_UNIVERSE = load_or_build_size_universes()
+
+# --- Volume Growth Universe ---
+
+VOLUME_GROWTH_CACHE_FILE = paths.thematic_basket_cache / f'volume_growth_universes_{SIZE}.json'
+
+
+def _calc_quarterly_dollar_volume(ticker):
+    df = norgatedata.price_timeseries(
+        ticker,
+        stock_price_adjustment_setting=norgatedata.StockPriceAdjustmentType.TOTALRETURN,
+        padding_setting=norgatedata.PaddingType.NONE,
+        timeseriesformat='pandas-dataframe'
+    )
+    if df is None or df.empty:
+        return None
+    df = df.reset_index()
+    date_col = df.columns[0]
+    df[date_col] = pd.to_datetime(df[date_col]).dt.normalize()
+    df.set_index(date_col, inplace=True)
+    dollar_vol = df['Close'] * df['Volume']
+    quarterly = dollar_vol.resample('QE-DEC').mean()
+    return quarterly
+
+
+def _safe_calc_quarterly_dollar_volume(ticker):
+    try:
+        result = _calc_quarterly_dollar_volume(ticker)
+        if result is None:
+            return ticker, []
+        rows = [(d, ticker, v) for d, v in result.items()
+                if d.year >= START_YEAR and pd.notna(v) and v > 0]
+        return ticker, rows
+    except Exception:
+        return ticker, []
+
+
+def build_quarter_volume_growth_universes():
+    symbols = sorted({t for tickers in QUARTER_UNIVERSE.values() for t in tickers})
+    print(f"Unique stocks in volume growth universe: {len(symbols)}")
+
+    all_data = []
+    total = len(symbols)
+    last_milestone = 0
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = [ex.submit(_safe_calc_quarterly_dollar_volume, t) for t in symbols]
+        for i, fut in enumerate(futures, start=1):
+            _, rows = fut.result()
+            all_data.extend(rows)
+            percent = int((i / total) * 100)
+            milestone = percent // 10 * 10
+            if milestone > last_milestone and milestone % 10 == 0:
+                print(f"  {milestone}% complete ({i} / {total} stocks)")
+                last_milestone = milestone
+
+    if not all_data:
+        return {}
+
+    df = pd.DataFrame(all_data, columns=['Date', 'Ticker', 'DollarVol'])
+
+    universe = {}
+    for key in sorted(QUARTER_UNIVERSE.keys()):
+        year_str, q_str = key.split()
+        year = int(year_str)
+        quarter = int(q_str.replace("Q", ""))
+        if quarter == 1:
+            prev_key = f"{year - 1} Q4"
+        else:
+            prev_key = f"{year} Q{quarter - 1}"
+        if prev_key not in QUARTER_UNIVERSE:
+            continue
+        # Need two prior quarters to compute growth
+        prev_year = int(prev_key.split()[0])
+        prev_q = int(prev_key.split()[1].replace("Q", ""))
+        if prev_q == 1:
+            prev_prev_key = f"{prev_year - 1} Q4"
+        else:
+            prev_prev_key = f"{prev_year} Q{prev_q - 1}"
+
+        ranking_date = _quarter_end_from_key(prev_key)
+        prev_ranking_date = _quarter_end_from_key(prev_prev_key)
+        prev_universe = QUARTER_UNIVERSE[prev_key]
+
+        cur_grp = df[(df['Date'] == ranking_date) & (df['Ticker'].isin(prev_universe))].set_index('Ticker')
+        prev_grp = df[(df['Date'] == prev_ranking_date) & (df['Ticker'].isin(prev_universe))].set_index('Ticker')
+
+        if cur_grp.empty or prev_grp.empty:
+            continue
+
+        merged = cur_grp[['DollarVol']].join(prev_grp[['DollarVol']], lsuffix='_cur', rsuffix='_prev', how='inner')
+        merged = merged[merged['DollarVol_prev'] > 0]
+        merged['Growth'] = (merged['DollarVol_cur'] - merged['DollarVol_prev']) / merged['DollarVol_prev']
+
+        sorted_desc = merged.sort_values('Growth', ascending=False)
+        universe[key] = set(sorted_desc.head(THEME_SIZE).index)
+
+    return universe
+
+
+def is_volume_growth_current(cached):
+    today = datetime.today()
+    current_key = f"{today.year} Q{(today.month - 1) // 3 + 1}"
+    return current_key in cached
+
+
+def load_or_build_volume_growth_universes():
+    if VOLUME_GROWTH_CACHE_FILE.exists():
+        try:
+            cached = {k: set(v) for k, v in
+                      json.loads(VOLUME_GROWTH_CACHE_FILE.read_text(encoding='utf-8')).items()}
+            if is_volume_growth_current(cached):
+                print("Volume growth universe loaded from cache (up to date)")
+                return cached
+            print("Volume growth universe outdated, rebuilding...")
+        except Exception:
+            print("Volume growth universe cache invalid, rebuilding...")
+
+    result = build_quarter_volume_growth_universes()
+    WriteThroughPath(VOLUME_GROWTH_CACHE_FILE).write_text(
+        json.dumps({k: sorted(v) for k, v in result.items()})
+    )
+    _latest = max(result.keys(), key=lambda k: (int(k.split()[0]), int(k.split()[1].replace('Q', '')))) if result else None
+    print(f"Saved: {VOLUME_GROWTH_CACHE_FILE} ({len(result.get(_latest, set())) if _latest else 0} tickers)")
+    return result
+
+
+print("Building volume growth group...")
+VOLUME_GROWTH_UNIVERSE = load_or_build_volume_growth_universes()
 
 # --- GICS Sector / Industry Mappings ---
 
@@ -2429,15 +2785,19 @@ def _signals_cache_is_current(df):
     if df is None or df.empty or 'Date' not in df.columns:
         return False
 
+    # Pre-convert to datetime if still string/object to speed up comparisons
+    if not pd.api.types.is_datetime64_any_dtype(df['Date']):
+        df['Date'] = pd.to_datetime(df['Date'])
+
     # If live rows are present at the latest date, cache is not current — Norgate should rebuild/replace
     if 'Source' in df.columns:
-        latest_cache_date_all = pd.to_datetime(df['Date']).max()
+        latest_cache_date_all = df['Date'].max()
         if pd.notna(latest_cache_date_all):
-            latest_rows = df[pd.to_datetime(df['Date']) == latest_cache_date_all]
+            latest_rows = df[df['Date'] == latest_cache_date_all]
             if (latest_rows['Source'] == 'live').any():
                 return False
 
-    latest_cache_date = pd.to_datetime(df['Date']).max()
+    latest_cache_date = df['Date'].max()
     if pd.isna(latest_cache_date):
         return False
 
@@ -2462,10 +2822,14 @@ def _signals_cache_is_current(df):
 def load_or_build_signals():
     if SIGNALS_CACHE_FILE.exists():
         cached = pd.read_parquet(SIGNALS_CACHE_FILE)
+        # Always convert Date to datetime immediately to save memory and speed up filter calls
+        if 'Date' in cached.columns and not pd.api.types.is_datetime64_any_dtype(cached['Date']):
+            cached['Date'] = pd.to_datetime(cached['Date'])
+
         if _signals_cache_is_current(cached):
             print("Signals loaded from cache (up to date)")
             if 'Source' in cached.columns:
-                cached = cached.drop(columns=['Source'])
+                del cached['Source']
             return cached
 
         # Strip live rows — Norgate rebuild/incremental will replace them
@@ -2477,7 +2841,7 @@ def load_or_build_signals():
         days_stale = None
         columns_ok = True
         if 'Date' in cached.columns and not cached.empty:
-            latest_cache_date   = pd.to_datetime(cached['Date']).max().normalize()
+            latest_cache_date   = cached['Date'].max().normalize()
             latest_norgate_date = _get_latest_norgate_date()
             if latest_norgate_date is not None and not pd.isna(latest_cache_date):
                 days_stale = int(np.busday_count(latest_cache_date.date(), latest_norgate_date.date()))
@@ -2488,10 +2852,16 @@ def load_or_build_signals():
                     columns_ok = False
                 break
 
-        if (days_stale is not None and 1 <= days_stale <= INCREMENTAL_MAX_DAYS and columns_ok):
+        if days_stale is not None and days_stale == 0 and columns_ok:
+            print("Signals loaded from cache (up to date after stripping live rows)")
+            return cached
+        elif (days_stale is not None and 1 <= days_stale <= INCREMENTAL_MAX_DAYS and columns_ok):
             print(f"Signals cache stale by {days_stale} trading day(s), running incremental update...")
             try:
-                return _incremental_update_signals(cached, days_stale=days_stale)
+                res = _incremental_update_signals(cached, days_stale=days_stale)
+                if res['Date'].dtype == object:
+                    res['Date'] = pd.to_datetime(res['Date'])
+                return res
             except Exception as exc:
                 print(f"Incremental update failed ({exc}), falling back to full rebuild...")
         else:
@@ -2619,11 +2989,322 @@ def load_or_build_signals():
     all_signals_df.to_parquet(SIGNALS_CACHE_FILE, index=False, compression='snappy')
     print(f"Saved: {SIGNALS_CACHE_FILE} ({len(all_signals_df)} rows, {all_signals_df['Ticker'].nunique()} tickers)")
     # Drop Source from in-memory DF — only needed on disk, not for basket processing
-    all_signals_df = all_signals_df.drop(columns=['Source'])
+    del all_signals_df['Source']
     return all_signals_df
 
 
 all_signals_df = load_or_build_signals()
+
+
+# --- ETF Signal Pipeline (parallel to stock signals, separate parquet) ---
+
+ETF_SIGNALS_CACHE_FILE = DATA_FOLDER / 'signals_etf_50.parquet'
+
+
+def _etf_signals_cache_is_current(df):
+    """Same logic as _signals_cache_is_current but for the ETF parquet."""
+    if df is None or df.empty or 'Date' not in df.columns:
+        return False
+    if 'Source' in df.columns:
+        latest_all = pd.to_datetime(df['Date']).max()
+        if pd.notna(latest_all):
+            latest_rows = df[pd.to_datetime(df['Date']) == latest_all]
+            if (latest_rows['Source'] == 'live').any():
+                return False
+    latest_cache_date = pd.to_datetime(df['Date']).max()
+    if pd.isna(latest_cache_date):
+        return False
+    latest_norgate_date = _get_latest_norgate_date()
+    if latest_norgate_date is None:
+        return False
+    if latest_cache_date.normalize() < latest_norgate_date:
+        return False
+    return True
+
+
+def _incremental_update_etf_signals(cached_df, days_stale=1):
+    """Incremental update for ETF signals — mirrors _incremental_update_signals."""
+    inc_start = time.time()
+    print("=" * 60)
+    print("[ETF] Running incremental signals update...")
+
+    all_tickers = sorted({t for tickers in ETF_UNIVERSE.values() for t in tickers})
+    universe_set = set(all_tickers)
+
+    cached_df = cached_df.copy()
+    if 'Source' in cached_df.columns:
+        cached_df = cached_df[cached_df['Source'] != 'live'].copy()
+    cached_df['Date'] = pd.to_datetime(cached_df['Date'])
+    last_rows = {}
+    for ticker_val, grp in cached_df.groupby('Ticker', sort=False):
+        last_rows[ticker_val] = grp.sort_values('Date').iloc[-1]
+
+    cached_tickers = set(last_rows.keys())
+    new_tickers = universe_set - cached_tickers
+    dropped_tickers = cached_tickers - universe_set
+
+    print(f"  [ETF] Universe: {len(universe_set)} | Cached: {len(cached_tickers)} | "
+          f"New: {len(new_tickers)} | Dropped: {len(dropped_tickers)}")
+
+    check_tickers = [t for t in all_tickers if t in cached_tickers]
+    append_rows = {}
+    rebuild_tickers = list(new_tickers)
+
+    def _safe_append(t):
+        return t, _build_signals_append_ticker(t, last_rows[t], limit=days_stale + 1)
+
+    total_check = len(check_tickers)
+    processed = 0
+    last_milestone = 0
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = [ex.submit(_safe_append, t) for t in check_tickers]
+        for fut in futures:
+            t, (action, payload) = fut.result()
+            processed += 1
+            percent = int((processed / total_check) * 100) if total_check else 100
+            milestone = percent // 10 * 10
+            if milestone > last_milestone and milestone % 10 == 0:
+                print(f"  [ETF] Append check {milestone}% ({processed}/{total_check})")
+                last_milestone = milestone
+            if action == 'append':
+                append_rows[t] = payload
+            elif action in ('full_rebuild', 'error'):
+                rebuild_tickers.append(t)
+
+    print(f"  [ETF] Append: {len(append_rows)} | Full rebuild: {len(rebuild_tickers)}")
+
+    rebuild_results = {}
+    if rebuild_tickers:
+        print(f"  [ETF] Rebuilding {len(rebuild_tickers)} tickers...")
+        def _safe_rebuild(t):
+            try:
+                return t, build_signals_for_ticker(t)
+            except Exception:
+                return t, None
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            for fut in [ex.submit(_safe_rebuild, t) for t in rebuild_tickers]:
+                t, result = fut.result()
+                if result is not None:
+                    rebuild_results[t] = result
+
+    keep_set = set(cached_df.columns)
+
+    if rebuild_results:
+        cached_df = cached_df[~cached_df['Ticker'].isin(rebuild_results.keys())].copy()
+        rebuild_frames = []
+        for t, df_rebuilt in rebuild_results.items():
+            trim_cols = [c for c in df_rebuilt.columns if c in keep_set]
+            if trim_cols:
+                trimmed = df_rebuilt[trim_cols].dropna(axis=1, how='all')
+                if not trimmed.empty:
+                    rebuild_frames.append(trimmed)
+        if rebuild_frames:
+            cached_df = pd.concat([cached_df] + rebuild_frames, ignore_index=True)
+
+    if append_rows:
+        new_rows_list = []
+        for t, row_list in append_rows.items():
+            for row_series in row_list:
+                row_dict = {k: v for k, v in row_series.items() if k in keep_set}
+                new_rows_list.append(row_dict)
+        new_rows_df = pd.DataFrame(new_rows_list,
+                                   columns=[c for c in cached_df.columns if c in keep_set])
+        cached_df = pd.concat([cached_df, new_rows_df], ignore_index=True)
+
+    # Dtype optimizations
+    bool_cols = ['Is_Up_Rotation', 'Is_Down_Rotation', 'Is_Breakout', 'Is_Breakdown',
+                 'Is_BTFD', 'Is_STFR', 'Is_Breakout_Sequence', 'BTFD_Triggered', 'STFR_Triggered']
+    for col in bool_cols:
+        if col in cached_df.columns:
+            cached_df[col] = cached_df[col].fillna(False).astype(bool)
+    if 'Trend' in cached_df.columns:
+        cached_df['Trend'] = cached_df['Trend'].map(
+            {True: 1.0, False: 0.0, 1.0: 1.0, 0.0: 0.0, None: float('nan')}
+        ).astype('float32')
+    if 'Rotation_ID' in cached_df.columns:
+        cached_df['Rotation_ID'] = cached_df['Rotation_ID'].fillna(0).astype('int32')
+    float32_prefixes = ['Win_Rate', 'Avg_Winner', 'Avg_Loser', 'Avg_Winner_Bars', 'Avg_Loser_Bars',
+                        'Avg_MFE', 'Avg_MAE', 'Historical_EV', 'Std_Dev', 'Risk_Adj_EV',
+                        'EV_Last_3', 'Risk_Adj_EV_Last_3', 'Count']
+    for col in cached_df.columns:
+        for prefix in float32_prefixes:
+            if col.endswith(prefix) and cached_df[col].dtype == 'float64':
+                cached_df[col] = cached_df[col].astype('float32')
+                break
+
+    cached_df['Source'] = 'norgate'
+    tmp_path = ETF_SIGNALS_CACHE_FILE.with_suffix('.parquet.tmp')
+    pq.write_table(pa.Table.from_pandas(cached_df, preserve_index=False),
+                    tmp_path, compression='snappy', use_dictionary=False)
+    tmp_path.replace(ETF_SIGNALS_CACHE_FILE)
+    WriteThroughPath(ETF_SIGNALS_CACHE_FILE).sync()
+    del cached_df['Source']
+
+    print(f"  [ETF] Incremental update complete: {len(cached_df)} total rows "
+          f"({time.time() - inc_start:.1f}s)")
+    print("=" * 60)
+    return cached_df
+
+
+def load_or_build_etf_signals():
+    """Load or build the ETF signals parquet — mirrors load_or_build_signals."""
+    etf_start = time.time()
+    if ETF_SIGNALS_CACHE_FILE.exists():
+        cached = pd.read_parquet(ETF_SIGNALS_CACHE_FILE)
+        if _etf_signals_cache_is_current(cached):
+            print("[ETF] Signals loaded from cache (up to date)")
+            if 'Source' in cached.columns:
+                del cached['Source']
+            return cached
+
+        if 'Source' in cached.columns:
+            cached = cached[cached['Source'] != 'live'].copy()
+
+        days_stale = None
+        columns_ok = True
+        if 'Date' in cached.columns and not cached.empty:
+            latest_cache_date = pd.to_datetime(cached['Date']).max().normalize()
+            latest_norgate_date = _get_latest_norgate_date()
+            if latest_norgate_date is not None and not pd.isna(latest_cache_date):
+                days_stale = int(np.busday_count(latest_cache_date.date(), latest_norgate_date.date()))
+        _required_stats = ['Avg_Winner_Bars', 'Avg_Loser_Bars']
+        for sig in SIGNALS:
+            if f'{sig}_Win_Rate' in cached.columns:
+                if any(f'{sig}_{s}' not in cached.columns for s in _required_stats):
+                    columns_ok = False
+                break
+
+        if days_stale is not None and days_stale == 0 and columns_ok:
+            print("[ETF] Signals loaded from cache (up to date after stripping live rows)")
+            return cached
+        elif (days_stale is not None and 1 <= days_stale <= INCREMENTAL_MAX_DAYS and columns_ok):
+            print(f"[ETF] Signals cache stale by {days_stale} trading day(s), running incremental update...")
+            try:
+                return _incremental_update_etf_signals(cached, days_stale=days_stale)
+            except Exception as exc:
+                print(f"[ETF] Incremental update failed ({exc}), falling back to full rebuild...")
+        else:
+            if not columns_ok:
+                print("[ETF] Signals cache outdated (schema changed), full rebuild...")
+            else:
+                print(f"[ETF] Signals cache outdated (stale by {days_stale} days), full rebuild...")
+    else:
+        print("[ETF] No signals cache found, building from scratch...")
+
+    all_etf_tickers = sorted({t for tickers in ETF_UNIVERSE.values() for t in tickers})
+    print(f"[ETF] Total unique ETFs in universe: {len(all_etf_tickers)}")
+    print("=" * 60)
+
+    base_keep = [
+        'Date', 'Ticker',
+        'Open', 'High', 'Low', 'Close', 'Volume',
+        'RV', 'RV_EMA', 'Trend',
+        'Resistance_Pivot', 'Support_Pivot',
+        'Rotation_Open', 'Up_Range', 'Down_Range',
+        'Up_Range_EMA', 'Down_Range_EMA',
+        'Upper_Target', 'Lower_Target',
+        'Is_Up_Rotation', 'Is_Down_Rotation',
+        'Is_Breakout', 'Is_Breakdown', 'Is_BTFD', 'Is_STFR',
+        'Is_Breakout_Sequence',
+        'Rotation_ID', 'BTFD_Triggered', 'STFR_Triggered',
+    ]
+    signal_cols = []
+    for sig in SIGNALS:
+        signal_cols.extend([
+            f'{sig}_Entry_Price', f'{sig}_Exit_Date', f'{sig}_Exit_Price',
+            f'{sig}_Final_Change', f'{sig}_MFE', f'{sig}_MAE',
+            f'{sig}_Win_Rate', f'{sig}_Avg_Winner', f'{sig}_Avg_Loser',
+            f'{sig}_Avg_Winner_Bars', f'{sig}_Avg_Loser_Bars',
+            f'{sig}_Avg_MFE', f'{sig}_Avg_MAE',
+            f'{sig}_Std_Dev', f'{sig}_Historical_EV', f'{sig}_EV_Last_3',
+            f'{sig}_Risk_Adj_EV', f'{sig}_Risk_Adj_EV_Last_3', f'{sig}_Count'
+        ])
+    keep_set = set(base_keep + signal_cols)
+
+    all_signals = []
+    failed_tickers = []
+
+    def _safe_build(t):
+        try:
+            return t, build_signals_for_ticker(t)
+        except Exception:
+            return t, None
+
+    max_workers = min(8, (os.cpu_count() or 4))
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_safe_build, t) for t in all_etf_tickers]
+        processed = 0
+        total = len(all_etf_tickers)
+        last_milestone = 0
+        for fut in futures:
+            t, result = fut.result()
+            processed += 1
+            percent = int((processed / total) * 100) if total else 100
+            milestone = percent // 10 * 10
+            if milestone > last_milestone and milestone % 10 == 0:
+                print(f"  [ETF] {milestone}% complete ({processed} / {total} ETFs)")
+                last_milestone = milestone
+            if result is not None:
+                trim_cols = [c for c in result.columns if c in keep_set]
+                if not trim_cols:
+                    failed_tickers.append(t)
+                    continue
+                trimmed = result[trim_cols].dropna(axis=1, how='all')
+                if trimmed.empty:
+                    failed_tickers.append(t)
+                    continue
+                all_signals.append(trimmed)
+            else:
+                failed_tickers.append(t)
+
+    if not all_signals:
+        print("[ETF] No signals generated for any ETFs.")
+        return pd.DataFrame()
+
+    print("=" * 60)
+    print(f"[ETF] Signal generation complete")
+    print(f"  Successful: {len(all_signals)} ETFs")
+    print(f"  Failed: {len(failed_tickers)} ETFs")
+    print(f"  Total time: {time.time() - etf_start:.1f}s")
+    print("=" * 60)
+
+    clean_frames = [df.dropna(axis=1, how='all') for df in all_signals if not df.empty]
+    etf_signals_df = pd.concat(clean_frames, ignore_index=True)
+    del all_signals, clean_frames
+    etf_signals_df = etf_signals_df.dropna(axis=1, how='all')
+
+    # Dtype optimization
+    bool_cols = ['Is_Up_Rotation', 'Is_Down_Rotation', 'Is_Breakout', 'Is_Breakdown',
+                 'Is_BTFD', 'Is_STFR', 'Is_Breakout_Sequence', 'BTFD_Triggered', 'STFR_Triggered']
+    for col in bool_cols:
+        if col in etf_signals_df.columns:
+            etf_signals_df[col] = etf_signals_df[col].fillna(False).astype(bool)
+    if 'Trend' in etf_signals_df.columns:
+        etf_signals_df['Trend'] = etf_signals_df['Trend'].map({True: 1.0, False: 0.0, None: np.nan}).astype('float32')
+    if 'Rotation_ID' in etf_signals_df.columns:
+        etf_signals_df['Rotation_ID'] = etf_signals_df['Rotation_ID'].fillna(0).astype('int32')
+    float32_prefixes = ['Win_Rate', 'Avg_Winner', 'Avg_Loser', 'Avg_Winner_Bars', 'Avg_Loser_Bars', 'Avg_MFE', 'Avg_MAE',
+                        'Historical_EV', 'Std_Dev', 'Risk_Adj_EV', 'EV_Last_3',
+                        'Risk_Adj_EV_Last_3', 'Count']
+    for col in etf_signals_df.columns:
+        for prefix in float32_prefixes:
+            if col.endswith(prefix) and etf_signals_df[col].dtype == 'float64':
+                etf_signals_df[col] = etf_signals_df[col].astype('float32')
+                break
+
+    etf_signals_df = etf_signals_df.copy()
+    etf_signals_df['Source'] = 'norgate'
+    pq.write_table(pa.Table.from_pandas(etf_signals_df, preserve_index=False),
+                    ETF_SIGNALS_CACHE_FILE, compression='snappy', use_dictionary=False)
+    print(f"[ETF] Saved: {ETF_SIGNALS_CACHE_FILE} ({len(etf_signals_df)} rows, {etf_signals_df['Ticker'].nunique()} ETFs)")
+    etf_signals_df = etf_signals_df.drop(columns=['Source'])
+    return etf_signals_df
+
+
+etf_signals_df = load_or_build_etf_signals()
+print(f"[ETF] {len(etf_signals_df)} rows, {etf_signals_df['Ticker'].nunique()} ETFs ready")
+
 
 # %% [markdown]
 ## Basket Processing
@@ -2744,7 +3425,10 @@ def _prebuild_equity_cache_from_signals(all_df):
         ('Momentum Losers', MOMENTUM_LOSERS_UNIVERSE, 'thematic'),
         ('High Dividend Yield', HIGH_YIELD_UNIVERSE, 'thematic'),
         ('Dividend Growth', DIV_GROWTH_UNIVERSE, 'thematic'),
+        ('Dividend with Growth', DIV_WITH_GROWTH_UNIVERSE, 'thematic'),
         ('Risk Adj Momentum', RISK_ADJ_MOM_UNIVERSE, 'thematic'),
+        ('Size', SIZE_UNIVERSE, 'thematic'),
+        ('Volume Growth', VOLUME_GROWTH_UNIVERSE, 'thematic'),
     ]
     specs += [(name, uni, 'sector') for name, uni in SECTOR_UNIVERSES.items()]
     specs += [(name, uni, 'industry') for name, uni in INDUSTRY_UNIVERSES.items()]
@@ -4354,7 +5038,10 @@ all_baskets = [
     ('Momentum Losers',     MOMENTUM_LOSERS_UNIVERSE, THEMATIC_CHARTS_FOLDER, 'thematic'),
     ('High Dividend Yield', HIGH_YIELD_UNIVERSE,      THEMATIC_CHARTS_FOLDER, 'thematic'),
     ('Dividend Growth',     DIV_GROWTH_UNIVERSE,      THEMATIC_CHARTS_FOLDER, 'thematic'),
+    ('Dividend with Growth', DIV_WITH_GROWTH_UNIVERSE, THEMATIC_CHARTS_FOLDER, 'thematic'),
     ('Risk Adj Momentum',   RISK_ADJ_MOM_UNIVERSE,    THEMATIC_CHARTS_FOLDER, 'thematic'),
+    ('Size',                SIZE_UNIVERSE,            THEMATIC_CHARTS_FOLDER, 'thematic'),
+    ('Volume Growth',       VOLUME_GROWTH_UNIVERSE,   THEMATIC_CHARTS_FOLDER, 'thematic'),
 ]
 all_baskets += [(s, u, SECTOR_CHARTS_FOLDER, 'sector') for s, u in SECTOR_UNIVERSES.items()]
 all_baskets += [(ind, u, INDUSTRY_CHARTS_FOLDER, 'industry') for ind, u in INDUSTRY_UNIVERSES.items()]
@@ -5092,6 +5779,122 @@ def append_live_today_to_signals_parquet():
     print(f"[live] Appended {len(new_rows)} live rows for {pd.Timestamp(today).date()} to {SIGNALS_CACHE_FILE.name}")
 
 
+def export_today_etf_signals(live_ctx=None):
+    """Export live OHLC for ETF universe to a separate parquet file.
+
+    Mirrors the live OHLC export portion of export_today_signals but for ETFs.
+    Reuses the same live update gate and Databento OHLC fetcher.
+    """
+    if live_ctx is None:
+        gate = _get_live_update_gate()
+        if not gate.get('should_live_update', False):
+            return None
+        current_key = f"{gate['spy_trade_date'].year} Q{(gate['spy_trade_date'].month - 1) // 3 + 1}"
+    else:
+        current_key = live_ctx.get('current_key')
+        gate = None
+
+    etf_universe = ETF_UNIVERSE.get(current_key, set())
+    if not etf_universe:
+        print(f"[ETF live] No ETF universe found for {current_key}")
+        return None
+
+    etf_tickers = sorted(t for t in etf_universe if '-' not in t)
+    live_ohlc_map = get_live_ohlc_bars(etf_tickers)
+    if not live_ohlc_map:
+        print("[ETF live] No live OHLC data for ETFs")
+        return None
+
+    _today_str = pd.Timestamp(gate['spy_trade_date'] if gate else live_ctx['today']).strftime('%Y-%m-%d')
+    _rows = [{'Date': _today_str, 'Ticker': t,
+              'Open': v['Open'], 'High': v['High'],
+              'Low': v['Low'], 'Close': v['Close']}
+             for t, v in live_ohlc_map.items()]
+    _live_ohlc_df = pd.DataFrame(_rows)
+    _etf_live_ohlc_path = paths.data / 'live_signals_etf_50.parquet'
+    _live_ohlc_df.to_parquet(_etf_live_ohlc_path, index=False)
+    print(f"[ETF live] Saved live OHLC ({len(_live_ohlc_df)} ETFs): {_etf_live_ohlc_path}")
+    return None
+
+
+def append_live_today_to_etf_signals_parquet():
+    """Build today's ETF signal rows from live OHLC and append to ETF signals parquet.
+
+    Mirrors append_live_today_to_signals_parquet but for ETFs.
+    """
+    gate = _get_live_update_gate()
+    if not gate.get('should_live_update', False):
+        return
+
+    ctx = _get_live_update_context()
+    if ctx is None:
+        return
+
+    today = ctx['today']
+    current_key = ctx['current_key']
+    live_dt = ctx['live_dt']
+
+    etf_universe = ETF_UNIVERSE.get(current_key, set())
+    if not etf_universe:
+        return
+
+    etf_tickers = sorted(t for t in etf_universe if '-' not in t)
+    live_ohlc_map = get_live_ohlc_bars(etf_tickers)
+    if not live_ohlc_map:
+        return
+
+    # Build last rows from ETF signals (not global all_signals_df)
+    _etf_df = etf_signals_df
+    _before = pd.Timestamp(ctx.get('spy_trade_date', today)).normalize()
+    _etf_df_filtered = _etf_df[pd.to_datetime(_etf_df['Date']).dt.normalize() < _before]
+    last_rows = (
+        _etf_df_filtered.sort_values('Date')
+        .groupby('Ticker', as_index=False)
+        .tail(1)
+        .set_index('Ticker')
+    )
+
+    new_rows = []
+    for ticker in etf_tickers:
+        if ticker not in live_ohlc_map or ticker not in last_rows.index:
+            continue
+        ohlc = live_ohlc_map[ticker]
+        close = ohlc.get('Close')
+        if close is None:
+            continue
+        prev_row = last_rows.loc[ticker]
+        new_row = _build_signals_next_row(
+            prev_row, close, live_dt,
+            live_high=ohlc.get('High'),
+            live_low=ohlc.get('Low'),
+            live_open=ohlc.get('Open'),
+        )
+        if new_row is None:
+            continue
+        new_row['Ticker'] = ticker
+        new_row['Date'] = today
+        new_row['Source'] = 'live'
+        new_rows.append(new_row)
+
+    if not new_rows:
+        return
+
+    today_df = pd.DataFrame(new_rows)
+    if ETF_SIGNALS_CACHE_FILE.exists():
+        try:
+            existing = pd.read_parquet(ETF_SIGNALS_CACHE_FILE)
+            combined = pd.concat([existing, today_df], ignore_index=True)
+        except Exception:
+            combined = today_df
+    else:
+        combined = today_df
+    combined = combined.drop_duplicates(subset=['Date', 'Ticker'], keep='last')
+    combined = combined.sort_values(['Ticker', 'Date']).reset_index(drop=True)
+    pq.write_table(pa.Table.from_pandas(combined, preserve_index=False),
+                    ETF_SIGNALS_CACHE_FILE, compression='snappy', use_dictionary=False)
+    print(f"[ETF live] Appended {len(new_rows)} live rows for {pd.Timestamp(today).date()} to {ETF_SIGNALS_CACHE_FILE.name}")
+
+
 def _get_basket_ohlc_for_reports(group_name, universe_by_qtr, cache_key_name=None):
     cache_name = cache_key_name if cache_key_name else group_name
     if '_slugify_label' in globals():
@@ -5203,7 +6006,8 @@ def _get_latest_norgate_rows_by_ticker(before_date=None):
     df = all_signals_df
     if before_date is not None:
         cutoff = pd.Timestamp(before_date).normalize()
-        df = df[pd.to_datetime(df['Date']).dt.normalize() < cutoff]
+        # all_signals_df['Date'] is already datetime64[ns]
+        df = df[df['Date'] < cutoff]
     return (
         df.sort_values('Date')
         .groupby('Ticker', as_index=False)
@@ -5705,7 +6509,10 @@ def _get_all_basket_specs_for_reports():
         ('Theme: Momentum Losers',     MOMENTUM_LOSERS_UNIVERSE, 'Momentum Losers'),
         ('Theme: High Dividend Yield', HIGH_YIELD_UNIVERSE,      'High Dividend Yield'),
         ('Theme: Dividend Growth',     DIV_GROWTH_UNIVERSE,      'Dividend Growth'),
+        ('Theme: Dividend with Growth', DIV_WITH_GROWTH_UNIVERSE, 'Dividend with Growth'),
         ('Theme: Risk Adj Momentum',   RISK_ADJ_MOM_UNIVERSE,    'Risk Adj Momentum'),
+        ('Theme: Size',                SIZE_UNIVERSE,            'Size'),
+        ('Theme: Volume Growth',       VOLUME_GROWTH_UNIVERSE,   'Volume Growth'),
     ]
     specs += [(f"Sector: {name}", SECTOR_UNIVERSES[name], name) for name in sorted(SECTOR_UNIVERSES.keys())]
     specs += [(f"Industry: {name}", INDUSTRY_UNIVERSES[name], name) for name in sorted(INDUSTRY_UNIVERSES.keys())]
@@ -6117,6 +6924,8 @@ _LIVE_UPDATE_CONTEXT_CACHE = None
 print(f"Databento config: API_KEY={'SET' if DATABENTO_API_KEY else 'MISSING'}, DATASET={DATABENTO_DATASET or 'MISSING'}")
 _live_ctx_for_reports = _get_live_update_context()
 export_today_signals(live_ctx=_live_ctx_for_reports)
+export_today_etf_signals(live_ctx=_live_ctx_for_reports)
+append_live_today_to_etf_signals_parquet()
 export_annual_returns(live_ctx=_live_ctx_for_reports)
 export_annual_returns_by_year(live_ctx=_live_ctx_for_reports)
 export_last_20_days_returns(live_ctx=_live_ctx_for_reports)
@@ -6151,7 +6960,10 @@ def export_group_holdings():
         ("Momentum Losers",     MOMENTUM_LOSERS_UNIVERSE),
         ("High Dividend Yield", HIGH_YIELD_UNIVERSE),
         ("Dividend Growth",     DIV_GROWTH_UNIVERSE),
+        ("Dividend with Growth", DIV_WITH_GROWTH_UNIVERSE),
         ("Risk Adj Momentum",   RISK_ADJ_MOM_UNIVERSE),
+        ("Size",                SIZE_UNIVERSE),
+        ("Volume Growth",       VOLUME_GROWTH_UNIVERSE),
     ]
     for name, universe in thematic_groups:
         tickers = sorted(universe.get(current_qtr, set()))

@@ -25,8 +25,9 @@ module.exports = {
       cwd: path.join(__dirname, "signals"),
       script: "live_loop.py",
       interpreter: path.join(process.env.LOCALAPPDATA, "Python", "pythoncore-3.14-64", "python.exe"),
-      restart_delay: 5000,
-      max_restarts: 10,
+      restart_delay: 30000,
+      max_restarts: 3,
+      min_uptime: 60000,
     },
   ],
 };

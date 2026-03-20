@@ -20,10 +20,11 @@ from typing import List, Optional
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Load .env: check local backend dir first, then shared ~/Documents/Repositories/.env
+# Load .env: check local backend dir first, then repo root, then shared ~/Documents/Repositories/.env
 _local_env = Path(__file__).parent / ".env"
+_repo_root_env = Path(__file__).parent.parent.parent / ".env"
 _shared_env = Path.home() / "Documents" / "Repositories" / ".env"
-env_path = _local_env if _local_env.exists() else _shared_env
+env_path = next((p for p in [_local_env, _repo_root_env, _shared_env] if p.exists()), _shared_env)
 load_dotenv(dotenv_path=env_path, override=True)
 
 app = FastAPI()
@@ -66,6 +67,10 @@ LIVE_SIGNALS_FILE = DATA_STORAGE / "live_signals_500.parquet"
 LIVE_BASKET_SIGNALS_FILE = DATA_STORAGE / "live_basket_signals_500.parquet"
 TOP_500_FILE = DATA_STORAGE / "top500stocks.json"
 GICS_MAPPINGS_FILE = DATA_STORAGE / "gics_mappings_500.json"
+ETF_UNIVERSES_FILE = DATA_STORAGE / "etf_universes_50.json"
+ETF_SIGNALS_FILE = DATA_STORAGE / "signals_etf_50.parquet"
+ETF_LIVE_SIGNALS_FILE = DATA_STORAGE / "live_signals_etf_50.parquet"
+TICKER_NAMES_FILE = DATA_STORAGE / "ticker_names.json"
 
 THEMATIC_CONFIG = {
     "High_Beta": ("beta_universes_500.json", "high"),
@@ -74,7 +79,10 @@ THEMATIC_CONFIG = {
     "Momentum_Losers": ("momentum_universes_500.json", "losers"),
     "High_Dividend_Yield": ("dividend_universes_500.json", "high_yield"),
     "Dividend_Growth": ("dividend_universes_500.json", "div_growth"),
+    "Dividend_with_Growth": ("dividend_universes_500.json", "div_with_growth"),
     "Risk_Adj_Momentum": ("risk_adj_momentum_500.json", None),
+    "Size": ("size_universes_500.json", None),
+    "Volume_Growth": ("volume_growth_universes_500.json", None),
 }
 
 def _read_live_parquet(path):
@@ -130,6 +138,41 @@ def _find_basket_meta(slug):
         if matches:
             return matches[0]
     return None
+
+
+def _resolve_ticker_signals_file(ticker):
+    """Return (signals_file, live_file) for a ticker — ETF parquet if not found in stocks."""
+    if INDIVIDUAL_SIGNALS_FILE.exists():
+        try:
+            df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=['Ticker'],
+                                 filters=[('Ticker', '==', ticker)])
+            if not df.empty:
+                return INDIVIDUAL_SIGNALS_FILE, LIVE_SIGNALS_FILE
+        except Exception:
+            pass
+    if ETF_SIGNALS_FILE.exists():
+        return ETF_SIGNALS_FILE, ETF_LIVE_SIGNALS_FILE
+    return INDIVIDUAL_SIGNALS_FILE, LIVE_SIGNALS_FILE
+
+
+def _read_ticker_parquet(ticker, columns=None, filters=None):
+    """Read signal data for a ticker, trying stock parquet first then ETF."""
+    for sig_file in [INDIVIDUAL_SIGNALS_FILE, ETF_SIGNALS_FILE]:
+        if not sig_file.exists():
+            continue
+        try:
+            filt = [('Ticker', '==', ticker)]
+            if filters:
+                filt.extend(filters)
+            if columns:
+                df = pd.read_parquet(sig_file, columns=columns, filters=filt)
+            else:
+                df = pd.read_parquet(sig_file, filters=filt)
+            if not df.empty:
+                return df
+        except Exception:
+            continue
+    return pd.DataFrame()
 
 
 def clean_data_for_json(df):
@@ -322,6 +365,83 @@ def _tally_breadth(tickers, live_close, last_hist):
     if total == 0:
         return None
     return {'Uptrend_Pct': round(uptrend / total * 100, 1), 'Breakout_Pct': round(bo_seq / total * 100, 1)}
+
+
+def _compute_live_breadth_batch(slugs):
+    """Compute live Uptrend_Pct, Breakout_Pct, Correlation_Pct for multiple baskets in one pass.
+    Returns {slug: {'Uptrend_Pct': ..., 'Breakout_Pct': ..., 'Correlation_Pct': ...}}."""
+    live_df = _read_live_parquet(LIVE_SIGNALS_FILE)
+    if live_df is None:
+        return {}
+
+    # Gather all tickers needed across all baskets
+    basket_tickers = {}
+    all_tickers = set()
+    for slug in slugs:
+        tickers = get_latest_universe_tickers(slug)
+        if tickers:
+            basket_tickers[slug] = tickers
+            all_tickers.update(tickers)
+    if not all_tickers:
+        return {}
+
+    # Read historical signals once for all tickers
+    needed_cols = ['Ticker', 'Date', 'Close', 'Trend', 'Resistance_Pivot', 'Support_Pivot',
+                   'Upper_Target', 'Lower_Target', 'Is_Breakout_Sequence']
+    try:
+        hist = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=needed_cols,
+                               filters=[('Ticker', 'in', list(all_tickers))])
+    except Exception:
+        return {}
+
+    if not _live_is_current(live_df, hist['Date'].max()):
+        return {}
+
+    live_prices = live_df[live_df['Ticker'].isin(all_tickers)].set_index('Ticker')
+    if live_prices.empty:
+        return {}
+    live_close_all = live_prices['Close'].to_dict()
+    last_hist_all = hist.sort_values('Date').groupby('Ticker').tail(1).set_index('Ticker')
+
+    # Read close pivot for correlation (once for all tickers)
+    try:
+        close_df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=['Ticker', 'Date', 'Close'],
+                                    filters=[('Ticker', 'in', list(all_tickers))])
+        close_pivot = close_df.pivot_table(index='Date', columns='Ticker', values='Close').sort_index()
+        live_date = pd.to_datetime(live_df['Date'].iloc[0])
+        live_series = pd.Series(live_close_all, name=live_date)
+        close_pivot = pd.concat([close_pivot, live_series.to_frame().T]).sort_index()
+        returns_pivot = close_pivot.pct_change()
+    except Exception:
+        returns_pivot = None
+
+    result = {}
+    for slug, tickers in basket_tickers.items():
+        # Breadth
+        breadth = _tally_breadth(tickers, live_close_all, last_hist_all)
+        if breadth is None:
+            continue
+        entry = dict(breadth)
+
+        # Correlation from pre-computed returns pivot
+        if returns_pivot is not None:
+            try:
+                basket_cols = [t for t in tickers if t in returns_pivot.columns]
+                if len(basket_cols) >= 2:
+                    recent = returns_pivot[basket_cols].tail(21)
+                    valid = [c for c in basket_cols if recent[c].notna().sum() >= 10]
+                    if len(valid) >= 2:
+                        corr = recent[valid].corr()
+                        mask = np.triu(np.ones(corr.shape, dtype=bool), k=1)
+                        vals = corr.values[mask]
+                        vals = vals[~np.isnan(vals)]
+                        if len(vals) > 0:
+                            entry['Correlation_Pct'] = round(float(np.mean(vals) * 100), 2)
+            except Exception:
+                pass
+
+        result[slug] = entry
+    return result
 
 
 def _compute_live_breadth(basket_name):
@@ -570,7 +690,7 @@ logger.info(f"DATA_STORAGE: {DATA_STORAGE} (exists={DATA_STORAGE.exists()})")
 logger.info(f"INDIVIDUAL_SIGNALS_FILE: {INDIVIDUAL_SIGNALS_FILE} (exists={INDIVIDUAL_SIGNALS_FILE.exists()})")
 
 @app.get("/api/baskets/returns")
-def get_basket_returns(start: str = None, end: str = None, mode: str = "period", basket: str = None, group: str = "all", top_n: int = 10, threshold: float = 0.0, conditions: str = None):
+def get_basket_returns(start: str = None, end: str = None, mode: str = "period", basket: str = None, group: str = "all", top_n: int = 10, threshold: float = 0.0, conditions: str = None, bar_period: str = "1D", metric: str = "returns"):
     """Cross-basket period returns or single-basket daily returns time series."""
     t_names = list(THEMATIC_CONFIG.keys())
     s_names = ["Communication_Services", "Consumer_Discretionary", "Consumer_Staples", "Energy", "Financials", "Health_Care", "Industrials", "Information_Technology", "Materials", "Real_Estate", "Utilities"]
@@ -631,13 +751,27 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
         if global_max is None or live_max > global_max:
             global_max = live_max
 
+    # Collect trading dates from the first available basket (for 1D scroll)
+    _trading_dates = []
+    if not start and not end:
+        for slug in sorted(all_slugs):
+            pf = _find_basket_parquet(slug)
+            if not pf: continue
+            try:
+                tdf = pd.read_parquet(pf, columns=['Date'])
+                tdf['Date'] = pd.to_datetime(tdf['Date'])
+                _trading_dates = sorted(tdf['Date'].dropna().unique())
+                break
+            except Exception:
+                continue
+
     date_range = {
         "min": global_min.strftime('%Y-%m-%d') if global_min else None,
         "max": global_max.strftime('%Y-%m-%d') if global_max else None,
     }
 
     if mode == "daily":
-        # Single basket daily returns
+        # Single basket returns (daily or aggregated by bar_period)
         if not basket:
             raise HTTPException(status_code=400, detail="basket param required for mode=daily")
         if not re.fullmatch(r'[A-Za-z0-9_\-]+', basket):
@@ -666,14 +800,31 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
                 df = pd.concat([before_start.iloc[[-1]], in_range])
             else:
                 df = in_range
-        df['return'] = df['Close'].pct_change()
-        df = df.dropna(subset=['return'])
-        if start_ts is not None:
-            df = df[df['Date'] >= start_ts]
+
+        if bar_period == "1D":
+            df['return'] = df['Close'].pct_change()
+            df = df.dropna(subset=['return'])
+            if start_ts is not None:
+                df = df[df['Date'] >= start_ts]
+            dates_out = [d.strftime('%Y-%m-%d') for d in df['Date']]
+            returns_out = [round(float(r), 6) for r in df['return']]
+        else:
+            # Aggregate into period buckets using last close per period
+            df = df.set_index('Date').sort_index()
+            period_map = {'1W': 'W-FRI', '1M': 'ME', '1Q': 'QE', '1Y': 'YE'}
+            rule = period_map.get(bar_period, 'ME')
+            period_close = df['Close'].resample(rule).last().dropna()
+            period_ret = period_close.pct_change().dropna()
+            if start_ts is not None:
+                period_ret = period_ret[period_ret.index >= start_ts]
+            # Label: use period end date for W, last day of month/quarter/year for others
+            dates_out = [d.strftime('%Y-%m-%d') for d in period_ret.index]
+            returns_out = [round(float(r), 6) for r in period_ret]
+
         return {
             "basket": basket,
-            "dates": [d.strftime('%Y-%m-%d') for d in df['Date']],
-            "returns": [round(float(r), 6) for r in df['return']],
+            "dates": dates_out,
+            "returns": returns_out,
             "date_range": date_range,
         }
 
@@ -693,6 +844,9 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
                     continue
             slugs.append(slug)
 
+        # Pre-compute live metrics for all baskets in one pass
+        live_breadth_batch = _compute_live_breadth_batch(slugs) if live_closes else {}
+
         # Read aligned data for all baskets
         COLS = ['Date', 'Close', 'Uptrend_Pct', 'Breakout_Pct', 'Correlation_Pct', 'RV_EMA']
         basket_frames = {}
@@ -704,13 +858,23 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
                 df = pd.read_parquet(pf, columns=COLS)
                 df['Date'] = pd.to_datetime(df['Date'])
                 df = df.sort_values('Date').drop_duplicates(subset=['Date'])
-                # Append live close if available
+                # Append live close with real-time metrics computed from constituents
                 if slug in live_closes:
                     live_date, live_close = live_closes[slug]
                     if live_date not in df['Date'].values:
+                        lb = live_breadth_batch.get(slug, {})
+                        # Compute live RV_EMA: RV = |ret|, EMA(RV, span=10)
+                        prev_close = df['Close'].iloc[-1]
+                        prev_rv_ema = df['RV_EMA'].iloc[-1]
+                        if pd.notna(prev_close) and prev_close != 0 and pd.notna(prev_rv_ema):
+                            live_rv_ema = 2.0/11.0 * abs(live_close / prev_close - 1) + (1 - 2.0/11.0) * prev_rv_ema
+                        else:
+                            live_rv_ema = np.nan
                         live_row = pd.DataFrame({'Date': [live_date], 'Close': [live_close],
-                                                 'Uptrend_Pct': [np.nan], 'Breakout_Pct': [np.nan],
-                                                 'Correlation_Pct': [np.nan], 'RV_EMA': [np.nan]})
+                                                 'Uptrend_Pct': [lb.get('Uptrend_Pct', np.nan)],
+                                                 'Breakout_Pct': [lb.get('Breakout_Pct', np.nan)],
+                                                 'Correlation_Pct': [lb.get('Correlation_Pct', np.nan)],
+                                                 'RV_EMA': [live_rv_ema]})
                         df = pd.concat([df, live_row], ignore_index=True).sort_values('Date')
                 basket_frames[slug] = df.set_index('Date')
             except Exception:
@@ -870,8 +1034,8 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
         rho_cor = spearman_vec(cur_cor_ranks, rr_cor)
         rho_rv = spearman_vec(cur_rv_ranks, rr_rv)
 
-        # Multi-timeframe return fingerprints
-        MULTI_TF = {"1D": 1, "1W": 5, "1M": 21, "1Q": 63, "1Y": 252, "3Y": 756, "5Y": 1260}
+        # Multi-timeframe fingerprints
+        MULTI_TF = {"1D": 1, "1W": 5, "1M": 21, "1Q": 63, "1Y": 252, "3Y": 756}
         rho_tf_list = []
         cur_tf_returns = {}  # for current.metrics
         for tf_label, W_t in MULTI_TF.items():
@@ -890,6 +1054,35 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
             rr_tf = rank_matrix(roll_tf_mat, descending=True)
             rho_tf = spearman_vec(cur_tf_ranks, rr_tf)
             rho_tf_list.append(rho_tf)
+
+        # Multi-timeframe absolute change for non-return metrics (vol, corr, breadth, breakout)
+        METRIC_MATS = {
+            'rv_ema': (rv_mat, False),        # ascending: 1 = lowest vol
+            'correlation_pct': (corr_mat, False),  # ascending: 1 = lowest corr
+            'uptrend_pct': (uptrend_mat, True),    # descending: 1 = highest breadth
+            'breakout_pct': (breakout_mat, True),  # descending: 1 = highest breakout
+        }
+        cur_tf_metrics = {}   # metric_name -> {tf_label -> vec of per-basket change}
+        for metric_name, (mat, desc) in METRIC_MATS.items():
+            cur_tf_metrics[metric_name] = {}
+            for tf_label, W_t in MULTI_TF.items():
+                if end_idx < W_t:
+                    continue
+                prev_val = mat[max(0, end_idx - W_t)]
+                cur_val = mat[end_idx]
+                chg = cur_val - prev_val
+                cur_tf_metrics[metric_name][tf_label] = chg
+                cur_chg_ranks = rank_vec(chg, descending=desc)
+                # Rolling version for similarity
+                roll_chg_mat = np.full((N_windows, B), np.nan)
+                for i in range(N_windows):
+                    e = i + W
+                    s_tf = e - W_t
+                    if s_tf >= 0 and e < T:
+                        roll_chg_mat[i] = mat[e] - mat[s_tf]
+                rr_chg = rank_matrix(roll_chg_mat, descending=desc)
+                rho_chg = spearman_vec(cur_chg_ranks, rr_chg)
+                rho_tf_list.append(rho_chg)
 
         # Cross-basket correlation similarity
         rho_xc = np.zeros(N_windows)
@@ -946,14 +1139,29 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
         current_returns = {}
         current_metrics = {"uptrend_pct": {}, "breakout_pct": {}, "correlation_pct": {}, "rv_ema": {}}
         current_ranks = {"returns": {}, "uptrend_pct": {}, "breakout_pct": {}, "correlation_pct": {}, "rv_ema": {}}
-        # Build multi-TF rank vectors
+        # Build multi-TF rank vectors for returns
         cur_tf_rank_vecs = {}
         for tf_label in MULTI_TF:
             if tf_label in cur_tf_returns:
                 cur_tf_rank_vecs[tf_label] = rank_vec(cur_tf_returns[tf_label], descending=True)
+        # Init multi-TF metric keys for returns
         for tf_label in MULTI_TF:
             current_metrics[f"returns_{tf_label}"] = {}
             current_ranks[f"returns_{tf_label}"] = {}
+        # Init multi-TF metric keys for non-return metrics
+        for metric_name, (_, desc) in METRIC_MATS.items():
+            for tf_label in MULTI_TF:
+                current_metrics[f"{metric_name}_{tf_label}"] = {}
+                current_ranks[f"{metric_name}_{tf_label}"] = {}
+        # Build rank vectors for non-return multi-TF
+        cur_tf_metric_rank_vecs = {}
+        for metric_name, (_, desc) in METRIC_MATS.items():
+            cur_tf_metric_rank_vecs[metric_name] = {}
+            for tf_label in MULTI_TF:
+                if metric_name in cur_tf_metrics and tf_label in cur_tf_metrics[metric_name]:
+                    cur_tf_metric_rank_vecs[metric_name][tf_label] = rank_vec(
+                        cur_tf_metrics[metric_name][tf_label], descending=desc)
+
         current_metrics["cross_basket_corr"] = round(float(cur_xc), 4) if cur_xc is not None else None
         for j, slug in enumerate(ordered_slugs):
             r = cur_ret[j]
@@ -962,12 +1170,12 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
             current_metrics["breakout_pct"][slug] = round(float(breakout_mat[end_idx, j]), 2) if not np.isnan(breakout_mat[end_idx, j]) else None
             current_metrics["correlation_pct"][slug] = round(float(corr_mat[end_idx, j]), 2) if not np.isnan(corr_mat[end_idx, j]) else None
             current_metrics["rv_ema"][slug] = round(float(rv_mat[end_idx, j]), 6) if not np.isnan(rv_mat[end_idx, j]) else None
-            # Ranks (1-based, B = worst)
             current_ranks["returns"][slug] = int(cur_ret_ranks[j])
             current_ranks["uptrend_pct"][slug] = int(cur_upt_ranks[j])
             current_ranks["breakout_pct"][slug] = int(cur_bkt_ranks[j])
             current_ranks["correlation_pct"][slug] = int(cur_cor_ranks[j])
             current_ranks["rv_ema"][slug] = int(cur_rv_ranks[j])
+            # Multi-TF returns
             for tf_label in MULTI_TF:
                 if tf_label in cur_tf_returns:
                     v = cur_tf_returns[tf_label][j]
@@ -976,6 +1184,16 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
                 else:
                     current_metrics[f"returns_{tf_label}"][slug] = None
                     current_ranks[f"returns_{tf_label}"][slug] = None
+            # Multi-TF non-return metrics (% change)
+            for metric_name in METRIC_MATS:
+                for tf_label in MULTI_TF:
+                    if metric_name in cur_tf_metrics and tf_label in cur_tf_metrics[metric_name]:
+                        v = cur_tf_metrics[metric_name][tf_label][j]
+                        current_metrics[f"{metric_name}_{tf_label}"][slug] = round(float(v), 6) if not np.isnan(v) else None
+                        current_ranks[f"{metric_name}_{tf_label}"][slug] = int(cur_tf_metric_rank_vecs[metric_name][tf_label][j])
+                    else:
+                        current_metrics[f"{metric_name}_{tf_label}"][slug] = None
+                        current_ranks[f"{metric_name}_{tf_label}"][slug] = None
 
         analogs = []
         HORIZONS = {"1M": 21, "1Q": 63, "6M": 126, "1Y": 252}
@@ -1124,6 +1342,8 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
                 if group == "industries" and cat != "industry": continue
             slugs.append(slug)
 
+        q_live_breadth = _compute_live_breadth_batch(slugs) if live_closes else {}
+
         COLS = ['Date', 'Close', 'Uptrend_Pct', 'Breakout_Pct', 'Correlation_Pct', 'RV_EMA']
         basket_frames = {}
         for slug in slugs:
@@ -1136,9 +1356,18 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
                 if slug in live_closes:
                     ld, lc = live_closes[slug]
                     if ld not in df['Date'].values:
+                        lb = q_live_breadth.get(slug, {})
+                        prev_c = df['Close'].iloc[-1]
+                        prev_rv = df['RV_EMA'].iloc[-1]
+                        if pd.notna(prev_c) and prev_c != 0 and pd.notna(prev_rv):
+                            l_rv = 2.0/11.0 * abs(lc/prev_c - 1) + (1 - 2.0/11.0) * prev_rv
+                        else:
+                            l_rv = np.nan
                         df = pd.concat([df, pd.DataFrame({'Date': [ld], 'Close': [lc],
-                            'Uptrend_Pct': [np.nan], 'Breakout_Pct': [np.nan],
-                            'Correlation_Pct': [np.nan], 'RV_EMA': [np.nan]})],
+                            'Uptrend_Pct': [lb.get('Uptrend_Pct', np.nan)],
+                            'Breakout_Pct': [lb.get('Breakout_Pct', np.nan)],
+                            'Correlation_Pct': [lb.get('Correlation_Pct', np.nan)],
+                            'RV_EMA': [l_rv]})],
                             ignore_index=True).sort_values('Date')
                 basket_frames[slug] = df.set_index('Date')
             except Exception:
@@ -1191,8 +1420,27 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
                 mat[lb:] = close_mat[lb:] / close_mat[:-lb] - 1
             ret_mats[key] = mat
 
+        # Change matrices for non-return metrics (absolute difference over lookback)
+        NR_MATS = {
+            "uptrend_pct": q_uptrend_mat,
+            "breakout_pct": q_breakout_mat,
+            "correlation_pct": q_corr_mat,
+            "rv_ema": q_rv_mat,
+        }
+        NR_LOOKBACKS = {"1D": 1, "1W": 5, "1M": 21, "1Q": 63, "1Y": 252}
+        nr_change_mats = {}
+        for nr_name, nr_mat in NR_MATS.items():
+            for tf, lb in NR_LOOKBACKS.items():
+                key = f"{nr_name}_{tf}"
+                mat = np.full((T, B), np.nan)
+                if lb < T:
+                    mat[lb:] = nr_mat[lb:] - nr_mat[:-lb]
+                nr_change_mats[key] = mat
+
         metric_mats = {
             **ret_mats,
+            **nr_change_mats,
+            # Keep raw level versions for backward compat
             "uptrend_pct": q_uptrend_mat,
             "breakout_pct": q_breakout_mat,
             "correlation_pct": q_corr_mat,
@@ -1374,6 +1622,72 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
             "date_range": date_range,
         }
 
+    # mode=cumulative: daily cumulative return series for all baskets
+    if mode == "cumulative":
+        if not start and not end and global_max:
+            end_dt = global_max
+            start_dt = end_dt - pd.DateOffset(years=1)
+            start = start_dt.strftime('%Y-%m-%d')
+            end = end_dt.strftime('%Y-%m-%d')
+
+        # Determine which column to read based on metric
+        metric_col_map = {"returns": "Close", "volatility": "RV_EMA", "correlation": "Correlation_Pct"}
+        data_col = metric_col_map.get(metric, "Close")
+        read_cols = ['Date', data_col] if data_col != 'Close' else ['Date', 'Close']
+
+        # Collect series per basket
+        basket_series = {}
+        for slug in sorted(all_slugs):
+            cat = _categorize(slug)
+            if group != "all":
+                if group == "themes" and cat != "theme": continue
+                if group == "sectors" and cat != "sector": continue
+                if group == "industries" and cat != "industry": continue
+            pf = _find_basket_parquet(slug)
+            if not pf: continue
+            try:
+                df = pd.read_parquet(pf, columns=read_cols)
+                df['Date'] = pd.to_datetime(df['Date'])
+                df = df.sort_values('Date').dropna(subset=[data_col])
+                if data_col == 'Close' and slug in live_closes:
+                    live_date, live_close = live_closes[slug]
+                    if live_date not in df['Date'].values:
+                        live_row = pd.DataFrame({'Date': [live_date], 'Close': [live_close]})
+                        df = pd.concat([df, live_row], ignore_index=True).sort_values('Date')
+                if end:
+                    df = df[df['Date'] <= pd.Timestamp(end)]
+                if start:
+                    start_ts = pd.Timestamp(start)
+                    before = df[df['Date'] < start_ts]
+                    in_range = df[df['Date'] >= start_ts]
+                    if not before.empty:
+                        df = pd.concat([before.iloc[[-1]], in_range])
+                    else:
+                        df = in_range
+                if len(df) < 2: continue
+                base_val = float(df.iloc[0][data_col])
+                if base_val == 0: continue
+                df = df.iloc[1:]  # drop anchor row
+                vals = [(float(v) / base_val) - 1 for v in df[data_col]]
+                dates = [d.strftime('%Y-%m-%d') for d in df['Date']]
+                basket_series[slug] = {"name": slug, "group": cat, "dates": dates, "values": vals}
+            except Exception:
+                continue
+
+        # Build unified date index
+        all_dates_set = set()
+        for bs in basket_series.values():
+            all_dates_set.update(bs["dates"])
+        unified_dates = sorted(all_dates_set)
+
+        series = []
+        for bs in basket_series.values():
+            date_to_val = dict(zip(bs["dates"], bs["values"]))
+            vals = [date_to_val.get(d, None) for d in unified_dates]
+            series.append({"name": bs["name"], "group": bs["group"], "values": vals})
+
+        return {"dates": unified_dates, "series": series, "date_range": date_range}
+
     # mode=period: one return per basket
     # Default to 1Y range if no dates specified
     if not start and not end and global_max:
@@ -1381,6 +1695,10 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
         start_dt = end_dt - pd.DateOffset(years=1)
         start = start_dt.strftime('%Y-%m-%d')
         end = end_dt.strftime('%Y-%m-%d')
+
+    metric_col_map_p = {"returns": "Close", "volatility": "RV_EMA", "correlation": "Correlation_Pct"}
+    data_col_p = metric_col_map_p.get(metric, "Close")
+    read_cols_p = ['Date', data_col_p] if data_col_p != 'Close' else ['Date', 'Close']
 
     baskets = []
     for slug in sorted(all_slugs):
@@ -1396,18 +1714,17 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
         if not pf:
             continue
         try:
-            df = pd.read_parquet(pf, columns=['Date', 'Close'])
+            df = pd.read_parquet(pf, columns=read_cols_p)
             df['Date'] = pd.to_datetime(df['Date'])
-            df = df.sort_values('Date').dropna(subset=['Close'])
-            # Append live row if available
-            if slug in live_closes:
+            df = df.sort_values('Date').dropna(subset=[data_col_p])
+            if data_col_p == 'Close' and slug in live_closes:
                 live_date, live_close = live_closes[slug]
                 if live_date not in df['Date'].values:
                     live_row = pd.DataFrame({'Date': [live_date], 'Close': [live_close]})
                     df = pd.concat([df, live_row], ignore_index=True).sort_values('Date')
             if end:
                 df = df[df['Date'] <= pd.Timestamp(end)]
-            # Keep one anchor row before start for the opening price
+            # Grab anchor row before start for % change calculation
             if start:
                 start_ts = pd.Timestamp(start)
                 before = df[df['Date'] < start_ts]
@@ -1418,17 +1735,20 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
                     df = in_range
             if len(df) < 2:
                 continue
-            first_close = float(df.iloc[0]['Close'])
-            last_close = float(df.iloc[-1]['Close'])
-            if first_close == 0:
+            first_val = float(df.iloc[0][data_col_p])
+            last_val = float(df.iloc[-1][data_col_p])
+            if first_val == 0:
                 continue
-            ret = (last_close / first_close) - 1
+            ret = (last_val / first_val) - 1
             baskets.append({"name": slug, "group": cat, "return": round(ret, 6)})
         except Exception:
             continue
 
     actual_range = {"start": start, "end": end}
-    return {"baskets": baskets, "date_range": date_range, "actual_range": actual_range}
+    resp = {"baskets": baskets, "date_range": date_range, "actual_range": actual_range}
+    if _trading_dates:
+        resp["trading_dates"] = [d.strftime('%Y-%m-%d') if hasattr(d, 'strftime') else pd.Timestamp(d).strftime('%Y-%m-%d') for d in _trading_dates]
+    return resp
 
 @app.get("/api/baskets/{basket_name}")
 def get_basket_data(basket_name: str):
@@ -1516,6 +1836,46 @@ def list_tickers_by_quarter():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/etfs")
+def list_etfs():
+    """Return sorted ETF ticker list from the latest quarter in the ETF universe cache."""
+    if not ETF_UNIVERSES_FILE.exists():
+        return []
+    try:
+        with open(ETF_UNIVERSES_FILE, 'r') as f:
+            data = json.load(f)
+        qs = sorted(data.keys())
+        if qs:
+            return sorted(data[qs[-1]])
+        return []
+    except Exception:
+        return []
+
+@app.get("/api/etfs/quarters")
+def list_etfs_by_quarter():
+    """Return all quarters and their ETF universes from etf_universes_50.json."""
+    if not ETF_UNIVERSES_FILE.exists():
+        return {"quarters": [], "etfs_by_quarter": {}}
+    try:
+        with open(ETF_UNIVERSES_FILE, 'r') as f:
+            data = json.load(f)
+        quarters = sorted(data.keys(), reverse=True)
+        etfs_by_quarter = {q: sorted(data[q]) for q in quarters}
+        return {"quarters": quarters, "etfs_by_quarter": etfs_by_quarter}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/ticker-names")
+def get_ticker_names():
+    """Return ticker → security name mapping."""
+    if not TICKER_NAMES_FILE.exists():
+        return {}
+    try:
+        with open(TICKER_NAMES_FILE, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
 @app.get("/api/live-signals")
 def list_live_signal_tickers():
     """Return sorted list of tickers where a signal fires TODAY (recomputed with live prices)."""
@@ -1598,6 +1958,57 @@ def list_live_signal_tickers():
             if fired:
                 results.append({"symbol": ticker, "signals": fired})
 
+        # Also process ETF signals from separate parquet
+        if ETF_SIGNALS_FILE.exists():
+            try:
+                etf_universe = None
+                if ETF_UNIVERSES_FILE.exists():
+                    with open(ETF_UNIVERSES_FILE, 'r') as f:
+                        etf_data = json.load(f)
+                        etf_qs = sorted(etf_data.keys())
+                        if etf_qs:
+                            etf_universe = set(etf_data[etf_qs[-1]])
+                etf_df = pd.read_parquet(ETF_SIGNALS_FILE, columns=_SIGNAL_COLS,
+                                         filters=[('Date', '>=', cutoff)])
+                etf_df = etf_df.sort_values('Date')
+                etf_latest = etf_df.groupby('Ticker').tail(1)
+                etf_max_date = etf_latest['Date'].max()
+                etf_latest = etf_latest[etf_latest['Date'] >= etf_max_date]
+                if etf_universe is not None:
+                    etf_latest = etf_latest[etf_latest['Ticker'].isin(etf_universe)]
+
+                etf_live_df = _read_live_parquet(ETF_LIVE_SIGNALS_FILE)
+                if etf_live_df is not None and not etf_live_df.empty and _live_is_current(etf_live_df, etf_max_date):
+                    etf_live_ohlc = {}
+                    for _, lr in etf_live_df.iterrows():
+                        t = lr.get('Ticker')
+                        if t and pd.notna(lr.get('Close')):
+                            etf_live_ohlc[t] = {
+                                'Close': float(lr['Close']),
+                                'Open': float(lr['Open']) if pd.notna(lr.get('Open')) else None,
+                                'High': float(lr['High']) if pd.notna(lr.get('High')) else None,
+                                'Low': float(lr['Low']) if pd.notna(lr.get('Low')) else None,
+                            }
+                    for _, row in etf_latest.iterrows():
+                        ticker = row['Ticker']
+                        if ticker not in etf_live_ohlc:
+                            continue
+                        ohlc = etf_live_ohlc[ticker]
+                        new_row = signals_engine._build_signals_next_row(
+                            row, ohlc['Close'], now,
+                            live_high=ohlc.get('High'),
+                            live_low=ohlc.get('Low'),
+                            live_open=ohlc.get('Open'),
+                        )
+                        if new_row is None:
+                            continue
+                        fired = [name for flag_col, name in signal_flag_to_name.items()
+                                 if bool(new_row.get(flag_col, False))]
+                        if fired:
+                            results.append({"symbol": ticker, "signals": fired})
+            except Exception:
+                logger.exception("live-signals ETF processing failed")
+
         results.sort(key=lambda x: x["symbol"])
         return results
     except Exception as e:
@@ -1669,10 +2080,16 @@ def get_ticker_signals():
                 if pd.notna(prev_close) and pd.notna(curr_close) and prev_close != 0:
                     pct = round(float(curr_close / prev_close - 1) * 100, 2)
 
-            # Dollar volume from latest row
+            # Dollar volume — use prior row's Volume if latest (live) row has Volume=0
             dv = None
-            if pd.notna(final.get('Close')) and pd.notna(final.get('Volume')):
-                dv = round(float(final['Close']) * float(final['Volume']))
+            vol = final.get('Volume')
+            if (not vol or vol == 0) and len(rows) >= 2:
+                vol = rows.iloc[-2].get('Volume')
+                close_for_dv = rows.iloc[-2].get('Close')
+            else:
+                close_for_dv = final.get('Close')
+            if pd.notna(close_for_dv) and pd.notna(vol) and vol > 0:
+                dv = round(float(close_for_dv) * float(vol))
 
             # Last price
             last_price = None
@@ -1702,6 +2119,72 @@ def get_ticker_signals():
                         if pd.notna(prev_close) and prev_close != 0:
                             result[t]['pct_change'] = round(float(live_close / prev_close - 1) * 100, 2)
 
+        # Merge ETF signals from separate parquet
+        if ETF_SIGNALS_FILE.exists():
+            try:
+                etf_df = pd.read_parquet(ETF_SIGNALS_FILE, columns=cols,
+                                         filters=[('Date', '>=', cutoff)])
+                etf_df = etf_df.sort_values(['Ticker', 'Date'])
+                etf_last2 = etf_df.groupby('Ticker').tail(2)
+                for ticker, group in etf_last2.groupby('Ticker'):
+                    rows_e = group.sort_values('Date')
+                    final = rows_e.iloc[-1]
+                    lt = None
+                    val = final.get('Is_Breakout_Sequence')
+                    if pd.notna(val):
+                        lt = 'BO' if bool(val) else 'BD'
+                    st = None
+                    trend_val = final.get('Trend')
+                    if pd.notna(trend_val):
+                        st = 'Up' if int(trend_val) == 1 else 'Dn'
+                    mr = None
+                    btfd_open = pd.notna(final.get('BTFD_Entry_Price')) and pd.isna(final.get('BTFD_Exit_Date'))
+                    stfr_open = pd.notna(final.get('STFR_Entry_Price')) and pd.isna(final.get('STFR_Exit_Date'))
+                    if btfd_open and stfr_open:
+                        mr = 'STFR'
+                    elif btfd_open:
+                        mr = 'BTFD'
+                    elif stfr_open:
+                        mr = 'STFR'
+                    pct = None
+                    if len(rows_e) >= 2:
+                        prev_close = rows_e.iloc[-2]['Close']
+                        curr_close = final['Close']
+                        if pd.notna(prev_close) and pd.notna(curr_close) and prev_close != 0:
+                            pct = round(float(curr_close / prev_close - 1) * 100, 2)
+                    # Use prior row's Volume if latest (live) row has Volume=0
+                    dv = None
+                    vol = final.get('Volume')
+                    if (not vol or vol == 0) and len(rows_e) >= 2:
+                        vol = rows_e.iloc[-2].get('Volume')
+                        close_for_dv = rows_e.iloc[-2].get('Close')
+                    else:
+                        close_for_dv = final.get('Close')
+                    if pd.notna(close_for_dv) and pd.notna(vol) and vol > 0:
+                        dv = round(float(close_for_dv) * float(vol))
+                    last_price = round(float(final['Close']), 2) if pd.notna(final.get('Close')) else None
+                    result[ticker] = {
+                        'lt_trend': lt, 'st_trend': st, 'mean_rev': mr,
+                        'pct_change': float(pct) if pct is not None else None,
+                        'dollar_vol': int(dv) if dv is not None else None,
+                        'last_price': last_price,
+                    }
+                # Override with ETF live data
+                etf_live_df = _read_live_parquet(ETF_LIVE_SIGNALS_FILE)
+                if etf_live_df is not None and _live_is_current(etf_live_df, pd.to_datetime(etf_df['Date']).max()):
+                    for _, lr in etf_live_df.iterrows():
+                        t = lr.get('Ticker')
+                        if t and pd.notna(lr.get('Close')) and t in result:
+                            live_close = float(lr['Close'])
+                            result[t]['last_price'] = round(live_close, 2)
+                            etf_rows = etf_last2[etf_last2['Ticker'] == t].sort_values('Date')
+                            if len(etf_rows) >= 1:
+                                prev_close = etf_rows.iloc[-1]['Close']
+                                if pd.notna(prev_close) and prev_close != 0:
+                                    result[t]['pct_change'] = round(float(live_close / prev_close - 1) * 100, 2)
+            except Exception:
+                logger.exception("ticker-signals ETF merge failed")
+
         return result
     except Exception as e:
         logger.exception("ticker-signals failed")
@@ -1709,15 +2192,25 @@ def get_ticker_signals():
 
 @app.get("/api/tickers/{ticker}")
 def get_ticker_data(ticker: str):
-    if not INDIVIDUAL_SIGNALS_FILE.exists(): raise HTTPException(status_code=404)
-    try:
+    # Try stock signals first, fall back to ETF signals
+    signals_file = INDIVIDUAL_SIGNALS_FILE
+    live_file = LIVE_SIGNALS_FILE
+    df = pd.DataFrame()
+    if INDIVIDUAL_SIGNALS_FILE.exists():
         df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, filters=[('Ticker', '==', ticker)])
+    if df.empty and ETF_SIGNALS_FILE.exists():
+        df = pd.read_parquet(ETF_SIGNALS_FILE, filters=[('Ticker', '==', ticker)])
+        signals_file = ETF_SIGNALS_FILE
+        live_file = ETF_LIVE_SIGNALS_FILE
+    if df.empty:
+        raise HTTPException(status_code=404, detail=f"No data for ticker {ticker}")
+    try:
         df['Date'] = pd.to_datetime(df['Date'])
 
         # Merge live bar using incremental signal computation (matches live-signals endpoint)
         # Only use the live bar if it's at least as recent as the latest Norgate date;
         # otherwise Norgate already has newer/equal data and the live file is stale.
-        live_df = _read_live_parquet(LIVE_SIGNALS_FILE)
+        live_df = _read_live_parquet(live_file)
         if live_df is not None:
             live_row = live_df[live_df['Ticker'] == ticker]
             if not live_row.empty:
@@ -2568,12 +3061,18 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
             df = pd.read_parquet(basket_file, columns=['Date', 'Close'])
         elif target_type == 'basket_tickers':
             raise HTTPException(status_code=400, detail=f"{sig} not supported for basket_tickers — use basket mode")
+        elif target_type == 'etf':
+            if not ETF_SIGNALS_FILE.exists():
+                raise HTTPException(status_code=404, detail="ETF signals file not found")
+            df = pd.read_parquet(ETF_SIGNALS_FILE, columns=['Ticker', 'Date', 'Close'],
+                                 filters=[('Ticker', '==', target)])
         else:
             if not INDIVIDUAL_SIGNALS_FILE.exists():
                 raise HTTPException(status_code=404, detail="Signals file not found")
-            df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
-                                 columns=['Ticker', 'Date', 'Close'],
+            df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=['Ticker', 'Date', 'Close'],
                                  filters=[('Ticker', '==', target)])
+        if df.empty:
+            raise HTTPException(status_code=404, detail=f"No data for {target}")
         df['Date'] = pd.to_datetime(df['Date'])
         df = df.sort_values('Date').reset_index(drop=True)
         if start_date:
@@ -2708,7 +3207,8 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
                                  filters=[('Ticker', 'in', basket_tickers)])
             df = df[[c for c in base_cols if c in df.columns]]
     else:
-        if not INDIVIDUAL_SIGNALS_FILE.exists():
+        _sig_file = ETF_SIGNALS_FILE if target_type == 'etf' else INDIVIDUAL_SIGNALS_FILE
+        if not _sig_file.exists():
             raise HTTPException(status_code=404, detail="Signals file not found")
         base_cols = ['Ticker', 'Date', 'Close', is_col] + trade_cols
         if use_custom_exit:
@@ -2723,11 +3223,11 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
                 base_cols.append(flt.metric)
         base_cols = list(dict.fromkeys(base_cols))
         try:
-            df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
+            df = pd.read_parquet(_sig_file,
                                  columns=[c for c in base_cols if c],
                                  filters=[('Ticker', '==', target)])
         except Exception:
-            df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
+            df = pd.read_parquet(_sig_file,
                                  filters=[('Ticker', '==', target)])
             df = df[[c for c in base_cols if c in df.columns]]
 
@@ -3083,11 +3583,16 @@ def get_date_range(target_type: str, target: str):
         if not basket_file:
             raise HTTPException(status_code=404, detail=f"Basket file not found for {target}")
         dates = pd.read_parquet(basket_file, columns=['Date'])['Date']
-    else:
-        if not INDIVIDUAL_SIGNALS_FILE.exists():
-            raise HTTPException(status_code=404, detail="Signals file not found")
-        dates = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=['Ticker', 'Date'],
+    elif target_type == 'etf':
+        if not ETF_SIGNALS_FILE.exists():
+            raise HTTPException(status_code=404, detail="ETF signals file not found")
+        dates = pd.read_parquet(ETF_SIGNALS_FILE, columns=['Ticker', 'Date'],
                                 filters=[('Ticker', '==', target)])['Date']
+    else:
+        df = _read_ticker_parquet(target, columns=['Ticker', 'Date'])
+        if df.empty:
+            raise HTTPException(status_code=404, detail="Signals file not found")
+        dates = df['Date']
     dates = pd.to_datetime(dates)
     if dates.empty:
         raise HTTPException(status_code=404, detail="No data found")
@@ -3102,12 +3607,20 @@ def _build_buy_hold(target, target_type, start_date, end_date, direction='long')
         df = pd.read_parquet(basket_file, columns=['Date', 'Close'])
     elif target_type == 'basket_tickers':
         raise HTTPException(status_code=400, detail="Long/Short not supported for basket_tickers mode — use basket mode")
+    elif target_type == 'etf':
+        if not ETF_SIGNALS_FILE.exists():
+            raise HTTPException(status_code=404, detail="ETF signals file not found")
+        df = pd.read_parquet(ETF_SIGNALS_FILE, columns=['Ticker', 'Date', 'Close'],
+                             filters=[('Ticker', '==', target)])
+        if df.empty:
+            raise HTTPException(status_code=404, detail=f"No ETF data for {target}")
     else:
         if not INDIVIDUAL_SIGNALS_FILE.exists():
             raise HTTPException(status_code=404, detail="Signals file not found")
-        df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
-                             columns=['Ticker', 'Date', 'Close'],
+        df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=['Ticker', 'Date', 'Close'],
                              filters=[('Ticker', '==', target)])
+        if df.empty:
+            raise HTTPException(status_code=404, detail=f"No data for {target}")
     df['Date'] = pd.to_datetime(df['Date'])
     df = df.sort_values('Date').reset_index(drop=True)
     date_range = {"min": df['Date'].min().strftime('%Y-%m-%d'), "max": df['Date'].max().strftime('%Y-%m-%d')}
