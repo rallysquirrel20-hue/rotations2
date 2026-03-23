@@ -292,8 +292,11 @@ html, body, #root {
 .col-ticker { flex: 0 0 42px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .col-expand { flex: 8 0 42px; }
 .col-name { flex: 8 1 40px; min-width: 40px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; color: var(--text-muted); padding-left: 4px; }
-.col-wt, .col-lt, .col-st, .col-mr, .col-pct, .col-bkt {
+.col-wt, .col-pct, .col-bkt {
   flex: 1 1 40px; min-width: 28px; text-align: right; font-size: 10px; font-weight: bold;
+}
+.col-lt, .col-st, .col-mr {
+  flex: 1 1 40px; min-width: 28px; text-align: center; font-size: 10px; font-weight: bold;
 }
 .col-price {
   flex: 1 1 50px; min-width: 36px; text-align: right; font-size: 10px; font-weight: bold;
@@ -1304,7 +1307,7 @@ html, body, #root {
 .bt-run-row {
   display: flex;
   align-items: stretch;
-  gap: 0;
+  gap: 6px;
   width: 100%;
 }
 
@@ -1317,15 +1320,14 @@ html, body, #root {
   flex: 1;
   height: 32px;
   background: #eee8d5;
-  border: 2px solid #93a1a1;
-  border-left: none;
+  border: 2px solid var(--color-blue);
   overflow: hidden;
   box-sizing: border-box;
 }
 
 .bt-progress-bar {
   height: 100%;
-  background: #268bd2;
+  background: var(--color-blue);
   transition: width 0.3s ease;
 }
 
@@ -1379,22 +1381,25 @@ html, body, #root {
 }
 
 .backtest-stats-th {
-  font-size: 10px;
+  font-size: 9px;
   font-weight: bold;
   text-transform: uppercase;
   color: var(--text-bold);
-  padding: 3px 8px;
+  padding: 3px 4px;
   text-align: right;
   border-bottom: 1px solid var(--border-color);
+  word-break: break-word;
+  overflow-wrap: break-word;
 }
 
 .backtest-stats-th:first-child { text-align: left; }
 
 .backtest-stats-td {
-  padding: 3px 8px;
+  padding: 3px 15px;
   text-align: right;
   color: var(--text-main);
-  border-bottom: 1px solid var(--bg-sidebar);
+  border-bottom: 1px solid #d6ceb5;
+  font-size: 10px;
 }
 
 .backtest-stats-td.label {

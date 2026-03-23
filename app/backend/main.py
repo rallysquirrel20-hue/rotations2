@@ -3958,6 +3958,337 @@ def run_backtest(req: BacktestRequest):
     return resp
 
 
+class BenchmarkRequest(BaseModel):
+    target: str
+    target_type: str
+    position_size: float = 1.0
+    max_leverage: float = 2.5
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    signals: List[str] = list(SIGNAL_IS_COL.keys())  # default: all 6
+
+
+@app.post("/api/backtest/benchmarks")
+def run_benchmarks(req: BenchmarkRequest):
+    """Compute benchmark equity curves for multiple signals in a single request.
+
+    Loads the parquet ONCE and loops over signals — avoids redundant I/O and
+    GIL contention from parallel /api/backtest/multi calls.
+    """
+    import time as _time
+    t0 = _time.perf_counter()
+
+    max_lev = req.max_leverage
+    initial = 1.0
+    signals = [s for s in req.signals if s in SIGNAL_IS_COL]
+    if not signals:
+        return {"benchmarks": {}}
+
+    is_multi_ticker = req.target_type == 'basket_tickers'
+
+    # ---- 1. Collect ALL columns needed across all signals in one pass ----
+    base_cols = ['Date', 'Close']
+    if is_multi_ticker:
+        base_cols.append('Ticker')
+    for sig in signals:
+        is_col = SIGNAL_IS_COL[sig]
+        default_exit = DEFAULT_EXIT_MAP.get(sig)
+        base_cols.append(is_col)
+        base_cols.extend([
+            f'{sig}_Entry_Price', f'{sig}_Exit_Date', f'{sig}_Exit_Price',
+            f'{sig}_Final_Change', f'{sig}_MFE', f'{sig}_MAE',
+        ])
+    base_cols = list(dict.fromkeys(base_cols))  # dedupe
+
+    # ---- 2. Load parquet ONCE ----
+    _quarter_bounds = None
+    if req.target_type == 'basket':
+        basket_file = _find_basket_parquet(req.target)
+        if not basket_file:
+            raise HTTPException(status_code=404, detail=f"Basket not found: {req.target}")
+        try:
+            df = pd.read_parquet(basket_file, columns=[c for c in base_cols if c])
+        except Exception:
+            df = pd.read_parquet(basket_file)
+            df = df[[c for c in base_cols if c in df.columns]]
+    elif is_multi_ticker:
+        if not INDIVIDUAL_SIGNALS_FILE.exists():
+            raise HTTPException(status_code=404, detail="Signals file not found")
+        _universe_history = _get_universe_history(req.target)
+        if _universe_history:
+            if req.start_date and req.end_date:
+                basket_tickers = _get_universe_tickers_for_range(
+                    req.target, pd.Timestamp(req.start_date), pd.Timestamp(req.end_date))
+            elif req.start_date:
+                basket_tickers = _get_universe_tickers_for_range(
+                    req.target, pd.Timestamp(req.start_date), pd.Timestamp('2099-12-31'))
+            else:
+                basket_tickers = list({t for tks in _universe_history.values() for t in tks})
+            _quarter_bounds = sorted(
+                [(_quarter_str_to_date(q), set(tks)) for q, tks in _universe_history.items()],
+                key=lambda x: x[0],
+            )
+        else:
+            basket_tickers = get_latest_universe_tickers(req.target)
+            if not basket_tickers:
+                basket_tickers = get_meta_file_tickers(req.target)
+        if not basket_tickers:
+            raise HTTPException(status_code=404, detail=f"No tickers for {req.target}")
+        try:
+            df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
+                                 columns=[c for c in base_cols if c],
+                                 filters=[('Ticker', 'in', basket_tickers)])
+        except Exception:
+            df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
+                                 filters=[('Ticker', 'in', basket_tickers)])
+            df = df[[c for c in base_cols if c in df.columns]]
+    elif req.target_type == 'etf':
+        _sig_file = ETF_SIGNALS_FILE
+        if not _sig_file.exists():
+            raise HTTPException(status_code=404, detail="ETF signals file not found")
+        try:
+            df = pd.read_parquet(_sig_file, columns=[c for c in base_cols if c],
+                                 filters=[('Ticker', '==', req.target)])
+        except Exception:
+            df = pd.read_parquet(_sig_file, filters=[('Ticker', '==', req.target)])
+            df = df[[c for c in base_cols if c in df.columns]]
+    else:
+        # single ticker
+        _sig_file = INDIVIDUAL_SIGNALS_FILE
+        if not _sig_file.exists():
+            raise HTTPException(status_code=404, detail="Signals file not found")
+        try:
+            df = pd.read_parquet(_sig_file, columns=[c for c in base_cols if c],
+                                 filters=[('Ticker', '==', req.target)])
+        except Exception:
+            df = pd.read_parquet(_sig_file, filters=[('Ticker', '==', req.target)])
+            df = df[[c for c in base_cols if c in df.columns]]
+
+    df['Date'] = pd.to_datetime(df['Date'])
+    if is_multi_ticker:
+        df = df.sort_values(['Ticker', 'Date']).reset_index(drop=True)
+    else:
+        df = df.sort_values('Date').reset_index(drop=True)
+    if req.start_date:
+        df = df[df['Date'] >= pd.Timestamp(req.start_date)]
+    if req.end_date:
+        df = df[df['Date'] <= pd.Timestamp(req.end_date)]
+
+    if df.empty:
+        return {"benchmarks": {}}
+
+    # Build ticker_closes once (shared across all signals)
+    if is_multi_ticker:
+        ticker_closes = {}
+        for tkr, grp in df.groupby('Ticker'):
+            ticker_closes[tkr] = grp.set_index('Date')['Close'].sort_index()
+    else:
+        ticker_closes = {'': df.set_index('Date')['Close'].sort_index()}
+
+    all_dates = sorted(df['Date'].unique())
+
+    t_load = _time.perf_counter() - t0
+
+    # ---- 3. For each signal, build trades + replay equity ----
+    benchmarks = {}
+    all_stats = {}
+    timings = {}
+
+    for sig in signals:
+        t_sig = _time.perf_counter()
+        is_col = SIGNAL_IS_COL[sig]
+        direction = BACKTEST_DIRECTION[sig]
+        is_long = direction == 'long'
+        pos_size = req.position_size
+
+        if is_col not in df.columns:
+            continue
+
+        # Extract trades using pre-computed columns (default exit path)
+        entries = df[df[is_col] == True].copy()
+        trades = []
+        for _, row in entries.iterrows():
+            entry_date = row['Date']
+
+            # Membership filter for basket_tickers
+            if is_multi_ticker and _quarter_bounds:
+                ticker = row.get('Ticker', '')
+                active_tickers = None
+                for q_start, q_tickers in _quarter_bounds:
+                    if q_start <= entry_date:
+                        active_tickers = q_tickers
+                    else:
+                        break
+                if active_tickers is None:
+                    active_tickers = _quarter_bounds[0][1]
+                if ticker not in active_tickers:
+                    continue
+
+            entry_price = row.get(f'{sig}_Entry_Price')
+            if pd.isna(entry_price) or entry_price is None or entry_price == 0:
+                entry_price = row.get('Close', 0)
+
+            exit_date_val = row.get(f'{sig}_Exit_Date')
+            exit_price = row.get(f'{sig}_Exit_Price')
+            final_change = row.get(f'{sig}_Final_Change')
+            if pd.isna(exit_date_val) or pd.isna(exit_price):
+                continue
+            exit_dt = pd.Timestamp(exit_date_val)
+            bars_held = max(1, int(np.busday_count(entry_date.date(), exit_dt.date())))
+            trade_return = float(final_change) if pd.notna(final_change) else 0.0
+
+            trade_dict = {
+                'entry_date': entry_date.strftime('%Y-%m-%d'),
+                'exit_date': exit_dt.strftime('%Y-%m-%d'),
+                'entry_price': safe_float(entry_price, 2),
+                'exit_price': safe_float(exit_price, 2),
+                'change': safe_float(trade_return, 4),
+                'bars_held': bars_held,
+                'regime_pass': True,  # no filters for benchmarks
+            }
+            if is_multi_ticker:
+                trade_dict['ticker'] = row.get('Ticker', '')
+            trades.append(trade_dict)
+
+        # Replay equity curve (same logic as run_multi_backtest standalone path)
+        sorted_trades = sorted(trades, key=lambda t: t['entry_date'])
+        entry_map = {}
+        exit_map = {}
+        trade_map = {i: t for i, t in enumerate(sorted_trades)}
+        for i, t in enumerate(sorted_trades):
+            ed = pd.Timestamp(t['entry_date'])
+            xd = pd.Timestamp(t['exit_date'])
+            entry_map.setdefault(ed, []).append(i)
+            exit_map.setdefault(xd, []).append(i)
+
+        def mtm_equity(open_pos, cash, close_date):
+            total = cash
+            for info in open_pos.values():
+                tkr = info.get('ticker', '')
+                ep = info['entry_price']
+                cs = ticker_closes.get(tkr)
+                if cs is None or ep == 0:
+                    total += info['alloc']
+                    continue
+                cv = cs.asof(close_date)
+                if pd.isna(cv):
+                    total += info['alloc']
+                    continue
+                cp = float(cv)
+                if is_long:
+                    total += info['alloc'] * (cp / ep)
+                else:
+                    total += info['alloc'] * (2 - cp / ep)
+            return total
+
+        cash = initial
+        open_pos = {}
+        eq_vals = []
+
+        for date in all_dates:
+            # Process exits
+            for idx in exit_map.get(date, []):
+                t = trade_map[idx]
+                ret = t['change'] or 0.0
+                if idx in open_pos:
+                    a = open_pos.pop(idx)
+                    cash += a['alloc'] * (1 + ret)
+
+            # Process entries
+            for idx in entry_map.get(date, []):
+                t = trade_map[idx]
+                eq_est = mtm_equity(open_pos, cash, date)
+                if eq_est > 0:
+                    wanted = eq_est * pos_size * max_lev
+                    exposure = eq_est - cash
+                    cap = eq_est * max_lev
+                    room = max(0, cap - exposure)
+                    alloc = min(wanted, room)
+                    if alloc > 0:
+                        open_pos[idx] = {
+                            'alloc': alloc,
+                            'entry_price': t['entry_price'] or 0,
+                            'ticker': t.get('ticker', ''),
+                        }
+                        cash -= alloc
+                        trade_map[idx]['_was_taken'] = True
+
+            equity = mtm_equity(open_pos, cash, date)
+            eq_vals.append(round(equity, 2))
+
+        # Compute stats (same logic as run_multi_backtest)
+        all_trades_count = len(sorted_trades)
+        taken = [t for t in sorted_trades if t.get('_was_taken')]
+        returns = [t['change'] for t in taken if t['change'] is not None]
+        winners = [r for r in returns if r > 0]
+        losers = [r for r in returns if r <= 0]
+        total_trades = len(returns)
+
+        # Portfolio stats from equity curve
+        sig_stats = {'portfolio': {}, 'trade': {}}
+        if len(eq_vals) >= 2:
+            eq_arr = np.array(eq_vals, dtype=float)
+            dr = np.diff(eq_arr) / eq_arr[:-1]
+            dr = dr[np.isfinite(dr)]
+            strat_ret = eq_arr[-1] / eq_arr[0] - 1 if eq_arr[0] > 0 else 0
+            yrs = len(dr) / 252 if len(dr) > 0 else 0
+            _cagr = (eq_arr[-1] / eq_arr[0]) ** (1 / yrs) - 1 if yrs > 0 and eq_arr[0] > 0 and eq_arr[-1] > 0 else 0
+            vol = float(np.std(dr) * np.sqrt(252)) if len(dr) > 1 else 0
+            mean_d = float(np.mean(dr)) if len(dr) > 0 else 0
+            std_d = float(np.std(dr)) if len(dr) > 1 else 0
+            _sharpe = (mean_d / std_d * np.sqrt(252)) if std_d > 0 else 0
+            down = dr[dr < 0]
+            down_std = float(np.std(down)) if len(down) > 1 else 0
+            _sortino = (mean_d / down_std * np.sqrt(252)) if down_std > 0 else 0
+            _max_dd = 0.0
+            peak = eq_arr[0]
+            for v in eq_arr:
+                peak = max(peak, v)
+                if peak > 0:
+                    _max_dd = max(_max_dd, (peak - v) / peak)
+            sig_stats['portfolio'] = {
+                'strategy_return': round(strat_ret, 4), 'cagr': round(float(_cagr), 4),
+                'volatility': round(vol, 4), 'max_dd': round(_max_dd, 4),
+                'sharpe': round(float(_sharpe), 2), 'sortino': round(float(_sortino), 2),
+            }
+        else:
+            sig_stats['portfolio'] = {'strategy_return': 0, 'cagr': 0, 'volatility': 0, 'max_dd': 0, 'sharpe': 0, 'sortino': 0}
+
+        # Trade stats
+        win_rate = len(winners) / total_trades if total_trades > 0 else 0
+        avg_winner = sum(winners) / len(winners) if winners else 0
+        avg_loser = sum(losers) / len(losers) if losers else 0
+        ev = sum(returns) / total_trades if total_trades > 0 else 0
+        gp = sum(winners)
+        gl = abs(sum(losers))
+        pf = gp / gl if gl > 0 else (999 if gp > 0 else 0)
+        wt = [t for t in taken if t['change'] is not None and t['change'] > 0]
+        lt = [t for t in taken if t['change'] is not None and t['change'] <= 0]
+        sig_stats['trade'] = {
+            'trades_met_criteria': all_trades_count, 'trades_taken': total_trades,
+            'trades_skipped': max(0, all_trades_count - total_trades),
+            'win_rate': round(win_rate, 4), 'avg_winner': round(avg_winner, 4),
+            'avg_loser': round(avg_loser, 4), 'ev': round(ev, 4),
+            'profit_factor': round(pf, 2),
+            'avg_time_winner': round(sum(t['bars_held'] for t in wt) / len(wt), 1) if wt else 0,
+            'avg_time_loser': round(sum(t['bars_held'] for t in lt) / len(lt), 1) if lt else 0,
+        }
+
+        timings[sig] = round(_time.perf_counter() - t_sig, 2)
+        benchmarks[sig] = eq_vals
+        all_stats[sig] = sig_stats
+
+    eq_date_strs = [pd.Timestamp(d).strftime('%Y-%m-%d') for d in all_dates]
+    total_time = round(_time.perf_counter() - t0, 2)
+
+    return {
+        "dates": eq_date_strs,
+        "benchmarks": benchmarks,
+        "stats": all_stats,
+        "timings": {"load": round(t_load, 2), "per_signal": timings, "total": total_time},
+    }
+
+
 @app.post("/api/backtest/multi")
 def run_multi_backtest(req: MultiBacktestRequest):
     """Run a multi-leg backtest and return combined equity curves + per-leg stats."""

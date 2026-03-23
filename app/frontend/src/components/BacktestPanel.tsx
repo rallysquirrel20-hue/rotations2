@@ -159,6 +159,10 @@ const BENCHMARK_COLORS: Record<string, string> = {
   STFR: '#F8BBD0',
 }
 
+const BACKTEST_DIRECTION: Record<string, string> = {
+  Breakout: 'long', Breakdown: 'short', Up_Rot: 'long', Down_Rot: 'short', BTFD: 'long', STFR: 'short',
+}
+
 const LIGHT_PINK = 'rgb(255, 183, 226)'
 const LIGHT_BLUE = 'rgb(179, 222, 255)'
 
@@ -853,8 +857,13 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
 
   // ── Benchmark state (auto-calculated for single-leg only) ──
   const [benchmarks, setBenchmarks] = useState<Record<string, number[]>>({})
+  const [benchmarkStats, setBenchmarkStats] = useState<Record<string, Stats>>({})
   const [showBenchmark, setShowBenchmark] = useState<Record<string, boolean>>({})
   const benchmarkGenRef = useRef(0)
+
+  // ── Stats tab sort state ──
+  const [statsSortRow, setStatsSortRow] = useState<string | null>(null)
+  const [statsSortAsc, setStatsSortAsc] = useState(false)
 
   // ── Distribution tab state ──
   const histCanvasRef = useRef<HTMLCanvasElement>(null)
@@ -900,20 +909,25 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
     setBtProgressMsg('')
     setError('')
     setBenchmarks({})
+    setBenchmarkStats({})
     setShowBenchmark({})
     const gen = ++benchmarkGenRef.current
 
-    const benchSignals = isSingleLeg ? ENTRY_SIGNALS.filter(s => !['Long', 'Short'].includes(s)) : []
-    const totalTasks = 1 + benchSignals.length
+    const hasBenchmarks = isSingleLeg
+    const totalTasks = hasBenchmarks ? 2 : 1  // main + batch benchmarks
     let completed = 0
-    let animTarget = 0 // target % from completions — animation approaches this
-    const estimatedMs = 20000 // estimated total duration for smooth fill
+    let animTarget = 0
+    const estimatedMs = 15000
     const startTime = Date.now()
+    const incrementProgress = () => {
+      completed++
+      animTarget = Math.max(animTarget, Math.round(completed / totalTasks * 100))
+    }
 
     // Smooth progress: blends elapsed-time estimate with completion-based floor
     const progressTimer = setInterval(() => {
       const elapsed = Date.now() - startTime
-      const timePct = 90 * (1 - Math.exp(-elapsed / (estimatedMs * 0.4))) // exponential fill to ~90%
+      const timePct = 90 * (1 - Math.exp(-elapsed / (estimatedMs * 0.4)))
       const completionPct = Math.round(completed / totalTasks * 100)
       animTarget = Math.max(animTarget, completionPct)
       setBtProgress(Math.round(Math.max(timePct, animTarget)))
@@ -941,7 +955,7 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
         max_leverage: maxLeverage / 100,
       }
 
-      // Fire main + all benchmarks in parallel
+      // Fire main backtest
       const mainPromise = fetch(`${apiBase}/backtest/multi`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -950,34 +964,40 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
         if (!r.ok) { const err = await r.json().catch(() => ({ detail: r.statusText })); throw new Error(err.detail || r.statusText) }
         return r.json() as Promise<MultiBacktestResult>
       }).then(data => {
-        incrementProgress()
         setResult(data)
         setShowResults(true)
         setResultTab('equity')
         eqViewRef.current = { start: 0, end: data.combined.equity_curve.dates.length - 1 }
         setEqViewVersion(v => v + 1)
+        incrementProgress()
       })
 
-      const benchPromises = benchSignals.map(sig => {
-        const leg0 = legs[0]
-        return fetch(`${apiBase}/backtest/multi`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            legs: [{ target: leg0.target, target_type: leg0.targetType, entry_signal: sig, allocation_pct: 1.0, position_size: leg0.positionSize / 100, filters: [] }],
-            start_date: startDate || null, end_date: endDate || null, max_leverage: maxLeverage / 100, equity_only: true,
-          }),
+      // Fire single batch benchmarks request (loads parquet once, loops signals)
+      const benchPromise = hasBenchmarks ? fetch(`${apiBase}/backtest/benchmarks`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          target: legs[0].target,
+          target_type: legs[0].targetType,
+          position_size: legs[0].positionSize / 100,
+          max_leverage: maxLeverage / 100,
+          start_date: startDate || null,
+          end_date: endDate || null,
+        }),
+      })
+        .then(r => r.ok ? r.json() : null)
+        .then(d => {
+          incrementProgress()
+          if (benchmarkGenRef.current !== gen) return
+          if (d && d.benchmarks) {
+            setBenchmarks(d.benchmarks as Record<string, number[]>)
+            if (d.stats) setBenchmarkStats(d.stats as Record<string, Stats>)
+          }
         })
-          .then(r => r.ok ? r.json() : null)
-          .then(d => {
-            incrementProgress()
-            if (benchmarkGenRef.current !== gen) return
-            if (d) setBenchmarks(prev => ({ ...prev, [sig]: d.combined.equity_curve.combined as number[] }))
-          })
-          .catch(() => { incrementProgress() })
-      })
+        .catch(() => { incrementProgress() })
+      : Promise.resolve()
 
-      await Promise.all([mainPromise, ...benchPromises])
+      await Promise.all([mainPromise, benchPromise])
     } catch (e: any) {
       setError(e.message || 'Unknown error')
     } finally {
@@ -1898,100 +1918,177 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
               {resultTab === 'stats' && (() => {
                 const cs = result.combined.stats
                 const lc = result.leg_correlations
-                const renderStatsTable = (
-                  title: string,
-                  titleColor: string,
-                  portfolioRows: { label: string; values: string[]; colors?: (string | undefined)[] }[],
-                  tradeRows: { label: string; values: string[]; colors?: (string | undefined)[] }[],
-                ) => (
-                  <div style={{ marginBottom: 20 }}>
-                    <div style={{ fontWeight: 700, fontSize: 13, color: titleColor, marginBottom: 6, borderBottom: `2px solid ${titleColor}`, paddingBottom: 4 }}>{title}</div>
-                    <table className="backtest-stats-table" style={{ width: '100%', marginBottom: 8 }}>
-                      <thead>
-                        <tr><th className="backtest-stats-th" colSpan={2} style={{ textAlign: 'left', fontSize: 11, color: '#657b83' }}>Portfolio Stats</th></tr>
-                      </thead>
-                      <tbody>
-                        {portfolioRows.map((r, ri) => (
-                          <tr key={ri}>
-                            <td className="backtest-stats-td" style={{ fontWeight: 600, width: '50%' }}>{r.label}</td>
-                            <td className="backtest-stats-td" style={{ color: r.colors?.[0] }}>{r.values[0]}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                    <table className="backtest-stats-table" style={{ width: '100%' }}>
-                      <thead>
-                        <tr><th className="backtest-stats-th" colSpan={2} style={{ textAlign: 'left', fontSize: 11, color: '#657b83' }}>Trade Stats</th></tr>
-                      </thead>
-                      <tbody>
-                        {tradeRows.map((r, ri) => (
-                          <tr key={ri}>
-                            <td className="backtest-stats-td" style={{ fontWeight: 600, width: '50%' }}>{r.label}</td>
-                            <td className="backtest-stats-td" style={{ color: r.colors?.[0] }}>{r.values[0]}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )
 
-                const buildPortfolioRows = (p: PortfolioStats, legTarget?: string) => {
-                  const rows: { label: string; values: string[]; colors?: (string | undefined)[] }[] = [
-                    ...(p.allocation != null && resultIsMultiLeg ? [{ label: 'Allocation', values: [(p.allocation * 100).toFixed(0) + '%'] }] : []),
-                    { label: 'Return', values: [pctFmt(p.strategy_return)], colors: [p.strategy_return >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)'] },
-                    { label: 'CAGR', values: [pctFmt(p.cagr)], colors: [p.cagr >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)'] },
-                    { label: 'Volatility', values: [pctFmt(p.volatility)] },
-                    { label: 'Max Drawdown', values: [pctFmt(p.max_dd)], colors: ['rgb(255,50,150)'] },
-                    { label: 'Sharpe', values: [p.sharpe.toFixed(2)] },
-                    { label: 'Sortino', values: [p.sortino.toFixed(2)] },
-                  ]
-                  if (p.contribution != null && resultIsMultiLeg) {
-                    rows.push({ label: 'Contribution', values: [pctFmt(p.contribution)], colors: [p.contribution >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)'] })
-                  }
-                  // Inter-leg correlations
-                  if (lc && legTarget && lc[legTarget]) {
-                    for (const [otherLeg, corr] of Object.entries(lc[legTarget])) {
-                      rows.push({ label: `Corr: ${otherLeg.replace(/_/g, ' ')}`, values: [corr.toFixed(4)] })
+                // Build columns: each column is a strategy with its Stats
+                type StatsCol = { key: string; label: string; color: string; stats: Stats }
+                const columns: StatsCol[] = []
+
+                if (resultIsMultiLeg) {
+                  // Multi-leg: one column per leg + combined
+                  result.legs.forEach((leg, i) => {
+                    columns.push({
+                      key: `leg_${i}`,
+                      label: `${leg.target.replace(/_/g, ' ')} ${leg.entry_signal.replace(/_/g, ' ')}`,
+                      color: LEG_COLORS[i % LEG_COLORS.length],
+                      stats: leg.stats,
+                    })
+                  })
+                  columns.push({ key: 'combined', label: 'Combined', color: '#8BC34A', stats: cs })
+                } else {
+                  // Single-leg: equity (combined) + all benchmarks
+                  const leg = result.legs[0]
+                  columns.push({
+                    key: 'main',
+                    label: `${leg.target.replace(/_/g, ' ')} ${leg.entry_signal.replace(/_/g, ' ')}`,
+                    color: '#8BC34A',
+                    stats: cs,
+                  })
+                  for (const sig of ['Breakout', 'Breakdown', 'Up_Rot', 'Down_Rot', 'BTFD', 'STFR']) {
+                    if (benchmarkStats[sig]) {
+                      columns.push({
+                        key: sig,
+                        label: sig.replace(/_/g, ' '),
+                        color: BENCHMARK_COLORS[sig] || '#657b83',
+                        stats: benchmarkStats[sig],
+                      })
                     }
                   }
-                  return rows
                 }
 
-                const buildTradeRows = (t: TradeStats) => [
-                  { label: 'Trades Met Criteria', values: [String(t.trades_met_criteria)] },
-                  { label: 'Trades Taken', values: [String(t.trades_taken)] },
-                  { label: 'Trades Skipped', values: [String(t.trades_skipped)] },
-                  { label: 'Win Rate', values: [pctFmt(t.win_rate)] },
-                  { label: 'Avg Winner', values: [pctFmt(t.avg_winner)], colors: ['rgb(50,50,255)'] },
-                  { label: 'Avg Loser', values: [pctFmt(t.avg_loser)], colors: ['rgb(255,50,150)'] },
-                  { label: 'EV', values: [pctFmt(t.ev)], colors: [t.ev >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)'] },
-                  { label: 'Profit Factor', values: [t.profit_factor.toFixed(2)] },
-                  { label: 'Avg Time Winner', values: [t.avg_time_winner.toFixed(1) + ' bars'] },
-                  { label: 'Avg Time Loser', values: [t.avg_time_loser.toFixed(1) + ' bars'] },
+                // Buy & Hold: compute portfolio stats from equity curve
+                const bhCurve = result.combined.equity_curve.buy_hold
+                if (bhCurve && bhCurve.length >= 2) {
+                  const first = bhCurve[0], last = bhCurve[bhCurve.length - 1]
+                  const stratRet = first > 0 ? last / first - 1 : 0
+                  const dailyRets: number[] = []
+                  for (let i = 1; i < bhCurve.length; i++) {
+                    if (bhCurve[i - 1] > 0) dailyRets.push(bhCurve[i] / bhCurve[i - 1] - 1)
+                  }
+                  const years = dailyRets.length / 252
+                  const cagr = years > 0 && first > 0 && last > 0 ? Math.pow(last / first, 1 / years) - 1 : 0
+                  const mean = dailyRets.length > 0 ? dailyRets.reduce((s, v) => s + v, 0) / dailyRets.length : 0
+                  const std = dailyRets.length > 1 ? Math.sqrt(dailyRets.reduce((s, v) => s + (v - mean) ** 2, 0) / dailyRets.length) : 0
+                  const vol = std * Math.sqrt(252)
+                  const sharpe = std > 0 ? (mean / std) * Math.sqrt(252) : 0
+                  const downside = dailyRets.filter(r => r < 0)
+                  const downStd = downside.length > 1 ? Math.sqrt(downside.reduce((s, v) => s + v ** 2, 0) / downside.length) : 0
+                  const sortino = downStd > 0 ? (mean / downStd) * Math.sqrt(252) : 0
+                  let maxDd = 0, peak = bhCurve[0]
+                  for (const v of bhCurve) { peak = Math.max(peak, v); if (peak > 0) maxDd = Math.max(maxDd, (peak - v) / peak) }
+                  columns.push({
+                    key: 'buy_hold', label: 'Buy & Hold', color: '#93a1a1',
+                    stats: {
+                      portfolio: { strategy_return: stratRet, cagr, volatility: vol, max_dd: maxDd, sharpe, sortino },
+                      trade: { trades_met_criteria: 1, trades_taken: 1, trades_skipped: 0, win_rate: stratRet > 0 ? 1 : 0, avg_winner: stratRet > 0 ? stratRet : 0, avg_loser: stratRet <= 0 ? stratRet : 0, ev: stratRet, profit_factor: 0, avg_time_winner: dailyRets.length, avg_time_loser: 0 },
+                    },
+                  })
+                }
+
+                // Row definitions: { key, label, section, getValue, getColor }
+                type RowDef = { key: string; label: string; section: 'portfolio' | 'trade'; getValue: (s: Stats) => string; getRaw: (s: Stats) => number; getColor?: (s: Stats) => string | undefined }
+                const rows: RowDef[] = [
+                  ...(resultIsMultiLeg ? [{
+                    key: 'allocation', label: 'Allocation', section: 'portfolio' as const,
+                    getValue: (s: Stats) => s.portfolio.allocation != null ? (s.portfolio.allocation * 100).toFixed(0) + '%' : '--',
+                    getRaw: (s: Stats) => s.portfolio.allocation ?? 0,
+                  }] : []),
+                  { key: 'return', label: 'Return', section: 'portfolio', getValue: s => pctFmt(s.portfolio.strategy_return), getRaw: s => s.portfolio.strategy_return, getColor: s => s.portfolio.strategy_return >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)' },
+                  { key: 'cagr', label: 'CAGR', section: 'portfolio', getValue: s => pctFmt(s.portfolio.cagr), getRaw: s => s.portfolio.cagr, getColor: s => s.portfolio.cagr >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)' },
+                  { key: 'volatility', label: 'Volatility', section: 'portfolio', getValue: s => pctFmt(s.portfolio.volatility), getRaw: s => s.portfolio.volatility },
+                  { key: 'max_dd', label: 'Max Drawdown', section: 'portfolio', getValue: s => pctFmt(s.portfolio.max_dd), getRaw: s => s.portfolio.max_dd, getColor: () => 'rgb(255,50,150)' },
+                  { key: 'sharpe', label: 'Sharpe', section: 'portfolio', getValue: s => s.portfolio.sharpe.toFixed(2), getRaw: s => s.portfolio.sharpe },
+                  { key: 'sortino', label: 'Sortino', section: 'portfolio', getValue: s => s.portfolio.sortino.toFixed(2), getRaw: s => s.portfolio.sortino },
+                  ...(resultIsMultiLeg ? [{
+                    key: 'contribution', label: 'Contribution', section: 'portfolio' as const,
+                    getValue: (s: Stats) => s.portfolio.contribution != null ? pctFmt(s.portfolio.contribution) : '--',
+                    getRaw: (s: Stats) => s.portfolio.contribution ?? 0,
+                    getColor: (s: Stats) => (s.portfolio.contribution ?? 0) >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)',
+                  }] : []),
+                  { key: 'trades_met', label: 'Trades Met Criteria', section: 'trade', getValue: s => String(s.trade.trades_met_criteria), getRaw: s => s.trade.trades_met_criteria },
+                  { key: 'trades_taken', label: 'Trades Taken', section: 'trade', getValue: s => String(s.trade.trades_taken), getRaw: s => s.trade.trades_taken },
+                  { key: 'trades_skipped', label: 'Trades Skipped', section: 'trade', getValue: s => String(s.trade.trades_skipped), getRaw: s => s.trade.trades_skipped },
+                  { key: 'win_rate', label: 'Win Rate', section: 'trade', getValue: s => pctFmt(s.trade.win_rate), getRaw: s => s.trade.win_rate },
+                  { key: 'avg_winner', label: 'Avg Winner', section: 'trade', getValue: s => pctFmt(s.trade.avg_winner), getRaw: s => s.trade.avg_winner, getColor: () => 'rgb(50,50,255)' },
+                  { key: 'avg_loser', label: 'Avg Loser', section: 'trade', getValue: s => pctFmt(s.trade.avg_loser), getRaw: s => s.trade.avg_loser, getColor: () => 'rgb(255,50,150)' },
+                  { key: 'ev', label: 'EV', section: 'trade', getValue: s => pctFmt(s.trade.ev), getRaw: s => s.trade.ev, getColor: s => s.trade.ev >= 0 ? 'rgb(50,50,255)' : 'rgb(255,50,150)' },
+                  { key: 'pf', label: 'Profit Factor', section: 'trade', getValue: s => s.trade.profit_factor.toFixed(2), getRaw: s => s.trade.profit_factor },
+                  { key: 'avg_time_w', label: 'Avg Time Winner', section: 'trade', getValue: s => s.trade.avg_time_winner.toFixed(1) + ' bars', getRaw: s => s.trade.avg_time_winner },
+                  { key: 'avg_time_l', label: 'Avg Time Loser', section: 'trade', getValue: s => s.trade.avg_time_loser.toFixed(1) + ' bars', getRaw: s => s.trade.avg_time_loser },
                 ]
 
+                // Inter-leg correlations removed for now — too many columns for the layout
+
+                // Sort strategies (rows) by clicking a stat column header
+                const sortedStrategies = statsSortRow
+                  ? [...columns].sort((a, b) => {
+                      const rd = rows.find(r => r.key === statsSortRow)
+                      if (!rd) return 0
+                      const va = rd.getRaw(a.stats), vb = rd.getRaw(b.stats)
+                      return statsSortAsc ? va - vb : vb - va
+                    })
+                  : columns
+
+                const handleColClick = (rowKey: string) => {
+                  if (statsSortRow === rowKey) setStatsSortAsc(v => !v)
+                  else { setStatsSortRow(rowKey); setStatsSortAsc(false) }
+                }
+
+                const portfolioRows = rows.filter(r => r.section === 'portfolio')
+                const tradeRows = rows.filter(r => r.section === 'trade')
+                const arrow = (key: string) => statsSortRow === key ? (statsSortAsc ? ' \u25B2' : ' \u25BC') : ''
+
+                const renderColHeaders = (label: string, sectionRows: RowDef[], isFirst: boolean) => (
+                  <th className="backtest-stats-th" style={{ textAlign: 'center', fontSize: 9, color: '#93a1a1', letterSpacing: 1, background: 'var(--bg-sidebar)', borderBottom: '1px solid var(--border-color)', padding: '4px 6px',
+                    ...(!isFirst ? { borderLeft: '1px solid #d6ceb5' } : {}) }} colSpan={sectionRows.length}>
+                    {label}
+                  </th>
+                )
+
                 return (
-                  <div style={{ padding: 12, overflowY: 'auto', display: 'flex', flexWrap: 'wrap', gap: 16, alignItems: 'flex-start' }}>
-                    {result.legs.map((leg, i) =>
-                      <div key={i} style={{ flex: '1 1 300px', maxWidth: 400 }}>
-                        {renderStatsTable(
-                          `${leg.target.replace(/_/g, ' ')} — ${leg.entry_signal.replace(/_/g, ' ')} (${leg.direction})`,
-                          resultIsMultiLeg ? LEG_COLORS[i % LEG_COLORS.length] : '#657b83',
-                          buildPortfolioRows(leg.stats.portfolio, leg.target),
-                          buildTradeRows(leg.stats.trade),
-                        )}
-                      </div>
-                    )}
-                    {resultIsMultiLeg && (
-                      <div style={{ flex: '1 1 300px', maxWidth: 400 }}>
-                        {renderStatsTable(
-                          'Combined Portfolio',
-                          '#8BC34A',
-                          buildPortfolioRows(cs.portfolio),
-                          buildTradeRows(cs.trade),
-                        )}
-                      </div>
-                    )}
+                  <div style={{ padding: 12, overflowX: 'auto', overflowY: 'auto' }}>
+                    <table className="backtest-stats-table" style={{ borderCollapse: 'collapse' }}>
+                      <thead>
+                        {/* Section group headers */}
+                        <tr>
+                          <th className="backtest-stats-th" style={{ background: 'var(--bg-main)', borderRight: '1px solid #d6ceb5' }} />
+                          {renderColHeaders('PORTFOLIO', portfolioRows, true)}
+                          {renderColHeaders('TRADE', tradeRows, false)}
+                        </tr>
+                        {/* Individual stat column headers */}
+                        <tr>
+                          <th className="backtest-stats-th" style={{ textAlign: 'center', verticalAlign: 'middle', whiteSpace: 'nowrap', position: 'sticky', left: 0, background: 'var(--bg-main)', zIndex: 1, borderRight: '1px solid #d6ceb5' }}>
+                            Strategy
+                          </th>
+                          {[...portfolioRows, ...tradeRows].map((r, ri) => (
+                            <th key={r.key} className="backtest-stats-th"
+                              style={{ padding: 0, verticalAlign: 'middle',
+                                ...(ri === portfolioRows.length ? { borderLeft: '1px solid #d6ceb5' } : {}) }}
+                              onClick={() => handleColClick(r.key)}>
+                              <div style={{ width: 0, minWidth: '100%', boxSizing: 'border-box', padding: '3px 4px',
+                                fontSize: 9, textAlign: 'center', cursor: 'pointer', userSelect: 'none',
+                                whiteSpace: 'normal', wordBreak: 'break-word', lineHeight: '1.2' }}>
+                                {r.label}{arrow(r.key)}
+                              </div>
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {sortedStrategies.map(strat => (
+                          <tr key={strat.key}>
+                            <td className="backtest-stats-td" style={{ fontWeight: 700, whiteSpace: 'nowrap', borderLeft: `3px solid ${strat.color}`, borderRight: '1px solid #d6ceb5', color: strat.color, paddingLeft: 8 }}>
+                              {strat.label}
+                            </td>
+                            {[...portfolioRows, ...tradeRows].map((r, ri) => (
+                              <td key={r.key} className="backtest-stats-td" style={{ textAlign: 'right', whiteSpace: 'nowrap', color: r.getColor?.(strat.stats),
+                                ...(ri === portfolioRows.length ? { borderLeft: '1px solid #d6ceb5' } : {}) }}>
+                                {r.getValue(strat.stats)}
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
                   </div>
                 )
               })()}
