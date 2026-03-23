@@ -1,5 +1,5 @@
 # Dependency Tree
-Updated: 2026-03-18 (incremental — _live_is_current stale-data guard, mode=query condition search, _was_taken trade tracking, strategy_scanner.py new file)
+Updated: 2026-03-23 (incremental — batch benchmarks endpoint, stats table rewrite, incrementProgress fix)
 Files scanned: 16
 Functions indexed: 241
 
@@ -27,7 +27,7 @@ Functions indexed: 241
 | signals/rotations.py | 6206 | 143 | Main pipeline: universe, signals, baskets, live, reports |
 | signals/rotations_old_outputs.py | 2177 | 35 | Extracted Group B report cells (Excel, correlations, charts, PDFs) |
 | signals/databento_test.py | 624 | 16 | Databento API connectivity tests |
-| app/backend/main.py | 3963 | 44 | FastAPI REST endpoints + WebSocket |
+| app/backend/main.py | 4300 | 46 | FastAPI REST endpoints + WebSocket |
 | signals/test_all_optimizations.py | 75 | 1 | Compares old vs new breadth/contributions/correlation values after rebuild |
 | signals/test_correlation_optimization.py | 207 | 5 | Step-by-step test harness: backup, compare, check returns_matrix, test API, restore |
 | app/backend/signals_engine.py | 534 | 2 | Live signal computation (parallel impl) |
@@ -840,7 +840,7 @@ This file imports everything from rotations.py via `from rotations import *` plu
 - **Purpose:** Returns True if the live parquet date is strictly newer than Norgate max date; prevents stale live overlay after market close when Norgate has already updated with end-of-day data
 - **Calls:** pd.to_datetime
 #### `_find_basket_parquet` (L110-120)
-- **Called by:** `get_basket_returns`, `get_basket_data`, `get_ticker_baskets`, `get_date_range`, `run_backtest`, `_build_leg_trades`
+- **Called by:** `get_basket_returns`, `get_basket_data`, `get_ticker_baskets`, `get_date_range`, `run_backtest`, `_build_leg_trades`, `run_benchmarks`
 - **PARALLEL IMPL:** signals/rotations.py L3510-3522
 
 #### `_find_basket_meta` (L122-132)
@@ -851,22 +851,22 @@ This file imports everything from rotations.py via `from rotations import *` plu
 - **Called by:** `get_basket_data`, `get_ticker_data`
 
 #### `get_latest_universe_tickers` (L138-160)
-- **Called by:** `_compute_live_breadth`, `get_basket_breadth`, `get_basket_data`, `get_basket_summary`, `get_basket_correlation`, `get_ticker_baskets`, `run_backtest`, `_build_leg_trades`
+- **Called by:** `_compute_live_breadth`, `get_basket_breadth`, `get_basket_data`, `get_basket_summary`, `get_basket_correlation`, `get_ticker_baskets`, `run_backtest`, `_build_leg_trades`, `run_benchmarks`
 - **Data I/O:** reads `gics_mappings_{SIZE}.json`, thematic JSON files
 
 #### `get_meta_file_tickers` (L162-174)
-- **Called by:** `get_basket_summary`, `get_basket_correlation`, `run_backtest`, `_build_leg_trades`
+- **Called by:** `get_basket_summary`, `get_basket_correlation`, `run_backtest`, `_build_leg_trades`, `run_benchmarks`
 
 #### `_get_universe_history` (L177-194)
-- **Called by:** `_get_universe_tickers_for_range`, `_get_ticker_join_dates`, `_get_tickers_for_date`, `get_basket_summary`, `run_backtest`, `_build_leg_trades`
+- **Called by:** `_get_universe_tickers_for_range`, `_get_ticker_join_dates`, `_get_tickers_for_date`, `get_basket_summary`, `run_backtest`, `_build_leg_trades`, `run_benchmarks`
 - **Data I/O:** reads `gics_mappings_{SIZE}.json`, thematic JSON files
 
 #### `_quarter_str_to_date` (L197-203)
-- **Called by:** `_get_universe_tickers_for_range`, `_get_ticker_join_dates`, `_get_tickers_for_date`, `get_basket_summary`, `run_backtest`, `_build_leg_trades`
+- **Called by:** `_get_universe_tickers_for_range`, `_get_ticker_join_dates`, `_get_tickers_for_date`, `get_basket_summary`, `run_backtest`, `_build_leg_trades`, `run_benchmarks`
 - **PARALLEL IMPL:** signals/rotations.py `_quarter_start_from_key` L427-432
 
 #### `_get_universe_tickers_for_range` (L206-220)
-- **Called by:** `run_backtest`, `_build_leg_trades`
+- **Called by:** `run_backtest`, `_build_leg_trades`, `run_benchmarks`
 
 #### `_get_ticker_join_dates` (L223-235)
 - **Called by:** `get_basket_summary`
@@ -956,8 +956,25 @@ This file imports everything from rotations.py via `from rotations import *` plu
 - **Fields:** `target`, `target_type`, `entry_signal`, `allocation_pct` (0-1 fraction), `position_size` (default 1.0), `filters`
 
 #### `MultiBacktestRequest` (L2511-2517) — Pydantic model
-- **Fields:** `legs`, `start_date`, `end_date`, `max_leverage` (default 2.5)
+- **Fields:** `legs`, `start_date`, `end_date`, `max_leverage` (default 2.5), `equity_only` (bool, default False)
 - **Removed:** `initial_equity` (no longer user-configurable; hardcoded to 1.0 internally for percentage-based equity)
+
+#### `BenchmarkRequest` (L3961-3968) — Pydantic model (NEW 2026-03-23)
+- **Fields:** `target`, `target_type`, `position_size` (default 1.0), `max_leverage` (default 2.5), `start_date`, `end_date`, `signals` (default: all 6 from SIGNAL_IS_COL)
+- **Used by:** `run_benchmarks` endpoint
+
+#### `run_benchmarks` (L3971-4228) — POST /api/backtest/benchmarks (NEW 2026-03-23)
+- **Purpose:** Compute benchmark equity curves + stats for multiple signals in a single request. Loads parquet ONCE, loops over signals — eliminates redundant I/O and GIL contention from parallel /api/backtest/multi calls.
+- **Calls:** `_find_basket_parquet`, `_get_universe_history`, `_get_universe_tickers_for_range`, `_quarter_str_to_date`, `get_latest_universe_tickers`, `get_meta_file_tickers`, `safe_float`
+- **Reads:** `INDIVIDUAL_SIGNALS_FILE`, basket parquets, `ETF_SIGNALS_FILE`, universe JSON files
+- **Returns:** `{ dates[], benchmarks: { signal: equity_curve[] }, stats: { signal: { portfolio, trade } }, timings }`
+- **Key behaviors:**
+  - Collects ALL columns needed across all signals in one parquet read
+  - Builds ticker_closes once, shared across all signal loops
+  - Uses default exit path only (pre-computed trade columns), no custom exits/stops/filters
+  - Tracks `_was_taken` for trade stats; computes portfolio stats from equity curve
+  - Includes per-signal timing breakdown
+- **Frontend caller:** BacktestPanel.tsx `runBacktest` (single batch request replaces 6 parallel /api/backtest/multi calls)
 
 #### `_build_leg_trades` (L2518-2795)
 - **Purpose:** extracted from `run_backtest` — builds the trades list + ticker_closes dict for a single backtest leg
@@ -1350,9 +1367,12 @@ app/frontend/src/index.css
 - **Type**: `LegConfig[]` — array of leg configurations (1 for single-leg, up to 6 for multi-leg)
 - **Initialized from**: props `target`/`targetType` if provided
 
-#### benchmarks (L322) / showBenchmark (L323)
-- **Type**: `Record<string, number[]>` / `Record<string, boolean>` — auto-calculated for single-leg only
-- **Set by**: `runBacktest` — 6 parallel `/api/backtest/multi` calls with each signal
+#### benchmarks (L855) / benchmarkStats (L856) / showBenchmark (L857)
+- **Type**: `Record<string, number[]>` / `Record<string, Stats>` / `Record<string, boolean>`
+- **Set by**: `runBacktest` — single POST `/api/backtest/benchmarks` batch request (replaced 6 parallel calls as of 2026-03-23)
+
+#### statsSortRow / statsSortAsc (L866-867)
+- **Type**: `string | null` / `boolean` — sort state for unified stats table
 
 #### showConstituents (L319) / eqHoverIdx (L347) / eqPinnedIdx (L348)
 - **Type**: boolean / number | null / number | null — constituents overlay state
@@ -1363,8 +1383,9 @@ app/frontend/src/index.css
 
 ### API Call Pattern
 
-#### runBacktest (L359-436)
-- **Always calls POST `/api/backtest/multi`** — single-leg wrapped as 1-leg multi with `allocation_pct: 1.0`
+#### runBacktest (L896-992)
+- **Main backtest**: POST `/api/backtest/multi` — single-leg wrapped as 1-leg multi with `allocation_pct: 1.0`
+- **Benchmarks (single-leg only)**: POST `/api/backtest/benchmarks` — single batch request returns all 6 signal equity curves + stats
 - **Benchmark calls**: 6 parallel `/api/backtest/multi` calls with each signal (single-leg only)
 - **Position sizing**: `leg.positionSize / 100` sent to backend
 - **Max leverage**: `maxLeverage / 100` sent to backend

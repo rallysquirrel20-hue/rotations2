@@ -59,10 +59,20 @@
 - Strategy scanner script (`strategy_scanner.py`): sweeps backtest combinations (baskets x signals x filters x pos sizes x leverage) and collects results to CSV/JSON
 - `_was_taken` trade tracking fix: skipped trades due to leverage/cash constraints properly counted
 
-### 10. Variable Position Sizing
+### ~~10. Backtest Performance & Stats UI~~ � COMPLETED (2026-03-23)
+~~Backtest benchmark performance improvements and stats UI rewrite.~~ Completed sub-goals:
+- Batch endpoint (`POST /api/backtest/benchmarks`) loads parquet once and computes equity curves + stats for all 6 signals in one request (eliminates GIL contention, ~3x faster than 7 parallel requests)
+- Fixed missing `incrementProgress()` definition in BacktestPanel.tsx causing ReferenceError on all benchmark requests
+- Fixed mtm_equity return statement incorrectly placed inside for loop (only marked first position to market)
+- Aligned rounding between main backtest and benchmark equity curves
+- Stats tab rewritten: replaced individual strategy cards with unified sortable table (strategies as rows, stats as columns) with portfolio/trade section dividers
+- Buy & Hold stats added to stats table, computed from equity curve
+- UI polish: signal column text centering, progress bar spacing/color, stats table gridlines and header wrapping
+
+### 11. Variable Position Sizing
 Add variable position sizing feature to backtest.
 
-### ~~11. Theme List Dropdown Behavior~~ — RE-FIXED (2026-03-16)
+### ~~13. Theme List Dropdown Behavior~~ — RE-FIXED (2026-03-16)
 ~~Theme lists drop down automatically — should only drop down when the arrow is selected.~~ Regression occurred but has been fixed again by separating basket selection (row click) from expansion toggle (chevron click).
 
 ### ~~12. Basket Returns~~ — COMPLETED (2026-03-17)
@@ -80,12 +90,12 @@ Add variable position sizing feature to backtest.
 ### 16. Export Button
 Export button properly functions with all features on the frontend, with titles / good aesthetic for charts.
 
-### ~~17. Analogs Tab (Cross-Basket Analysis)~~ — COMPLETED (2026-03-18)
+### ~~19. Analogs Tab (Cross-Basket Analysis)~~ — COMPLETED (2026-03-18)
 ~~Add an "Analogs" tab to the cross-basket analysis panel.~~
-- **17a.** ~~Add all relevant factors (same list as backtesting filters)~~ — Multi-timeframe return fingerprints (1D/1W/1M/1Q/1Y/3Y/5Y) with cross-basket rolling correlation
-- **17b.** ~~Add historical ranking system~~ — Value-to-rank fingerprint process with Summary tab showing ranking table
-- **17c.** ~~Cross-asset future returns tab (similar to intrabasket returns and backtest path tabs)~~ — Forward tab (cumulative line chart, 252 days per analog) + Aggregate tab (mean/median/min/max/std at 1M/3M/6M)
-- **17d.** ~~Condition-based query mode~~ — Replaced fingerprint-matching with condition builder (basket + metric + operator + value). Backend `mode=query` evaluates conditions across all dates, returns forward returns at 1W/1M/3M/6M. Frontend tabs reduced to 4 (Summary/Matches/Forward/Aggregate).
+- **19a.** ~~Add all relevant factors (same list as backtesting filters)~~ — Multi-timeframe return fingerprints (1D/1W/1M/1Q/1Y/3Y/5Y) with cross-basket rolling correlation
+- **19b.** ~~Add historical ranking system~~ — Value-to-rank fingerprint process with Summary tab showing ranking table
+- **19c.** ~~Cross-asset future returns tab (similar to intrabasket returns and backtest path tabs)~~ — Forward tab (cumulative line chart, 252 days per analog) + Aggregate tab (mean/median/min/max/std at 1M/3M/6M)
+- **19d.** ~~Condition-based query mode~~ — Replaced fingerprint-matching with condition builder (basket + metric + operator + value). Backend `mode=query` evaluates conditions across all dates, returns forward returns at 1W/1M/3M/6M. Frontend tabs reduced to 4 (Summary/Matches/Forward/Aggregate).
 
 ## Completed
 

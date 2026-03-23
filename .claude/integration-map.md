@@ -598,9 +598,40 @@
 - **Trade interface**: Includes `entry_weight`, `exit_weight`, `contribution` fields (all `number | null`).
 - **Equity curve percentage rebasing**: All series rebased to 0% return from visible window start. Y-axis shows percentages with a breakeven line at 0%.
 - **Path tab**: Trade paths chart visualizing daily percentage return trajectories. Includes sortable legend with columns: Leg, Ticker, Date, Chg. Hovered paths are highlighted; legend entries are color-coded by leg.
-- **Benchmark auto-fire**: For single-leg backtests, automatically fires parallel benchmark requests for all other signal types (excluding `Buy_Hold`) to the same `/api/backtest/multi` endpoint.
+- **Benchmark auto-fire**: For single-leg backtests, fires a single POST `/api/backtest/benchmarks` batch request that returns all 6 signal equity curves + stats in one response. Replaced 6 parallel `/api/backtest/multi` calls (2026-03-23) due to Python GIL serializing CPU-bound work. Benchmark results stored in `benchmarks` (equity curves) and `benchmarkStats` (Stats objects) state.
+- **Stats tab**: Unified sortable table with strategies as rows and stats as columns (portfolio + trade sections). Includes Buy & Hold row computed client-side from equity curve. Sortable by clicking any column header.
 - **Old components**: `BacktestPanel_old.tsx` and `MultiBacktestPanel_old.tsx` are retained but not imported by `App.tsx`. `MultiBacktestPanel.tsx` still exists but is NOT imported.
 - **Also referenced in**: `app/frontend/src/App.tsx` (sole import: `import { BacktestPanel } from './components/BacktestPanel'`)
+
+### `POST /api/backtest/benchmarks` — Batch benchmark endpoint (2026-03-23)
+
+**Request model** — `BenchmarkRequest` (`app/backend/main.py:3961`):
+- `target: str` — basket or ticker name
+- `target_type: str` — 'basket' | 'basket_tickers' | 'ticker' | 'etf'
+- `position_size: float = 1.0` — per-trade position size fraction
+- `max_leverage: float = 2.5` — max leverage multiplier
+- `start_date: Optional[str]`, `end_date: Optional[str]`
+- `signals: List[str]` — defaults to all 6 from SIGNAL_IS_COL (Breakout, Breakdown, Up_Rot, Down_Rot, BTFD, STFR)
+
+**Response shape:**
+```json
+{
+  "dates": ["2000-04-03", ...],
+  "benchmarks": { "Breakout": [1.0, 1.01, ...], "BTFD": [...], ... },
+  "stats": { "Breakout": { "portfolio": {...}, "trade": {...} }, ... },
+  "timings": { "load": 2.1, "per_signal": {"Breakout": 1.3, ...}, "total": 9.8 }
+}
+```
+
+**Why it exists**: The previous approach fired 6 parallel POST `/api/backtest/multi` requests for benchmarks. Due to the Python GIL, CPU-bound pandas work serialized across threads — 7 parallel requests took ~30s (same as sequential). The batch endpoint loads the parquet ONCE, resolves universe ONCE, builds ticker_closes ONCE, then loops over signals. Total time: ~10-12s (~3x faster).
+
+**Data files read** (same as `_build_leg_trades`):
+- `INDIVIDUAL_SIGNALS_FILE` (basket_tickers/ticker)
+- Basket parquets via `_find_basket_parquet` (basket mode)
+- `ETF_SIGNALS_FILE` (ETF mode)
+- Universe JSON files via `_get_universe_history`, `get_latest_universe_tickers`, `get_meta_file_tickers`
+
+**Frontend caller**: `BacktestPanel.tsx` `runBacktest` function — fires alongside the main `/api/backtest/multi` request.
 
 ### BacktestPanel — Leverage Preset Buttons & Uniform Sizing (2026-03-16)
 - **Added**: `LEV_PRESETS = [100, 110, 125, 150, 200, 250]` constant and a row of leverage preset buttons (`.backtest-pos-preset`) in the Position Sizing config section. Clicking a button sets `maxLeverage` state, which is sent as `max_leverage: maxLeverage / 100` to `POST /api/backtest/multi` (unchanged contract).
