@@ -82,8 +82,6 @@ const TF_OPTIONS = [
 ]
 
 const OPERATOR_OPTIONS = [
-  { value: 'positive', label: '> 0' },
-  { value: 'negative', label: '< 0' },
   { value: 'top_n', label: 'Top N' },
   { value: 'bottom_n', label: 'Bottom N' },
   { value: 'above', label: 'Above' },
@@ -235,7 +233,7 @@ export function AnalogsPanel({ apiBase, exportTrigger }: AnalogsPanelProps) {
   const addEmptyCondition = () => {
     setConditions(prev => [...prev, {
       id: condIdCounter, basket: sortedSlugs[0] || '',
-      metric: 'return', timeframe: '1D', operator: 'negative', value: 0,
+      metric: 'return', timeframe: '1D', operator: 'below', value: 0,
     }])
     setCondIdCounter(prev => prev + 1)
   }
@@ -833,7 +831,7 @@ export function AnalogsPanel({ apiBase, exportTrigger }: AnalogsPanelProps) {
                                 const display = cell.value !== null
                                   ? isReturn ? (cell.value * 100).toFixed(1) + '%'
                                   : isRV ? (cell.value * Math.sqrt(252) * 100).toFixed(1)
-                                  : cell.value.toFixed(1) + '%'
+                                  : cell.value.toFixed(1)
                                   : '--'
                                 return summaryShowRanks ? (
                                   <span>

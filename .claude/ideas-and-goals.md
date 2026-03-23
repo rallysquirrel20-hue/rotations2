@@ -34,8 +34,8 @@
 ### ~~8. Backtest Pane Title~~ — COMPLETED (2026-03-16)
 ~~Fix visual asymmetry; include backtest variables in title.~~ Header height aligned to 41px matching sidebar accordion rows. Leverage preset buttons added. Position size and leverage preset rows with labels for symmetry.
 
-### 9. Multi-Basket Backtesting — IN PROGRESS (2026-03-18)
-Multi-leg backtest overhaul. Completed sub-goals:
+### ~~9. Multi-Basket Backtesting~~ — COMPLETED (2026-03-23)
+~~Multi-leg backtest overhaul.~~ Completed sub-goals:
 - Searchable target picker (baskets + tickers) for single-leg and multi-leg
 - Size/lev buttons uniform width, equity/size/lev inputs equal spacing
 - Single-leg half-width card; multi-leg 2-column grid (up to 6 legs)
@@ -50,14 +50,10 @@ Multi-leg backtest overhaul. Completed sub-goals:
 - Path tab columns properly spaced (240px legend)
 - Leverage multiplies position sizes (entry = equity × pos_size × max_lev)
 - Removed Equity $ input (charts show % returns)
-
-Remaining sub-goals:
 - All relevant regime filters (cross-basket source filtering)
-- Trades tab: show position size at entry, contribution to port, weight at exit
+- Trades tab: position size at entry, contribution to port, weight at exit
 - Long-term portfolio stats (CAGR, Sharpe, Sortino, max DD duration)
 - Multi-leg stats: correlation/volatility impact of adding a basket to baseline
-
-**Also completed in this session (2026-03-18):**
 - Multi-leg buy hold defaults to off (clean chart on first load)
 - Constituents overlay expanded + sortable (see Goal 2)
 - Strategy scanner script (`strategy_scanner.py`): sweeps backtest combinations (baskets x signals x filters x pos sizes x leverage) and collects results to CSV/JSON

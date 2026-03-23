@@ -3041,6 +3041,7 @@ class MultiBacktestRequest(BaseModel):
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     max_leverage: float = 2.5
+    equity_only: bool = False  # Return only equity curve (for benchmarks)
 
 
 def _build_leg_trades(target, target_type, entry_signal, filters, start_date, end_date,
@@ -4057,7 +4058,6 @@ def run_multi_backtest(req: MultiBacktestRequest):
     all_leg_dates = set()
     global_date_min = None
     global_date_max = None
-
     for leg in req.legs:
         trades, df, ticker_closes, direction = _build_leg_trades(
             leg.target, leg.target_type, leg.entry_signal,
@@ -4446,7 +4446,7 @@ def run_multi_backtest(req: MultiBacktestRequest):
 
     eq_date_strs = [pd.Timestamp(d).strftime('%Y-%m-%d') for d in all_dates]
 
-    return {
+    result = {
         "legs": leg_responses,
         "combined": {
             "equity_curve": {
@@ -4462,6 +4462,9 @@ def run_multi_backtest(req: MultiBacktestRequest):
         "skipped_entries": skipped_entries,
         "leg_correlations": leg_correlations if leg_correlations else None,
     }
+    if req.equity_only:
+        return {"combined": {"equity_curve": result["combined"]["equity_curve"]}}
+    return result
 
 
 @app.websocket("/ws/live/{ticker}")

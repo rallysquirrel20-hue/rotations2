@@ -635,7 +635,7 @@ function App() {
 
     return (
       <div className={`signal-col-header ${showWeight ? 'indent-constituent' : ''}`}>
-        <span className={`col-ticker col-hdr ${sortCol === 'ticker' ? 'active' : ''}`} onClick={() => handleClick('ticker')}>
+        <span className={`col-ticker col-hdr ${hiddenCols.has('name') ? 'col-expand' : ''} ${sortCol === 'ticker' ? 'active' : ''}`} onClick={() => handleClick('ticker')}>
           Ticker{arrow('ticker')}
         </span>
         {!hiddenCols.has('name') && (
@@ -924,7 +924,7 @@ function App() {
                       className={`accordion-item accordion-item-flex ${selectedItem === t && viewType === 'ETFs' && !activeTicker ? 'active' : ''}`}
                       onClick={() => handleItemSelect(t, 'ETFs')}
                     >
-                      <span className="col-ticker ticker-symbol">{t}</span>
+                      <span className={`col-ticker ticker-symbol${hiddenCols.has('name') ? ' col-expand' : ''}`}>{t}</span>
                       {!hiddenCols.has('name') && <span className="col-name" title={tickerNames[t] || ''}>{tickerNames[t] || ''}</span>}
                       {renderSignalCols(t, undefined, true)}
                     </div>
@@ -950,7 +950,7 @@ function App() {
                       className={`accordion-item accordion-item-flex ${selectedItem === t && viewType === 'LiveSignals' && !activeTicker ? 'active' : ''}`}
                       onClick={() => handleItemSelect(t, 'LiveSignals')}
                     >
-                      <span className="col-ticker ticker-symbol">{t}</span>
+                      <span className={`col-ticker ticker-symbol${hiddenCols.has('name') ? ' col-expand' : ''}`}>{t}</span>
                       {!hiddenCols.has('name') && <span className="col-name" title={tickerNames[t] || ''}>{tickerNames[t] || ''}</span>}
                       {renderSignalCols(t, undefined, true)}
                     </div>
@@ -972,7 +972,7 @@ function App() {
                       className={`accordion-item accordion-item-flex ${selectedItem === t && viewType === 'Tickers' && !activeTicker ? 'active' : ''}`}
                       onClick={() => handleItemSelect(t, 'Tickers')}
                     >
-                      <span className="col-ticker ticker-symbol">{t}</span>
+                      <span className={`col-ticker ticker-symbol${hiddenCols.has('name') ? ' col-expand' : ''}`}>{t}</span>
                       {!hiddenCols.has('name') && <span className="col-name" title={tickerNames[t] || ''}>{tickerNames[t] || ''}</span>}
                       {renderSignalCols(t, undefined, true)}
                     </div>
@@ -1080,7 +1080,7 @@ function App() {
                               className={`accordion-constituent ${activeTicker === t.symbol ? 'active' : ''}`}
                               onClick={() => { setActiveTicker(t.symbol); setSummaryData(null); }}
                             >
-                              <span className="col-ticker ticker-symbol">{t.symbol}</span>
+                              <span className={`col-ticker ticker-symbol${hiddenCols.has('name') ? ' col-expand' : ''}`}>{t.symbol}</span>
                               {!hiddenCols.has('name') && <span className="col-name" title={tickerNames[t.symbol] || ''}>{tickerNames[t.symbol] || ''}</span>}
                               {renderSignalCols(t.symbol, t.weight)}
                             </div>

@@ -792,21 +792,32 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
     })
   }
 
-  // ── Fetch date range from first leg with a target ──
+  // ── Fetch date ranges for all legs and compute effective range ──
   const [dataRange, setDataRange] = useState<{ min: string; max: string } | null>(null)
+  const legTargetKey = legs.map(l => `${l.targetType}:${l.target}`).join(',')
   useEffect(() => {
-    const firstWithTarget = legs.find(l => l.target)
-    if (!firstWithTarget) return
-    const { target: t, targetType: tt } = firstWithTarget
-    fetch(`${apiBase}/date-range/${tt}/${encodeURIComponent(t)}`)
-      .then(r => r.json())
-      .then((d: { min: string; max: string }) => {
-        setDataRange(d)
-        setStartDate(prev => prev || d.min)
-        setEndDate(prev => prev || d.max)
-      })
-      .catch(() => {})
-  }, [legs.map(l => l.target + l.targetType).join(','), apiBase])
+    const withTarget = legs.filter(l => l.target)
+    if (withTarget.length === 0) { setDataRange(null); return }
+    let cancelled = false
+    Promise.all(withTarget.map(l =>
+      fetch(`${apiBase}/date-range/${l.targetType}/${encodeURIComponent(l.target)}`)
+        .then(r => r.ok ? r.json() as Promise<{ min: string; max: string }> : null)
+        .catch(() => null)
+    )).then(ranges => {
+      if (cancelled) return
+      const valid = ranges.filter((r): r is { min: string; max: string } => r !== null)
+      if (valid.length === 0) return
+      // Effective start = latest min (newest initial date); effective end = latest max
+      const effectiveMin = valid.reduce((acc, r) => r.min > acc ? r.min : acc, valid[0].min)
+      const effectiveMax = valid.reduce((acc, r) => r.max > acc ? r.max : acc, valid[0].max)
+      // Picker bounds = union (widest range across all legs)
+      const boundsMin = valid.reduce((acc, r) => r.min < acc ? r.min : acc, valid[0].min)
+      setDataRange({ min: boundsMin, max: effectiveMax })
+      setStartDate(effectiveMin)
+      setEndDate(effectiveMax)
+    })
+    return () => { cancelled = true }
+  }, [legTargetKey, apiBase])
 
   // ── Shared settings ──
   const [maxLeverage, setMaxLeverage] = useState(250)
@@ -816,6 +827,8 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
   // ── Results ──
   const [result, setResult] = useState<MultiBacktestResult | null>(null)
   const [loading, setLoading] = useState(false)
+  const [btProgress, setBtProgress] = useState(0)
+  const [btProgressMsg, setBtProgressMsg] = useState('')
   const [error, setError] = useState('')
   const [showResults, setShowResults] = useState(false)
   const [resultTab, setResultTab] = useState<ResultTab>('equity')
@@ -883,87 +896,96 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
   const runBacktest = useCallback(async () => {
     if (!allocValid || !allTargetsSet || !exitsValid) return
     setLoading(true)
+    setBtProgress(0)
+    setBtProgressMsg('')
     setError('')
     setBenchmarks({})
     setShowBenchmark({})
     const gen = ++benchmarkGenRef.current
+
+    const benchSignals = isSingleLeg ? ENTRY_SIGNALS.filter(s => !['Long', 'Short'].includes(s)) : []
+    const totalTasks = 1 + benchSignals.length
+    let completed = 0
+    let animTarget = 0 // target % from completions — animation approaches this
+    const estimatedMs = 20000 // estimated total duration for smooth fill
+    const startTime = Date.now()
+
+    // Smooth progress: blends elapsed-time estimate with completion-based floor
+    const progressTimer = setInterval(() => {
+      const elapsed = Date.now() - startTime
+      const timePct = 90 * (1 - Math.exp(-elapsed / (estimatedMs * 0.4))) // exponential fill to ~90%
+      const completionPct = Math.round(completed / totalTasks * 100)
+      animTarget = Math.max(animTarget, completionPct)
+      setBtProgress(Math.round(Math.max(timePct, animTarget)))
+    }, 200)
+
     try {
-      const resp = await fetch(`${apiBase}/backtest/multi`, {
+      // Build main request body
+      const mainBody = {
+        legs: legs.map(l => ({
+          target: l.target,
+          target_type: l.targetType,
+          entry_signal: l.entrySignal,
+          exit_signal: l.exitSignal && l.exitSignal !== 'none' && !l.exitSignal.startsWith('rv_') ? l.exitSignal : undefined,
+          exit_rv_multiple: l.exitSignal?.startsWith('rv_') ? parseFloat(l.exitSignal.slice(3)) : undefined,
+          no_exit_target: l.exitSignal === 'none' ? true : undefined,
+          stop_signal: l.stopSignal && l.stopSignal !== 'none' && !l.stopSignal.startsWith('rv_') && !l.stopSignal.startsWith('trv_') ? l.stopSignal : undefined,
+          stop_rv_multiple: l.stopSignal?.startsWith('rv_') && !l.stopSignal.startsWith('trv_') ? parseFloat(l.stopSignal.slice(3)) : undefined,
+          trailing_stop_rv_multiple: l.stopSignal?.startsWith('trv_') ? parseFloat(l.stopSignal.slice(4)) : undefined,
+          allocation_pct: isSingleLeg ? 1.0 : l.allocationPct / 100,
+          position_size: l.positionSize / 100,
+          filters: l.filters.map(f => ({ ...f, lookback: f.lookback || 21 })),
+        })),
+        start_date: startDate || null,
+        end_date: endDate || null,
+        max_leverage: maxLeverage / 100,
+      }
+
+      // Fire main + all benchmarks in parallel
+      const mainPromise = fetch(`${apiBase}/backtest/multi`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          legs: legs.map(l => ({
-            target: l.target,
-            target_type: l.targetType,
-            entry_signal: l.entrySignal,
-            exit_signal: l.exitSignal && l.exitSignal !== 'none' && !l.exitSignal.startsWith('rv_') ? l.exitSignal : undefined,
-            exit_rv_multiple: l.exitSignal?.startsWith('rv_') ? parseFloat(l.exitSignal.slice(3)) : undefined,
-            no_exit_target: l.exitSignal === 'none' ? true : undefined,
-            stop_signal: l.stopSignal && l.stopSignal !== 'none' && !l.stopSignal.startsWith('rv_') && !l.stopSignal.startsWith('trv_') ? l.stopSignal : undefined,
-            stop_rv_multiple: l.stopSignal?.startsWith('rv_') && !l.stopSignal.startsWith('trv_') ? parseFloat(l.stopSignal.slice(3)) : undefined,
-            trailing_stop_rv_multiple: l.stopSignal?.startsWith('trv_') ? parseFloat(l.stopSignal.slice(4)) : undefined,
-            allocation_pct: isSingleLeg ? 1.0 : l.allocationPct / 100,
-            position_size: l.positionSize / 100,
-            filters: l.filters.map(f => ({ ...f, lookback: f.lookback || 21 })),
-          })),
-          start_date: startDate || null,
-          end_date: endDate || null,
-          max_leverage: maxLeverage / 100,
-        }),
+        body: JSON.stringify(mainBody),
+      }).then(async r => {
+        if (!r.ok) { const err = await r.json().catch(() => ({ detail: r.statusText })); throw new Error(err.detail || r.statusText) }
+        return r.json() as Promise<MultiBacktestResult>
+      }).then(data => {
+        incrementProgress()
+        setResult(data)
+        setShowResults(true)
+        setResultTab('equity')
+        eqViewRef.current = { start: 0, end: data.combined.equity_curve.dates.length - 1 }
+        setEqViewVersion(v => v + 1)
       })
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({ detail: resp.statusText }))
-        throw new Error(err.detail || resp.statusText)
-      }
-      const data: MultiBacktestResult = await resp.json()
 
-      // Auto-fire benchmarks for all backtests (using first leg's target)
-      if (data.legs.length > 0) {
+      const benchPromises = benchSignals.map(sig => {
         const leg0 = legs[0]
-        const benchSignals = ENTRY_SIGNALS.filter(s => !['Long', 'Short'].includes(s))
-        const benchPromises = benchSignals.map(sig =>
-          fetch(`${apiBase}/backtest/multi`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              legs: [{
-                target: leg0.target,
-                target_type: leg0.targetType,
-                entry_signal: sig,
-                allocation_pct: 1.0,
-                position_size: leg0.positionSize / 100,
-                filters: [],
-              }],
-              start_date: startDate || null,
-              end_date: endDate || null,
-              max_leverage: maxLeverage / 100,
-            }),
-          })
-            .then(r => r.ok ? r.json() : null)
-            .then(d => d ? { sig, curve: d.combined.equity_curve.combined as number[] } : null)
-            .catch(() => null)
-        )
-        Promise.all(benchPromises).then(results => {
-          if (benchmarkGenRef.current !== gen) return
-          const newBench: Record<string, number[]> = {}
-          for (const b of results) {
-            if (b) newBench[b.sig] = b.curve
-          }
-          setBenchmarks(newBench)
+        return fetch(`${apiBase}/backtest/multi`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            legs: [{ target: leg0.target, target_type: leg0.targetType, entry_signal: sig, allocation_pct: 1.0, position_size: leg0.positionSize / 100, filters: [] }],
+            start_date: startDate || null, end_date: endDate || null, max_leverage: maxLeverage / 100, equity_only: true,
+          }),
         })
-      }
+          .then(r => r.ok ? r.json() : null)
+          .then(d => {
+            incrementProgress()
+            if (benchmarkGenRef.current !== gen) return
+            if (d) setBenchmarks(prev => ({ ...prev, [sig]: d.combined.equity_curve.combined as number[] }))
+          })
+          .catch(() => { incrementProgress() })
+      })
 
-      setResult(data)
-      setShowResults(true)
-      setResultTab('equity')
-      eqViewRef.current = { start: 0, end: data.combined.equity_curve.dates.length - 1 }
-      setEqViewVersion(v => v + 1)
+      await Promise.all([mainPromise, ...benchPromises])
     } catch (e: any) {
       setError(e.message || 'Unknown error')
     } finally {
+      clearInterval(progressTimer)
+      setBtProgress(100)
       setLoading(false)
     }
-  }, [apiBase, legs, startDate, endDate, maxLeverage, allocValid, allTargetsSet, isSingleLeg])
+  }, [apiBase, legs, startDate, endDate, maxLeverage, allocValid, allTargetsSet, isSingleLeg, exitsValid])
 
   // ── Export current tab when exportTrigger changes ──
   const prevExportTrigger = useRef(exportTrigger || 0)
@@ -2499,10 +2521,18 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
               )}
             </div>
 
-            <button className="control-btn primary" onClick={runBacktest}
-              disabled={loading || (isMultiLeg && !allocValid) || !allTargetsSet || !exitsValid}>
-              {loading ? 'Running...' : 'Run Backtest'}
-            </button>
+            <div className="bt-run-row">
+              <button className="control-btn primary" onClick={runBacktest}
+                disabled={loading || (isMultiLeg && !allocValid) || !allTargetsSet || !exitsValid}>
+                {loading ? `${btProgress}%` : 'Run Backtest'}
+              </button>
+              {loading && (
+                <div className="bt-progress-container">
+                  <div className="bt-progress-bar" style={{ width: `${btProgress}%` }} />
+                  {btProgressMsg && <span className="bt-progress-msg">{btProgressMsg}</span>}
+                </div>
+              )}
+            </div>
             {error && <div className="backtest-error">{error}</div>}
           </div>
 
