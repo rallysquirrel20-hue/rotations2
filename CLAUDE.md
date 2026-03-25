@@ -7,8 +7,14 @@ Quantitative finance monorepo: signal generation pipeline + web dashboard.
 ```
 rotations/
 ├── signals/              Signal generation pipeline
-│   ├── rotations.py      Main pipeline (~9000 lines, 15 cells)
+│   ├── rotations.py      Monolithic pipeline (~6300 lines) — still runs via live_loop.py
 │   ├── rotations_old_outputs.py   Extracted Group B report cells
+│   ├── foundation.py     Shared module: constants, paths, signal engine, cache helpers
+│   ├── universe.py       Phase 1: quarterly universe construction
+│   ├── tickersignals.py  Phase 2: daily stock + ETF signal generation
+│   ├── basketsignals.py  Phase 3: daily basket equity/signal generation
+│   ├── livesignals.py    Phase 4: intraday live loop (~75s)
+│   ├── live_loop.py      Legacy loop runner (runs rotations.py every 15 min)
 │   └── databento_test.py
 ├── app/
 │   ├── backend/          FastAPI server
@@ -39,14 +45,15 @@ Both subsystems communicate through `~/Documents/Python_Outputs/Data_Storage/`:
 - **Consumer** (app): reads those caches via FastAPI endpoints
 
 Key shared files:
-- `signals_cache_500.parquet` — Individual ticker signals
+- `signals_500.parquet` — Individual ticker signals (Source='norgate' + 'live')
+- `signals_etf_50.parquet` — ETF signals (Source='norgate' + 'live')
 - `basket_equity_cache/{slug}_equity_ohlc.parquet` — Basket OHLC
 - `basket_signals_cache/{slug}_basket_signals.parquet` — Basket signals
 - `correlation_cache/within_osc_500.parquet` — Pre-computed correlations
 - `top500stocks.json` — Quarterly universe
 - `gics_mappings_500.json` — Sector/industry mappings
-- `live_signals_500.parquet` — Intraday signals (Source='live')
-- `live_basket_signals_500.parquet` — Intraday basket OHLC
+- `live_signals_500.parquet` — Intraday ticker OHLC snapshot (backward compat)
+- `live_basket_signals_500.parquet` — Intraday basket OHLC snapshot (backward compat)
 - `returns_matrix_500.parquet` — Pre-computed close-return pivot (Date × Ticker); rebuilt when universe/data changes
 - `returns_matrix_500.fingerprint` — MD5 hash guard for `returns_matrix_500.parquet` freshness
 
@@ -70,7 +77,37 @@ npm run lint                       # eslint .
 
 # Both via PM2
 pm2 start ecosystem.config.js
+
+# Independent pipeline scripts (run from signals/ directory)
+cd signals
+python universe.py                 # Phase 1: rebuild universes (quarterly/on demand)
+python tickersignals.py            # Phase 2: rebuild ticker + ETF signals (daily)
+python basketsignals.py            # Phase 3: rebuild basket signals (daily, after Phase 2)
+python livesignals.py              # Phase 4: live intraday loop (~75s interval)
 ```
+
+## Pipeline Architecture
+
+The signal generation pipeline has two execution modes:
+
+### Legacy mode (current)
+`live_loop.py` runs the entire `rotations.py` every 15 minutes via subprocess. All phases execute sequentially in a single process.
+
+### Split mode (new)
+Four independent scripts, each running on its own schedule, communicating only through disk (parquet/JSON):
+
+| File | Schedule | What it does |
+|------|----------|-------------|
+| `universe.py` | Quarterly / on demand | Builds ticker universes from Norgatedata, writes JSON caches |
+| `tickersignals.py` | Daily after Norgate update | Builds/updates signal caches for 500 stocks + 50 ETFs |
+| `basketsignals.py` | Daily after signals | Processes ~27 baskets (equity curves, breadth, correlation, contributions) |
+| `livesignals.py` | Every ~75s (market hours) | Fetches Databento OHLC, appends `Source='live'` rows to all parquets |
+
+All four import shared infrastructure from `foundation.py` (constants, paths, signal engine, cache helpers).
+
+**Data flow:** `universe.py` → JSON caches → `tickersignals.py` → signal parquets → `basketsignals.py` → basket parquets → `livesignals.py` appends live rows to all parquets.
+
+**Live data strategy (Option A):** `livesignals.py` appends live rows with `Source='live'` directly into consolidated parquets (signals, ETF signals, basket parquets). The backend reads one file per data type — no separate live files to merge at query time. Idempotent: existing `Source='live'` rows for today are dropped before re-appending.
 
 ## Environment Variables
 
@@ -122,8 +159,10 @@ These files are maintained by agents — read them for instant context:
 
 ## File Navigation
 
-- `signals/rotations.py` is ~9000 lines. Check `.claude/dependency-tree.md` for cell map and line ranges FIRST. ALWAYS read the specific function before editing — never edit based on memory.
+- `signals/rotations.py` is ~6300 lines (down from ~9000 after PDF export removal). Check `.claude/dependency-tree.md` for cell map and line ranges FIRST. ALWAYS read the specific function before editing — never edit based on memory.
+- The split pipeline files (`foundation.py`, `universe.py`, `tickersignals.py`, `basketsignals.py`, `livesignals.py`) extract code from `rotations.py` but `rotations.py` is still the source of truth. Both coexist — the split files are not yet the primary execution path.
 - When a function is modified, check both batch path (`signals/rotations.py`) AND live path (`app/backend/signals_engine.py` / `app/backend/main.py`) for parallel implementations.
+- Shared signal logic lives in `foundation.py`: `_build_signals_from_df()`, `_build_signals_next_row()`, numba JIT passes, basket cache helpers. Changes here affect all four pipeline phases.
 
 ## Performance Baselines
 
