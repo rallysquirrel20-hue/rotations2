@@ -428,10 +428,7 @@ export function AnalogsPanel({ apiBase, exportTrigger }: AnalogsPanelProps) {
       ctx.globalAlpha = 1
     })
 
-    // Title
-    const match = queryData!.matches[selectedMatch!]
-    ctx.fillStyle = '#586e75'; ctx.font = 'bold 10px monospace'; ctx.textAlign = 'left'
-    ctx.fillText(`FORWARD RETURNS from ${match.date}`, pad.left, 14)
+    // (title drawn by export overlay, not on live canvas)
   }, [tab, fwdSeries, queryData, selectedMatch, fwdDims, fwdHovered, renderTick, fwdLogScale])
 
   // Build ranked series for legend (sorted by return for color assignment, then user-sortable)
@@ -672,9 +669,7 @@ export function AnalogsPanel({ apiBase, exportTrigger }: AnalogsPanelProps) {
     for (let i = 0; i < nDates; i++) { i === 0 ? ctx.moveTo(xScale(i), yScale(mean[i])) : ctx.lineTo(xScale(i), yScale(mean[i])) }
     ctx.stroke()
 
-    // Title
-    ctx.fillStyle = '#586e75'; ctx.font = 'bold 10px monospace'; ctx.textAlign = 'left'
-    ctx.fillText(`${aggSelectedBasket?.replace(/_/g, ' ').toUpperCase()} — AVG FORWARD (n=${aggPathData.count})`, pad.left, 14)
+    // (title drawn by export overlay, not on live canvas)
   }, [tab, aggPathData, aggDims, aggLogScale, aggSelectedBasket, renderTick, aggHoveredMatch])
 
   // Export
@@ -684,13 +679,225 @@ export function AnalogsPanel({ apiBase, exportTrigger }: AnalogsPanelProps) {
       prevExportTrigger.current = exportTrigger || 0; return
     }
     prevExportTrigger.current = exportTrigger
-    const canvas = tab === 'forward' ? fwdCanvasRef.current : null
+
+    // Summary tab: export as CSV
+    if (tab === 'summary') {
+      if (!summaryRows.rows.length || !summaryRows.factors.length) return
+      const headers = ['Basket', ...summaryRows.factors.map(f => {
+        const tf = FACTOR_LABELS[f] || f
+        const metricName = summaryMetric === 'returns' ? 'Return' : summaryMetric === 'rv_ema' ? 'Volatility' : summaryMetric === 'correlation_pct' ? 'Correlation' : summaryMetric === 'uptrend_pct' ? 'Breadth' : summaryMetric === 'breakout_pct' ? 'Breakout' : summaryMetric
+        return `${metricName} ${tf}`
+      }), ...summaryRows.factors.map(f => {
+        const tf = FACTOR_LABELS[f] || f
+        const metricName = summaryMetric === 'returns' ? 'Return' : summaryMetric === 'rv_ema' ? 'Volatility' : summaryMetric === 'correlation_pct' ? 'Correlation' : summaryMetric === 'uptrend_pct' ? 'Breadth' : summaryMetric === 'breakout_pct' ? 'Breakout' : summaryMetric
+        return `${metricName} ${tf} Rank`
+      })]
+      const csvRows = [headers.join(',')]
+      for (const row of summaryRows.rows) {
+        const vals = [
+          row.slug.replace(/_/g, ' '),
+          ...row.cells.map(c => {
+            if (c.value === null) return ''
+            const isReturn = c.factor.startsWith('returns_')
+            const isRV = c.factor.startsWith('rv_ema_')
+            return isReturn ? (c.value * 100).toFixed(2) + '%'
+              : isRV ? (c.value * Math.sqrt(252) * 100).toFixed(1)
+              : c.value.toFixed(1)
+          }),
+          ...row.cells.map(c => c.rank !== null ? String(c.rank) : '')
+        ]
+        csvRows.push(vals.join(','))
+      }
+      // Prepend date range as first row
+      const envRange = data?.current ? `${data.current.start} to ${data.current.end}` : ''
+      if (envRange) csvRows.unshift(`Date Range: ${envRange}`)
+      const blob = new Blob([csvRows.join('\n')], { type: 'text/csv' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url; a.download = `analogs_summary_${summaryMetric}_${data?.current?.end || ''}.csv`; a.click()
+      URL.revokeObjectURL(url)
+      return
+    }
+
+    const canvas = tab === 'forward' ? fwdCanvasRef.current : tab === 'aggregate' ? aggCanvasRef.current : null
     if (!canvas) return
-    canvas.toBlob(blob => {
+
+    // Build descriptive title
+    // Shared state
+    const totalBaskets = sortedSlugs.length
+    const matchCount = queryData?.matches?.length ?? 0
+    const condStr = conditions.length > 0
+      ? conditions.map(c => {
+          const bLabel = c.basket.startsWith('*') ? c.basket.slice(1) : c.basket.replace(/_/g, ' ')
+          let opLabel: string
+          if (c.operator === 'top_n') opLabel = `top ${c.value}/${totalBaskets}`
+          else if (c.operator === 'bottom_n') opLabel = `bottom ${c.value}/${totalBaskets}`
+          else if (c.operator === 'above') opLabel = `above ${c.value}`
+          else if (c.operator === 'below') opLabel = `below ${c.value}`
+          else opLabel = c.operator
+          return `${bLabel} ${c.metric} ${c.timeframe} ${opLabel}`
+        }).join(' + ')
+      : 'No conditions'
+
+    // Tab-specific titles and data
+    const isAgg = tab === 'aggregate'
+    const activeHorizon = isAgg ? aggHorizon : fwdHorizon
+    const horizonLabel = activeHorizon <= 21 ? '1M' : activeHorizon <= 63 ? '1Q' : '1Y'
+
+    let titleRight: string
+    let filename: string
+    if (isAgg) {
+      const bName = aggSelectedBasket?.replace(/_/g, ' ') || 'unknown'
+      titleRight = `${bName} Avg Forward ${horizonLabel}`
+      filename = `analogs_aggregate_${horizonLabel}_${aggSelectedBasket || 'none'}.png`
+    } else {
+      const matchDate = (selectedMatch !== null && queryData?.matches?.[selectedMatch])
+        ? queryData.matches[selectedMatch].date : ''
+      titleRight = `Forward Returns ${horizonLabel} from ${matchDate}`
+      filename = `analogs_forward_${horizonLabel}_${matchDate || 'none'}.png`
+    }
+    const envRange = data?.current ? `${data.current.start} to ${data.current.end}` : ''
+    const titleLeft = `${matchCount} matches | ${condStr}${envRange ? '  |  ' + envRange : ''}`
+
+    // Composite: left panel + chart + right panel + title labels
+    const dpr = window.devicePixelRatio || 1
+    const leftW = isAgg ? 180 : 120
+    const rightW = 180
+    const chartW = canvas.width / dpr
+    const chartH = canvas.height / dpr
+    const totalW = leftW + chartW + rightW
+    const lineH = 16
+    const headerH = 20
+
+    const composite = document.createElement('canvas')
+    composite.width = totalW * dpr
+    composite.height = canvas.height
+    const cCtx = composite.getContext('2d')
+    if (!cCtx) return
+    cCtx.scale(dpr, dpr)
+
+    // Background
+    cCtx.fillStyle = '#fdf6e3'
+    cCtx.fillRect(0, 0, totalW, chartH)
+
+    // Horizon toggle buttons row
+    const btnH = 28
+    const horizonLabels: [string, number][] = [['1M', 21], ['1Q', 63], ['1Y', 252]]
+    const btnW = Math.floor(leftW / horizonLabels.length)
+    for (let i = 0; i < horizonLabels.length; i++) {
+      const [label, days] = horizonLabels[i]
+      const bx = i * btnW
+      const isActive = activeHorizon === days
+      cCtx.fillStyle = isActive ? '#586e75' : '#eee8d5'
+      cCtx.fillRect(bx, 0, btnW, btnH)
+      cCtx.strokeStyle = '#93a1a1'; cCtx.lineWidth = 1
+      cCtx.strokeRect(bx, 0, btnW, btnH)
+      cCtx.fillStyle = isActive ? '#fdf6e3' : '#586e75'
+      cCtx.font = 'bold 10px monospace'
+      cCtx.textAlign = 'center'
+      cCtx.textBaseline = 'middle'
+      cCtx.fillText(label, bx + btnW / 2, btnH / 2)
+    }
+    cCtx.strokeStyle = '#93a1a1'; cCtx.lineWidth = 1
+    cCtx.beginPath(); cCtx.moveTo(0, btnH); cCtx.lineTo(leftW, btnH); cCtx.stroke()
+
+    // Left panel content
+    cCtx.textBaseline = 'top'
+    if (isAgg) {
+      // Aggregate left: basket picker with Basket/Avg header
+      cCtx.fillStyle = '#586e75'; cCtx.font = 'bold 10px monospace'
+      cCtx.textAlign = 'left'; cCtx.fillText('Basket', 8, btnH + 6)
+      cCtx.textAlign = 'right'; cCtx.fillText('Avg', leftW - 8, btnH + 6)
+      const listStart = btnH + headerH + 4
+      cCtx.font = '10px monospace'
+      for (let i = 0; i < aggBasketList.length && (i * lineH + listStart) < chartH; i++) {
+        const { slug, avg } = aggBasketList[i]
+        const y = listStart + i * lineH
+        const isSel = aggSelectedBasket === slug
+        if (isSel) {
+          cCtx.fillStyle = '#586e75'; cCtx.fillRect(0, y - 2, leftW, lineH)
+          cCtx.fillStyle = '#fdf6e3'; cCtx.font = 'bold 10px monospace'
+        } else {
+          cCtx.fillStyle = '#586e75'; cCtx.font = '10px monospace'
+        }
+        cCtx.textAlign = 'left'; cCtx.fillText(slug.replace(/_/g, ' '), 8, y)
+        const avgColor = isSel ? '#fdf6e3' : avg === null ? '#93a1a1' : avg >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)'
+        cCtx.fillStyle = avgColor; cCtx.textAlign = 'right'
+        cCtx.fillText(avg !== null ? (avg * 100).toFixed(1) + '%' : '--', leftW - 8, y)
+      }
+    } else {
+      // Forward left: match dates
+      const matches = queryData?.matches ?? []
+      cCtx.font = '10px monospace'
+      for (let i = 0; i < matches.length && (i * lineH + btnH + 4) < chartH; i++) {
+        const y = btnH + 4 + i * lineH
+        const isSel = i === selectedMatch
+        if (isSel) {
+          cCtx.fillStyle = '#586e75'; cCtx.fillRect(0, y - 2, leftW, lineH)
+          cCtx.fillStyle = '#fdf6e3'; cCtx.font = 'bold 10px monospace'
+        } else {
+          cCtx.fillStyle = '#586e75'; cCtx.font = '10px monospace'
+        }
+        cCtx.textAlign = 'center'; cCtx.fillText(matches[i].date, leftW / 2, y)
+      }
+    }
+
+    // Separator left
+    cCtx.strokeStyle = '#93a1a1'; cCtx.lineWidth = 1
+    cCtx.beginPath(); cCtx.moveTo(leftW - 0.5, 0); cCtx.lineTo(leftW - 0.5, chartH); cCtx.stroke()
+
+    // Chart in center
+    cCtx.setTransform(1, 0, 0, 1, 0, 0)
+    cCtx.drawImage(canvas, leftW * dpr, 0)
+    cCtx.scale(dpr, dpr)
+
+    // Separator right
+    cCtx.strokeStyle = '#93a1a1'
+    cCtx.beginPath(); cCtx.moveTo(leftW + chartW + 0.5, 0); cCtx.lineTo(leftW + chartW + 0.5, chartH); cCtx.stroke()
+
+    // Right panel
+    const rX = leftW + chartW + 8
+    if (isAgg) {
+      // Aggregate right: match dates with Chg
+      cCtx.fillStyle = '#586e75'; cCtx.font = 'bold 10px monospace'; cCtx.textBaseline = 'top'
+      cCtx.textAlign = 'left'; cCtx.fillText('Date', rX, 8)
+      cCtx.textAlign = 'right'; cCtx.fillText('Chg', totalW - 8, 8)
+      cCtx.font = '10px monospace'
+      for (let i = 0; i < aggSortedMatches.length && i * lineH + headerH + 4 < chartH; i++) {
+        const m = aggSortedMatches[i]
+        const y = headerH + 4 + i * lineH
+        cCtx.fillStyle = '#586e75'; cCtx.textAlign = 'left'; cCtx.fillText(m.date, rX, y)
+        cCtx.fillStyle = m.ret === null ? '#93a1a1' : m.ret >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)'
+        cCtx.textAlign = 'right'; cCtx.fillText(m.ret !== null ? (m.ret * 100).toFixed(1) + '%' : '--', totalW - 8, y)
+      }
+    } else {
+      // Forward right: basket legend
+      cCtx.fillStyle = '#586e75'; cCtx.font = 'bold 10px monospace'; cCtx.textBaseline = 'top'
+      cCtx.textAlign = 'left'; cCtx.fillText('Basket', rX, 8)
+      cCtx.textAlign = 'right'; cCtx.fillText('Chg', totalW - 8, 8)
+      cCtx.font = '10px monospace'
+      for (let i = 0; i < fwdSortedLegend.length && i * lineH + headerH + 4 < chartH; i++) {
+        const s = fwdSortedLegend[i]
+        const y = headerH + 4 + i * lineH
+        cCtx.fillStyle = fwdColorMap.get(s.slug) || '#586e75'
+        cCtx.textAlign = 'left'; cCtx.fillText(s.slug.replace(/_/g, ' '), rX, y)
+        cCtx.fillStyle = s.finalRet >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)'
+        cCtx.textAlign = 'right'; cCtx.fillText((s.finalRet * 100).toFixed(1) + '%', totalW - 8, y)
+      }
+    }
+
+    // Title labels on chart area (same size both sides)
+    cCtx.fillStyle = '#586e75'; cCtx.textBaseline = 'top'
+    cCtx.font = '11px monospace'; cCtx.textAlign = 'left'
+    cCtx.fillText(titleLeft, leftW + 12, 8)
+    cCtx.font = 'bold 11px monospace'; cCtx.textAlign = 'right'
+    cCtx.fillText(titleRight, leftW + chartW - 60, 8)
+
+    composite.toBlob(blob => {
       if (!blob) return
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
-      a.href = url; a.download = `query_${tab}.png`; a.click()
+      a.href = url; a.download = filename; a.click()
       URL.revokeObjectURL(url)
     }, 'image/png')
   }, [exportTrigger, tab])
@@ -878,27 +1085,13 @@ export function AnalogsPanel({ apiBase, exportTrigger }: AnalogsPanelProps) {
                     Add conditions and click "Find Matches"
                   </div>
                 ) : (
-                  queryData.matches.map((match, mi) => {
-                    const avgFwd = (hz: string) => {
-                      const fwd = match.forward[hz]
-                      if (!fwd) return null
-                      const vals = Object.values(fwd).filter((v): v is number => v !== null)
-                      return vals.length > 0 ? vals.reduce((a, b) => a + b, 0) / vals.length : null
-                    }
-                    const avg1Q = avgFwd('1Q')
-                    return (
-                      <button key={mi}
-                        className={`contrib-quarter-btn ${selectedMatch === mi ? 'active' : ''}`}
-                        onClick={() => setSelectedMatch(mi)}>
-                        <span>{match.date}</span>
-                        {avg1Q !== null && (
-                          <span style={{ float: 'right', color: selectedMatch === mi ? 'var(--base3)' : avg1Q >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)' }}>
-                            {(avg1Q * 100).toFixed(1)}%
-                          </span>
-                        )}
-                      </button>
-                    )
-                  })
+                  queryData.matches.map((match, mi) => (
+                    <button key={mi}
+                      className={`contrib-quarter-btn ${selectedMatch === mi ? 'active' : ''}`}
+                      onClick={() => setSelectedMatch(mi)}>
+                      <span>{match.date}</span>
+                    </button>
+                  ))
                 )}
               </div>
             </div>

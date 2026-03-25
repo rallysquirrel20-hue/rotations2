@@ -4861,6 +4861,224 @@ async def websocket_endpoint(websocket: WebSocket, ticker: str):
         except:
             pass
 
+@app.get("/api/signals/log")
+def get_signals_log(universe: str = "stocks", period: str = "1m"):
+    """Return recent signal firings across the universe with entry/exit, MAE, MFE, performance."""
+    import pyarrow.parquet as pq
+    import numpy as np
+
+    period_days = {'1d': 1, '3d': 3, '1w': 5, '2w': 10, '1m': 21, '3m': 63, '6m': 126, '1y': 252}
+    lookback = period_days.get(period, 21)
+
+    # Load current universe for filtering
+    valid_tickers = None
+    if universe == 'stocks':
+        if TOP_500_FILE.exists():
+            try:
+                with open(TOP_500_FILE, 'r') as uf:
+                    udata = json.load(uf)
+                    qs = sorted(udata.keys())
+                    if qs:
+                        valid_tickers = set(udata[qs[-1]])
+            except Exception:
+                pass
+    elif universe == 'etfs':
+        if ETF_UNIVERSES_FILE.exists():
+            try:
+                with open(ETF_UNIVERSES_FILE, 'r') as uf:
+                    udata = json.load(uf)
+                    qs = sorted(udata.keys())
+                    if qs:
+                        valid_tickers = set(udata[qs[-1]])
+            except Exception:
+                pass
+
+    # Load ticker names for stocks/ETFs
+    ticker_names = {}
+    if universe in ('stocks', 'etfs') and TICKER_NAMES_FILE.exists():
+        try:
+            with open(TICKER_NAMES_FILE, 'r') as nf:
+                ticker_names = json.load(nf)
+        except Exception:
+            pass
+
+    # Load GICS mappings for sector/industry (stocks only)
+    ticker_sector = {}
+    ticker_industry = {}
+    if universe == 'stocks' and GICS_MAPPINGS_FILE.exists():
+        try:
+            with open(GICS_MAPPINGS_FILE, 'r') as gf:
+                gics = json.load(gf)
+            ticker_sector = gics.get('ticker_sector', {})
+            ticker_industry = gics.get('ticker_subindustry', {})
+        except Exception:
+            pass
+
+    # Select parquet file(s)
+    if universe == 'etfs':
+        files = [ETF_SIGNALS_FILE] if ETF_SIGNALS_FILE.exists() else []
+    elif universe == 'baskets':
+        files = []
+        for folder in BASKET_CACHE_FOLDERS:
+            if folder.exists():
+                files.extend(folder.glob("*_of_*_signals.parquet"))
+    else:  # stocks
+        files = [INDIVIDUAL_SIGNALS_FILE] if INDIVIDUAL_SIGNALS_FILE.exists() else []
+
+    if not files:
+        return {'signals': []}
+
+    SIG_NAMES = ['Breakout', 'Breakdown', 'Up_Rot', 'Down_Rot', 'BTFD', 'STFR']
+    base_cols = ['Ticker', 'Date', 'Close']
+    sig_cols = []
+    for sig in SIG_NAMES:
+        sig_cols.extend([
+            SIGNAL_IS_COL[sig],
+            f'{sig}_Entry_Price', f'{sig}_Exit_Date', f'{sig}_Exit_Price',
+            f'{sig}_MFE', f'{sig}_MAE',
+        ])
+
+    all_signals = []
+    cutoff_ts = pd.Timestamp.now() - pd.Timedelta(days=int(lookback * 2.5))
+
+    for f in files:
+        if not f.exists():
+            continue
+        try:
+            schema = pq.read_schema(str(f))
+            available = set(schema.names)
+            cols = [c for c in base_cols + sig_cols if c in available]
+
+            df = pd.read_parquet(f, columns=cols, filters=[('Date', '>=', cutoff_ts)])
+            if df.empty:
+                continue
+            if valid_tickers is not None:
+                df = df[df['Ticker'].isin(valid_tickers)]
+                if df.empty:
+                    continue
+            df = df.sort_values(['Ticker', 'Date'])
+
+            max_date = df['Date'].max()
+            bday_cutoff = max_date - pd.tseries.offsets.BDay(lookback)
+
+            # Currently-open pairs from latest rows (vectorized)
+            latest_rows = df.groupby('Ticker').tail(1).set_index('Ticker')
+            currently_open = set()
+            for sig in SIG_NAMES:
+                xd_col = f'{sig}_Exit_Date'
+                if xd_col in available:
+                    open_tickers = latest_rows[latest_rows[xd_col].isna()].index
+                    currently_open.update((t, sig) for t in open_tickers)
+
+            # Last close per ticker, overlaid with live intraday prices
+            last_close_s = df.groupby('Ticker')['Close'].last().astype(float)
+            live_file = (ETF_LIVE_SIGNALS_FILE if universe == 'etfs'
+                         else LIVE_BASKET_SIGNALS_FILE if universe == 'baskets'
+                         else LIVE_SIGNALS_FILE)
+            live_df = _read_live_parquet(live_file)
+            if live_df is not None and _live_is_current(live_df, max_date):
+                # Live basket file uses 'BasketName' instead of 'Ticker'
+                tk_col = 'BasketName' if 'BasketName' in live_df.columns else 'Ticker'
+                if tk_col in live_df.columns and 'Close' in live_df.columns:
+                    live_map = live_df.dropna(subset=[tk_col, 'Close']).set_index(tk_col)['Close'].astype(float)
+                    last_close_s = last_close_s.copy()
+                    last_close_s.update(live_map)
+
+            for sig in SIG_NAMES:
+                is_col = SIGNAL_IS_COL[sig]
+                if is_col not in available:
+                    continue
+
+                fired = df[(df[is_col] == True) & (df['Date'] >= bday_cutoff)].copy()
+                if fired.empty:
+                    continue
+
+                is_short = BACKTEST_DIRECTION.get(sig) == 'short'
+                ep_col = f'{sig}_Entry_Price'
+                xd_col = f'{sig}_Exit_Date'
+                xp_col = f'{sig}_Exit_Price'
+                mfe_col = f'{sig}_MFE'
+                mae_col = f'{sig}_MAE'
+
+                # Determine open/closed vectorized
+                last_fire = fired.groupby('Ticker')['Date'].transform('max')
+                is_last = fired['Date'] == last_fire
+                open_tickers_sig = {t for (t, s) in currently_open if s == sig}
+
+                if xd_col in available:
+                    is_open = (
+                        (is_last & fired['Ticker'].isin(open_tickers_sig))
+                        | fired[xd_col].isna()
+                        | (fired[xd_col] >= max_date)
+                    )
+                else:
+                    is_open = pd.Series(True, index=fired.index)
+
+                # Exit prices: live/last close for open, parquet value for closed
+                open_exit = fired['Ticker'].map(last_close_s).fillna(fired['Close'])
+                closed_exit = fired[xp_col].astype(float) if xp_col in available else pd.Series(np.nan, index=fired.index)
+                exit_prices = open_exit.where(is_open, closed_exit)
+
+                # Entry prices
+                ep_vals = fired[ep_col].astype(float) if ep_col in available else pd.Series(np.nan, index=fired.index)
+
+                # %Chg
+                valid_ep = ep_vals.notna() & (ep_vals != 0) & exit_prices.notna()
+                pct_chg = pd.Series(np.nan, index=fired.index)
+                if is_short:
+                    pct_chg.loc[valid_ep] = (ep_vals - exit_prices) / ep_vals
+                else:
+                    pct_chg.loc[valid_ep] = (exit_prices - ep_vals) / ep_vals
+
+                # MAE/MFE with live update for open trades
+                mae_vals = fired[mae_col].astype(float) if mae_col in available else pd.Series(np.nan, index=fired.index)
+                mfe_vals = fired[mfe_col].astype(float) if mfe_col in available else pd.Series(np.nan, index=fired.index)
+                open_valid = is_open & valid_ep
+                live_exc = pct_chg.copy()
+                mfe_vals.loc[open_valid] = pd.concat([mfe_vals.loc[open_valid], live_exc.loc[open_valid]], axis=1).max(axis=1)
+                mae_vals.loc[open_valid] = pd.concat([mae_vals.loc[open_valid], live_exc.loc[open_valid]], axis=1).min(axis=1)
+
+                # Exit date strings: None for open, formatted for closed
+                exit_date_strs = pd.Series(None, index=fired.index, dtype=object)
+                if xd_col in available:
+                    closed_mask = ~is_open & fired[xd_col].notna()
+                    exit_date_strs.loc[closed_mask] = pd.to_datetime(fired.loc[closed_mask, xd_col]).dt.strftime('%Y-%m-%d')
+
+                # Build result DataFrame
+                result = pd.DataFrame({
+                    'ticker': fired['Ticker'].values,
+                    'name': fired['Ticker'].map(ticker_names).values if ticker_names else None,
+                    'sector': fired['Ticker'].map(ticker_sector).values if ticker_sector else None,
+                    'industry': fired['Ticker'].map(ticker_industry).values if ticker_industry else None,
+                    'signal': sig,
+                    'entry_date': fired['Date'].dt.strftime('%Y-%m-%d').values,
+                    'entry_price': np.round(ep_vals.values, 2),
+                    'exit_date': exit_date_strs.values,
+                    'exit_price': np.round(exit_prices.values, 2),
+                    'mae': np.round(mae_vals.values, 4),
+                    'mfe': np.round(mfe_vals.values, 4),
+                    'pct_chg': np.round(pct_chg.values, 4),
+                    'status': np.where(is_open.values, 'open', 'closed'),
+                })
+                # NaN → None for JSON serialization
+                result = result.where(result.notna(), None)
+                all_signals.extend(result.to_dict('records'))
+        except Exception as e:
+            import traceback as _tb
+            logger.warning(f"signals/log: failed to read {f.name}: {e}\n{''.join(_tb.format_exc())}")
+            continue
+
+    all_signals.sort(key=lambda x: x['entry_date'] or '', reverse=True)
+    # Ensure all values are JSON-serializable (convert numpy types to native Python)
+    for row in all_signals:
+        for k, v in row.items():
+            if isinstance(v, (np.floating, np.integer)):
+                row[k] = None if np.isnan(v) else v.item()
+            elif isinstance(v, float) and np.isnan(v):
+                row[k] = None
+    return {'signals': all_signals}
+
+
 if __name__ == "__main__":
     import uvicorn
     # Use 0.0.0.0 to allow access from other devices on the network

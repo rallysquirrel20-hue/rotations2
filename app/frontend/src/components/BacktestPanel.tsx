@@ -196,10 +196,12 @@ const RETURNS_PRESETS = [
   { label: '5Y', days: 1825 }, { label: 'ALL', days: 0 },
 ] as const
 
-function BacktestReturnsView({ dates, series, viewMode = 'single' }: {
+function BacktestReturnsView({ dates, series, viewMode = 'single', exportTrigger, exportLabel }: {
   dates: string[]
   series: { key: string; label: string; curve: number[]; color: string }[]
   viewMode?: 'single' | 'multi'
+  exportTrigger?: number
+  exportLabel?: string
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -423,8 +425,8 @@ function BacktestReturnsView({ dates, series, viewMode = 'single' }: {
         ctx.globalAlpha = 1
       })
     } else if (viewMode === 'multi' && chartView === 'bar') {
-      // Multi-strat bar chart — one bar per strategy
-      const items = multiBarData
+      // Multi-strat bar chart — one bar per strategy, sorted worst→best (left→right)
+      const items = [...multiBarData].sort((a, b) => a.ret - b.ret)
       const n = items.length
       if (n === 0) return
       const labelFontSize = Math.min(11, Math.max(7, Math.floor((dims.w - 110) / n * 0.7 * 0.7)))
@@ -475,7 +477,7 @@ function BacktestReturnsView({ dates, series, viewMode = 'single' }: {
       // Bar chart (single strat)
       const n = barData.returns.length
       if (n === 0) return
-      const p = { top: 12, right: 50, bottom: 60, left: 60 }
+      const p = { top: 12, right: 50, bottom: 60, left: 20 }
       const plotW = dims.w - p.left - p.right
       const plotH = dims.h - p.top - p.bottom
       const barW = Math.max(1, (plotW / n) * 0.75)
@@ -491,8 +493,8 @@ function BacktestReturnsView({ dates, series, viewMode = 'single' }: {
         const v = yMin + (yMax - yMin) * (i / 6)
         const y = yScale(v)
         ctx.beginPath(); ctx.moveTo(p.left, y); ctx.lineTo(dims.w - p.right, y); ctx.stroke()
-        ctx.fillStyle = '#6c757d'; ctx.font = '10px monospace'; ctx.textAlign = 'right'
-        ctx.fillText((v * 100).toFixed(2) + '%', p.left - 5, y + 3)
+        ctx.fillStyle = '#6c757d'; ctx.font = '10px monospace'; ctx.textAlign = 'left'
+        ctx.fillText((v * 100).toFixed(2) + '%', dims.w - p.right + 5, y + 3)
       }
       ctx.strokeStyle = '#adb5bd'; ctx.lineWidth = 1; ctx.setLineDash([4, 4])
       ctx.beginPath(); ctx.moveTo(p.left, zeroY); ctx.lineTo(dims.w - p.right, zeroY); ctx.stroke()
@@ -588,6 +590,82 @@ function BacktestReturnsView({ dates, series, viewMode = 'single' }: {
     if (ne > dateBoundsMax) ne = dateBoundsMax
     setStartDate(ns); setEndDate(ne); setActivePreset('')
   }
+
+  // Export
+  const prevExportTrigger2 = useRef(exportTrigger || 0)
+  useEffect(() => {
+    if (!exportTrigger || exportTrigger === prevExportTrigger2.current) {
+      prevExportTrigger2.current = exportTrigger || 0; return
+    }
+    prevExportTrigger2.current = exportTrigger
+    const canvas = canvasRef.current
+    if (!canvas) return
+
+    const dpr = window.devicePixelRatio || 1
+    const chartW = canvas.width / dpr
+    const chartH = canvas.height / dpr
+    const dateRange = `${startDate} – ${endDate}`
+
+    if (viewMode === 'multi' && chartView === 'line') {
+      // Multi-strat line: include right legend panel
+      const rightW = 180
+      const totalW = chartW + rightW
+      const composite = document.createElement('canvas')
+      composite.width = totalW * dpr; composite.height = canvas.height
+      const cCtx = composite.getContext('2d')
+      if (!cCtx) return
+      cCtx.drawImage(canvas, 0, 0)
+      cCtx.scale(dpr, dpr)
+      // Right panel
+      cCtx.fillStyle = '#fdf6e3'; cCtx.fillRect(chartW, 0, rightW, chartH)
+      cCtx.strokeStyle = '#93a1a1'; cCtx.lineWidth = 1
+      cCtx.beginPath(); cCtx.moveTo(chartW + 0.5, 0); cCtx.lineTo(chartW + 0.5, chartH); cCtx.stroke()
+      const rX = chartW + 8
+      cCtx.fillStyle = '#586e75'; cCtx.font = 'bold 10px monospace'; cCtx.textBaseline = 'top'
+      cCtx.textAlign = 'left'; cCtx.fillText('Strategy', rX, 8)
+      cCtx.textAlign = 'right'; cCtx.fillText('Chg', totalW - 8, 8)
+      cCtx.font = '10px monospace'
+      const legendItems = sortedMultiSeries
+      for (let i = 0; i < legendItems.length && i * 16 + 28 < chartH; i++) {
+        const s = legendItems[i]
+        const y = 28 + i * 16
+        cCtx.fillStyle = s.color; cCtx.textAlign = 'left'; cCtx.fillText(s.label, rX, y)
+        cCtx.fillStyle = s.lastVal >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)'
+        cCtx.textAlign = 'right'; cCtx.fillText((s.lastVal * 100).toFixed(1) + '%', totalW - 8, y)
+      }
+      // Labels on chart
+      cCtx.fillStyle = '#586e75'; cCtx.font = '11px monospace'; cCtx.textAlign = 'left'
+      cCtx.fillText(exportLabel || '', 12, 6)
+      cCtx.font = 'bold 11px monospace'; cCtx.textAlign = 'right'
+      cCtx.fillText(dateRange, chartW - 60, 6)
+      composite.toBlob(blob => {
+        if (!blob) return
+        const url = URL.createObjectURL(blob); const a = document.createElement('a')
+        a.href = url; a.download = `multi_strat_returns.png`; a.click(); URL.revokeObjectURL(url)
+      }, 'image/png')
+    } else {
+      // Single-strat bar or multi-strat bar: just labels on chart
+      const selSeries = series.find(s => s.key === selectedKey)
+      const stratLabel = viewMode === 'single' ? `${selSeries?.label || ''} ${barPeriod}` : ''
+      const padR = viewMode === 'multi' ? 50 : 50
+      const composite = document.createElement('canvas')
+      composite.width = canvas.width; composite.height = canvas.height
+      const cCtx = composite.getContext('2d')
+      if (!cCtx) return
+      cCtx.drawImage(canvas, 0, 0)
+      cCtx.scale(dpr, dpr)
+      cCtx.fillStyle = '#586e75'; cCtx.textBaseline = 'top'
+      cCtx.font = '11px monospace'; cCtx.textAlign = 'left'
+      cCtx.fillText(exportLabel ? `${exportLabel}  ${stratLabel}` : stratLabel, 12, 6)
+      cCtx.font = 'bold 11px monospace'; cCtx.textAlign = 'right'
+      cCtx.fillText(dateRange, chartW - padR, 6)
+      composite.toBlob(blob => {
+        if (!blob) return
+        const url = URL.createObjectURL(blob); const a = document.createElement('a')
+        a.href = url; a.download = `${viewMode}_strat_returns.png`; a.click(); URL.revokeObjectURL(url)
+      }, 'image/png')
+    }
+  }, [exportTrigger])
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
@@ -1015,21 +1093,167 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
       return
     }
     prevExportTrigger.current = exportTrigger
-    const tabLabel = resultTab
-    const legLabel = legs.map(l => l.target).join('+')
-    const filename = `${legLabel}_${tabLabel}.png`
-    const downloadCanvas = (canvas: HTMLCanvasElement) => {
-      canvas.toBlob((blob) => {
+
+    // Build common labels
+    const legDescs = legs.map(l => {
+      const target = l.target.replace(/_/g, ' ')
+      const tickerFlag = l.targetType === 'basket_tickers' ? ' (Tickers)' : ''
+      const entry = l.entrySignal
+      const exitParts: string[] = []
+      if (l.exitSignal) exitParts.push(l.exitSignal)
+      if (l.stopSignal) exitParts.push(`Stop:${l.stopSignal}`)
+      const exit = exitParts.length > 0 ? exitParts.join('+') : 'Default'
+      const alloc = legs.length > 1 ? ` Alloc:${l.allocationPct}%` : ''
+      return `${target}${tickerFlag} Entry:${entry} Exit:${exit} Pos:${l.positionSize}%${alloc}`
+    })
+    const levLabel = `Lev:${maxLeverage}%`
+    const dateRange = result?.date_range ? `${result.date_range.min} – ${result.date_range.max}` : `${startDate} – ${endDate}`
+    const titleLeft = legDescs.join('  |  ') + `  ${levLabel}`
+    const filenameBase = legs.map(l => l.target).join('+')
+
+    // CSV export helper
+    const downloadCSV = (content: string, fname: string) => {
+      const blob = new Blob([content], { type: 'text/csv' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url; a.download = fname; a.click()
+      URL.revokeObjectURL(url)
+    }
+
+    // PNG export helper with labels (padRight = chart's right padding for y-axis alignment)
+    const downloadCanvas = (canvas: HTMLCanvasElement, tabName: string, padRight = 60) => {
+      const dpr = window.devicePixelRatio || 1
+      const cW = canvas.width / dpr
+      const composite = document.createElement('canvas')
+      composite.width = canvas.width
+      composite.height = canvas.height
+      const cCtx = composite.getContext('2d')
+      if (!cCtx) return
+      cCtx.drawImage(canvas, 0, 0)
+      cCtx.scale(dpr, dpr)
+      cCtx.fillStyle = '#586e75'
+      cCtx.textBaseline = 'top'
+      cCtx.font = '11px monospace'
+      cCtx.textAlign = 'left'
+      cCtx.fillText(titleLeft, 12, 6)
+      cCtx.font = 'bold 11px monospace'
+      cCtx.textAlign = 'right'
+      cCtx.fillText(dateRange, cW - padRight, 6)
+      composite.toBlob((blob) => {
         if (!blob) return
         const url = URL.createObjectURL(blob)
         const a = document.createElement('a')
-        a.href = url; a.download = filename; a.click()
+        a.href = url; a.download = `${filenameBase}_${tabName}.png`; a.click()
         URL.revokeObjectURL(url)
       }, 'image/png')
     }
-    if (resultTab === 'equity' && canvasRef.current) downloadCanvas(canvasRef.current)
-    else if (resultTab === 'distribution' && histCanvasRef.current) downloadCanvas(histCanvasRef.current)
-    else if (resultTab === 'path' && pathCanvasRef.current) downloadCanvas(pathCanvasRef.current)
+
+    if (resultTab === 'equity' && canvasRef.current) downloadCanvas(canvasRef.current, 'equity', 60)
+    else if (resultTab === 'distribution' && histCanvasRef.current) downloadCanvas(histCanvasRef.current, 'distribution', 30)
+    else if (resultTab === 'path' && pathCanvasRef.current) {
+      // Path: include right-side legend panel
+      const canvas = pathCanvasRef.current
+      const dpr = window.devicePixelRatio || 1
+      const chartW = canvas.width / dpr
+      const chartH = canvas.height / dpr
+      const rightW = 240
+      const totalW = chartW + rightW
+      const composite = document.createElement('canvas')
+      composite.width = totalW * dpr; composite.height = canvas.height
+      const cCtx = composite.getContext('2d')
+      if (cCtx) {
+        cCtx.drawImage(canvas, 0, 0)
+        cCtx.scale(dpr, dpr)
+        // Right panel background + separator
+        cCtx.fillStyle = '#fdf6e3'; cCtx.fillRect(chartW, 0, rightW, chartH)
+        cCtx.strokeStyle = '#93a1a1'; cCtx.lineWidth = 1
+        cCtx.beginPath(); cCtx.moveTo(chartW + 0.5, 0); cCtx.lineTo(chartW + 0.5, chartH); cCtx.stroke()
+        // Header
+        const rX = chartW + 8
+        const resultIsMulti = result && result.legs.length > 1
+        cCtx.fillStyle = '#586e75'; cCtx.font = 'bold 10px monospace'; cCtx.textBaseline = 'top'
+        cCtx.textAlign = 'left'
+        if (resultIsMulti) cCtx.fillText('Leg', rX, 8)
+        const hasTickers = allPaths.some(d => d.trade.ticker)
+        const tickerX = resultIsMulti ? rX + 55 : rX
+        if (hasTickers) cCtx.fillText('Ticker', tickerX, 8)
+        const dateX = hasTickers ? tickerX + 50 : tickerX
+        cCtx.fillText('Date', dateX, 8)
+        cCtx.textAlign = 'right'; cCtx.fillText('Chg', totalW - 8, 8)
+        // Rows
+        cCtx.font = '9px monospace'
+        const colorRanked = [...allPaths].sort((a, b) => b.ret - a.ret)
+        const rankColor = (rank: number, total: number): string => {
+          if (total <= 1) return 'rgb(50, 50, 255)'
+          const t = rank / (total - 1)
+          if (t <= 0.5) { const s = t * 2; return `rgb(${Math.round(50 + 102 * s)}, 50, ${Math.round(255 - 53 * s)})` }
+          const s = (t - 0.5) * 2; return `rgb(${Math.round(152 + 103 * s)}, 50, ${Math.round(202 - 52 * s)})`
+        }
+        const colorMap = new Map(colorRanked.map((d, rank) => [allPaths.indexOf(d), rankColor(rank, colorRanked.length)]))
+        for (let i = 0; i < allPaths.length && i * 14 + 26 < chartH; i++) {
+          const d = allPaths[i]
+          const y = 26 + i * 14
+          const color = colorMap.get(i) || '#586e75'
+          cCtx.fillStyle = color; cCtx.textAlign = 'left'
+          if (resultIsMulti) cCtx.fillText(d.legTarget.replace(/_/g, ' ').slice(0, 8), rX, y)
+          if (hasTickers) cCtx.fillText(d.trade.ticker || '', tickerX, y)
+          cCtx.fillText(d.trade.entry_date.slice(2), dateX, y)
+          cCtx.fillStyle = d.ret >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)'
+          cCtx.textAlign = 'right'; cCtx.fillText((d.ret * 100).toFixed(1) + '%', totalW - 8, y)
+        }
+        // Labels on chart
+        cCtx.fillStyle = '#586e75'; cCtx.font = '11px monospace'; cCtx.textAlign = 'left'
+        cCtx.fillText(titleLeft, 12, 6)
+        cCtx.font = 'bold 11px monospace'; cCtx.textAlign = 'right'
+        cCtx.fillText(dateRange, chartW - 70, 6)
+        composite.toBlob(blob => {
+          if (!blob) return
+          const url = URL.createObjectURL(blob); const a = document.createElement('a')
+          a.href = url; a.download = `${filenameBase}_path.png`; a.click(); URL.revokeObjectURL(url)
+        }, 'image/png')
+      }
+    } else if (resultTab === 'stats' && result) {
+      const rows = [`${titleLeft},,,${dateRange}`, '']
+      // Header
+      const statKeys = ['strategy_return', 'cagr', 'volatility', 'max_dd', 'sharpe', 'sortino'] as const
+      const tradeKeys = ['trades_met_criteria', 'trades_taken', 'trades_skipped', 'win_rate', 'avg_winner', 'avg_loser', 'ev'] as const
+      rows.push(['Strategy', ...statKeys.map(k => k.replace(/_/g, ' ')), ...tradeKeys.map(k => k.replace(/_/g, ' '))].join(','))
+      for (const leg of result.legs) {
+        const ps = leg.stats.portfolio
+        const ts = leg.stats.trades
+        rows.push([
+          leg.target,
+          ...statKeys.map(k => ps[k] != null ? String(ps[k]) : ''),
+          ...tradeKeys.map(k => ts[k] != null ? String(ts[k]) : ''),
+        ].join(','))
+      }
+      if (result.combined) {
+        const ps = result.combined.stats.portfolio
+        const ts = result.combined.stats.trades
+        rows.push([
+          'Combined',
+          ...statKeys.map(k => ps[k] != null ? String(ps[k]) : ''),
+          ...tradeKeys.map(k => ts[k] != null ? String(ts[k]) : ''),
+        ].join(','))
+      }
+      downloadCSV(rows.join('\n'), `${filenameBase}_stats.csv`)
+    } else if (resultTab === 'trades' && result) {
+      const rows = [`${titleLeft},,,${dateRange}`, '']
+      rows.push(['Leg', 'Ticker', 'Entry Date', 'Exit Date', 'Entry Price', 'Exit Price', 'Return', 'Bars Held', 'MFE', 'MAE'].join(','))
+      for (const leg of result.legs) {
+        for (const t of leg.trades) {
+          rows.push([
+            leg.target, t.ticker ?? '', t.entry_date, t.exit_date,
+            t.entry_price?.toFixed(2) ?? '', t.exit_price?.toFixed(2) ?? '',
+            t.change != null ? (t.change * 100).toFixed(2) + '%' : '',
+            t.bars_held ?? '',
+            t.mfe != null ? (t.mfe * 100).toFixed(2) + '%' : '',
+            t.mae != null ? (t.mae * 100).toFixed(2) + '%' : '',
+          ].join(','))
+        }
+      }
+      downloadCSV(rows.join('\n'), `${filenameBase}_trades.csv`)
+    }
   }, [exportTrigger])
 
   // ── ResizeObserver for equity canvas container ──
@@ -2210,7 +2434,8 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
                     allSeries.push({ key: sig, label: sig.replace(/_/g, ' '), curve: benchmarks[sig], color: BENCHMARK_COLORS[sig] || '#657b83' })
                   }
                 }
-                return <BacktestReturnsView dates={eq.dates} series={allSeries} viewMode={resultTab === 'multi_returns' ? 'multi' : 'single'} />
+                const rTitleLeft = titleLeft
+                return <BacktestReturnsView dates={eq.dates} series={allSeries} viewMode={resultTab === 'multi_returns' ? 'multi' : 'single'} exportTrigger={exportTrigger} exportLabel={rTitleLeft} />
               })()}
               {/* ── Trades tab ── */}
               {resultTab === 'trades' && (

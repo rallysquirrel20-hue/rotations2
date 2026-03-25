@@ -1,6 +1,20 @@
 # Monorepo Integration Map
 
-> Auto-generated 2026-03-16. Last updated 2026-03-20 (batch 8). Tracks all communication points between signals/ and app/backend/.
+> Auto-generated 2026-03-16. Last updated 2026-03-24 (batch 9). Tracks all communication points between signals/ and app/backend/.
+
+## New Endpoint: GET /api/signals/log (added 2026-03-24)
+
+Returns recent signal firings across stocks/ETFs/baskets with entry/exit, MAE, MFE, performance.
+
+- **Query params**: `universe` (stocks|etfs|baskets), `period` (1d|1w|1m|3m|6m|1y)
+- **Reads (stocks)**: `signals_500.parquet`, `top500stocks.json`, `gics_mappings_500.json`, `ticker_names.json`, `live_signals_500.parquet`
+- **Reads (ETFs)**: `signals_etf_50.parquet`, `etf_universes_50.json`, `ticker_names.json`, `live_signals_etf_50.parquet`
+- **Reads (baskets)**: All `*_of_*_signals.parquet` from thematic/sector/industry cache folders, `live_basket_signals_500.parquet` (note: uses `BasketName` column, not `Ticker`)
+- **Signal columns read**: `Ticker`, `Date`, `Close`, `Is_Breakout`, `Is_Breakdown`, `Is_Up_Rotation`, `Is_Down_Rotation`, `Is_BTFD`, `Is_STFR`, and per signal: `{sig}_Entry_Price`, `{sig}_Exit_Date`, `{sig}_Exit_Price`, `{sig}_MFE`, `{sig}_MAE`
+- **Universe filtering**: stocks filtered to latest quarter of `top500stocks.json`; ETFs filtered to latest quarter of `etf_universes_50.json`; baskets unfiltered
+- **Open/closed detection**: checks latest row per ticker for NaT exit_date (ground truth), not firing row's exit_date (can be stale)
+- **Live overlay**: updates exit price, %chg, MAE, MFE for open trades with intraday prices
+- **Frontend consumer**: `SignalsPanel.tsx`
 
 ## Signal Refresh Entry Point
 

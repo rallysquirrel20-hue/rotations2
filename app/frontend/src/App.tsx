@@ -4,6 +4,7 @@ import { TVChart } from './components/TVChart'
 import { BasketSummary } from './components/BasketSummary'
 import { BacktestPanel } from './components/BacktestPanel'
 import { AnalogsPanel } from './components/AnalogsPanel'
+import { SignalsPanel } from './components/SignalsPanel'
 
 // DYNAMIC API BASE:
 // Automatically uses the hostname of the machine you are browsing from.
@@ -73,9 +74,10 @@ interface BasketSummaryData {
   correlation: CorrelationData
   cumulative_returns: CumulativeReturnsData
 }
-type ViewType = 'Themes' | 'Sectors' | 'Industries' | 'Tickers' | 'LiveSignals' | 'ETFs';
-type SearchCategory = 'all' | 'Themes' | 'Sectors' | 'Industries' | 'Tickers' | 'ETFs';
+type ViewType = 'Themes' | 'Sectors' | 'Industries' | 'Tickers' | 'LiveSignals' | 'ETFs' | 'Portfolio';
+type SearchCategory = 'all' | 'Themes' | 'Sectors' | 'Industries' | 'Tickers' | 'ETFs' | 'Portfolio';
 interface SearchResult { name: string; category: ViewType; displayName: string; }
+interface ImportedPortfolio { name: string; tickers: { symbol: string; weight: number }[] }
 interface TickerSignalSummary { lt_trend: string | null; st_trend: string | null; mean_rev: string | null; pct_change: number | null; dollar_vol: number | null; last_price: number | null; }
 type SignalSortCol = 'ticker' | 'name' | 'wt' | 'lt' | 'st' | 'mr' | 'price' | 'pct'
 type BasketSortCol = 'name' | 'bo' | 'br' | 'cor' | 'lt' | 'st' | 'mr' | 'price' | 'chg'
@@ -149,6 +151,7 @@ function App() {
   const [summaryLoading, setSummaryLoading] = useState(false)
   const [showBacktest, setShowBacktest] = useState(false)
   const [showAnalogs, setShowAnalogs] = useState(false)
+  const [showSignals, setShowSignals] = useState(false)
   const [backtestBaskets, setBacktestBaskets] = useState<string[]>([])
   const contentStackRef = useRef<HTMLDivElement>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
@@ -185,6 +188,22 @@ function App() {
   const [eFilterMR, setEFilterMR] = useState<string | null>(null)
   const [eFilterOpen, setEFilterOpen] = useState<SignalSortCol | null>(null)
 
+  // Imported portfolio state
+  const [portfolios, setPortfolios] = useState<ImportedPortfolio[]>(() => {
+    try { return JSON.parse(localStorage.getItem('imported_portfolios') || '[]') }
+    catch { return [] }
+  })
+  const [importOpen, setImportOpen] = useState(false)
+  const [importName, setImportName] = useState('')
+  const [importText, setImportText] = useState('')
+  const [expandedPortfolios, setExpandedPortfolios] = useState<Set<string>>(new Set())
+  const [pSortCol, setPSortCol] = useState<SignalSortCol>('wt')
+  const [pSortDir, setPSortDir] = useState<1 | -1>(-1)
+  const [pFilterLT, setPFilterLT] = useState<string | null>(null)
+  const [pFilterST, setPFilterST] = useState<string | null>(null)
+  const [pFilterMR, setPFilterMR] = useState<string | null>(null)
+  const [pFilterOpen, setPFilterOpen] = useState<SignalSortCol | null>(null)
+
   // Basket sort/filter state
   const [bSortCol, setBSortCol] = useState<BasketSortCol>('name')
   const [bSortDir, setBSortDir] = useState<1 | -1>(1)
@@ -206,7 +225,7 @@ function App() {
   // Single derived flag: is quarter mode on?
   const isQuarterMode = quarterActive && !!quarterStart && !!quarterEnd
 
-  const isTicker = viewType === 'Tickers' || viewType === 'LiveSignals' || viewType === 'ETFs'
+  const isTicker = viewType === 'Tickers' || viewType === 'LiveSignals' || viewType === 'ETFs' || viewType === 'Portfolio'
   const isBasketView = !isTicker && !activeTicker
   const canShowSummary = isBasketView
 
@@ -532,6 +551,10 @@ function App() {
     }
   }, [sortedETFs, viewType, selectedItem, effectiveSignals])
 
+  useEffect(() => {
+    localStorage.setItem('imported_portfolios', JSON.stringify(portfolios))
+  }, [portfolios])
+
   const toggleView = (view: ViewType) => {
     setExpandedViews(prev => {
       const next = new Set(prev)
@@ -539,6 +562,41 @@ function App() {
       else next.add(view)
       return next
     })
+  }
+
+  const togglePortfolio = (name: string) => {
+    setExpandedPortfolios(prev => {
+      const next = new Set(prev)
+      if (next.has(name)) next.delete(name)
+      else next.add(name)
+      return next
+    })
+  }
+
+  const handleImport = () => {
+    const lines = importText.trim().split(/\n/)
+    const items: { symbol: string; weight: number }[] = []
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
+      const parts = trimmed.split(/[\s,\t]+/)
+      if (parts.length >= 2) {
+        const symbol = parts[0].toUpperCase().replace(/[^A-Z0-9.]/g, '')
+        const weight = parseFloat(parts[1].replace('%', ''))
+        if (symbol && !isNaN(weight)) items.push({ symbol, weight: weight / 100 })
+      }
+    }
+    if (items.length > 0 && importName.trim()) {
+      setPortfolios(prev => [...prev, { name: importName.trim(), tickers: items }])
+      setImportOpen(false)
+      setImportName('')
+      setImportText('')
+    }
+  }
+
+  const handleDeletePortfolio = (name: string) => {
+    setPortfolios(prev => prev.filter(p => p.name !== name))
+    setExpandedPortfolios(prev => { const next = new Set(prev); next.delete(name); return next })
   }
 
   const handleBasketSelect = (item: string, view: ViewType) => {
@@ -552,6 +610,7 @@ function App() {
       setSummaryData(null)
       setShowBacktest(false)
       setShowAnalogs(false)
+      setShowSignals(false)
       setIntraBasketTarget(item)
     }
   }
@@ -564,6 +623,7 @@ function App() {
     setSummaryData(null)
     setShowBacktest(false)
     setShowAnalogs(false)
+    setShowSignals(false)
     setExpandedBasket(null)
     setIntraBasketTarget('')
   }
@@ -873,7 +933,18 @@ function App() {
               <img src="/usamlogo.webp" alt="U.S. Asset Management" className="sidebar-logo" />
             </div>
             <div className="col-toggle-wrapper">
-              <button className="col-toggle-btn" onClick={() => setColMenuOpen(v => !v)} title="Toggle columns">Columns</button>
+              <button className="col-toggle-btn" onClick={() => { setImportOpen(v => !v); setColMenuOpen(false) }} title="Import portfolio">Import</button>
+              {importOpen && (
+                <>
+                  <div className="col-filter-backdrop" onClick={() => setImportOpen(false)}></div>
+                  <div className="import-menu" onClick={e => e.stopPropagation()}>
+                    <input type="text" className="import-name-input" placeholder="Portfolio name" value={importName} onChange={e => setImportName(e.target.value)} />
+                    <textarea className="import-textarea" placeholder={'Paste tickers with weights:\nAAPL 10%\nMSFT 8.5%\nGOOGL 7%'} value={importText} onChange={e => setImportText(e.target.value)} rows={8} />
+                    <button className="import-submit-btn" onClick={handleImport}>Import</button>
+                  </div>
+                </>
+              )}
+              <button className="col-toggle-btn" onClick={() => { setColMenuOpen(v => !v); setImportOpen(false) }} title="Toggle columns">Columns</button>
               {colMenuOpen && (
                 <>
                   <div className="col-filter-backdrop" onClick={() => setColMenuOpen(false)}></div>
@@ -906,6 +977,46 @@ function App() {
             </div>
           </div>
           <div className="sidebar-scrollable-content">
+            {portfolios.map(p => {
+              const isExp = expandedPortfolios.has(p.name)
+              const weightMap = new Map(p.tickers.map(t => [t.symbol, t.weight]))
+              let list = p.tickers.map(t => t.symbol)
+              if (pFilterLT) list = list.filter(t => effectiveSignals[t]?.lt_trend === pFilterLT)
+              if (pFilterST) list = list.filter(t => effectiveSignals[t]?.st_trend === pFilterST)
+              if (pFilterMR) list = list.filter(t => effectiveSignals[t]?.mean_rev === pFilterMR)
+              const sorted = [...list].sort((a, b) => {
+                let va: string | number, vb: string | number
+                if (pSortCol === 'wt') { va = weightMap.get(a) ?? -Infinity; vb = weightMap.get(b) ?? -Infinity }
+                else { va = getSigSortVal(a, pSortCol, effectiveSignals, tickerNames); vb = getSigSortVal(b, pSortCol, effectiveSignals, tickerNames) }
+                if (typeof va === 'number' && typeof vb === 'number') return (va - vb) * pSortDir
+                return String(va).localeCompare(String(vb)) * pSortDir
+              })
+              return (
+                <div key={p.name} className="accordion-section">
+                  <button className="accordion-header" onClick={() => togglePortfolio(p.name)}>
+                    <span className={`accordion-chevron ${isExp ? 'expanded' : ''}`}>{'>'}</span>
+                    {p.name}
+                    <span className="portfolio-delete" onClick={(e) => { e.stopPropagation(); handleDeletePortfolio(p.name) }} title="Remove portfolio">&times;</span>
+                  </button>
+                  {isExp && (
+                    <>
+                      {renderColHeader(pSortCol, pSortDir, setPSortCol, setPSortDir, pFilterLT, pFilterST, pFilterMR, setPFilterLT, setPFilterST, setPFilterMR, pFilterOpen, setPFilterOpen, true)}
+                      {sorted.length === 0 ? (
+                        <div className="accordion-item" style={{color: 'var(--text-muted)', fontStyle: 'italic'}}>
+                          {p.tickers.length === 0 ? 'Empty portfolio' : 'No matches for filter'}
+                        </div>
+                      ) : sorted.map(t => (
+                        <div key={t} className={`accordion-item accordion-item-flex ${selectedItem === t && viewType === 'Portfolio' && !activeTicker ? 'active' : ''}`} onClick={() => handleItemSelect(t, 'Portfolio')}>
+                          <span className={`col-ticker ticker-symbol${hiddenCols.has('name') ? ' col-expand' : ''}`}>{t}</span>
+                          {!hiddenCols.has('name') && <span className="col-name" title={tickerNames[t] || ''}>{tickerNames[t] || ''}</span>}
+                          {renderSignalCols(t, weightMap.get(t))}
+                        </div>
+                      ))}
+                    </>
+                  )}
+                </div>
+              )
+            })}
             <div className="accordion-section">
               <button className="accordion-header" onClick={() => toggleView('ETFs')}>
                 <span className={`accordion-chevron ${expandedViews.has('ETFs') ? 'expanded' : ''}`}>{'>'}</span>
@@ -1173,41 +1284,48 @@ function App() {
             </div>
             <div className="header-actions header-actions-grid">
               <button
-                className={`control-btn ${showSummary === 'intra' ? 'primary' : ''}`}
+                className={`control-btn ${showSummary === 'cross' ? 'primary' : ''}`}
                 style={{ order: 1 }}
+                onClick={() => { setShowSummary(prev => prev === 'cross' ? false : 'cross'); setShowBacktest(false); setShowAnalogs(false); setShowSignals(false) }}
+              >
+                Basket Returns
+              </button>
+              <button
+                className={`control-btn ${showAnalogs ? 'primary' : ''}`}
+                style={{ order: 2 }}
+                onClick={() => { setShowAnalogs(prev => !prev); setShowSummary(false); setShowBacktest(false); setShowSignals(false) }}
+              >
+                Analogs
+              </button>
+              <button
+                className={`control-btn ${showBacktest ? 'primary' : ''}`}
+                style={{ order: 3 }}
+                onClick={() => { setShowBacktest(prev => !prev); setShowSummary(false); setShowAnalogs(false); setShowSignals(false) }}
+              >
+                Backtest
+              </button>
+              <button
+                className={`control-btn ${showSummary === 'intra' ? 'primary' : ''}`}
+                style={{ order: 4 }}
                 onClick={() => {
                   if (showSummary === 'intra') { setShowSummary(false) }
                   else {
                     if (isBasketView && selectedItem) setIntraBasketTarget(selectedItem)
                     else setIntraBasketTarget('')
-                    setShowSummary('intra'); setShowBacktest(false); setShowAnalogs(false)
+                    setShowSummary('intra'); setShowBacktest(false); setShowAnalogs(false); setShowSignals(false)
                   }
                 }}
               >
                 Intrabasket
               </button>
               <button
-                className={`control-btn ${showSummary === 'cross' ? 'primary' : ''}`}
-                style={{ order: 2 }}
-                onClick={() => { setShowSummary(prev => prev === 'cross' ? false : 'cross'); setShowBacktest(false); setShowAnalogs(false) }}
+                className={`control-btn ${showSignals ? 'primary' : ''}`}
+                style={{ order: 5 }}
+                onClick={() => { setShowSignals(prev => !prev); setShowSummary(false); setShowBacktest(false); setShowAnalogs(false) }}
               >
-                Cross-Basket
+                Signals
               </button>
-              <button
-                className={`control-btn ${showBacktest ? 'primary' : ''}`}
-                style={{ order: 3 }}
-                onClick={() => { setShowBacktest(prev => !prev); setShowSummary(false); setShowAnalogs(false) }}
-              >
-                Backtest
-              </button>
-              <button
-                className={`control-btn ${showAnalogs ? 'primary' : ''}`}
-                style={{ order: 4 }}
-                onClick={() => { setShowAnalogs(prev => !prev); setShowSummary(false); setShowBacktest(false) }}
-              >
-                Analogs
-              </button>
-              <button className="control-btn" style={{ order: 5 }} onClick={() => setExportTrigger(p => p + 1)}>Export</button>
+              <button className="control-btn" style={{ order: 6 }} onClick={() => setExportTrigger(p => p + 1)}>Export</button>
             </div>
             <div className="header-right-stack">
               {quarterKeys.length > 0 && (
@@ -1259,7 +1377,9 @@ function App() {
             </div>
           </div>
           <div className="content-stack" ref={contentStackRef}>
-            {showAnalogs ? (
+            {showSignals ? (
+              <SignalsPanel apiBase={API_BASE} exportTrigger={exportTrigger} />
+            ) : showAnalogs ? (
               <AnalogsPanel
                 apiBase={API_BASE}
                 exportTrigger={exportTrigger}

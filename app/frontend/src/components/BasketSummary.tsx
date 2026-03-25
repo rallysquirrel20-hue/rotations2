@@ -1189,20 +1189,54 @@ export function BasketReturnsChart({ apiBase, exportTrigger, mode, initialBasket
     prevExportTrigger.current = exportTrigger
     const canvas = canvasRef.current
     if (!canvas) return
-    // Build filename: cross_basket_returns_all_3_17_2026 or single_basket_returns_Financials_3_17_2025_3_17_2026
+
+    // Build descriptive title and filename
     const fmtDate = (d: string) => { const p = d.split('-'); return `${parseInt(p[1])}_${parseInt(p[2])}_${p[0]}` }
+    const fmtDateDisplay = (d: string) => { const p = d.split('-'); return `${parseInt(p[1])}/${parseInt(p[2])}/${p[0]}` }
+    const groupLabel = group === 'all' ? 'All Baskets' : group === 'themes' ? 'Themes' : group === 'sectors' ? 'Sectors' : 'Industries'
+    const metricName = metric === 'volatility' ? 'Volatility' : metric === 'correlation' ? 'Correlation' : 'Price Returns'
+    const chartLabel = chartView === 'bar' ? 'Bar Chart' : 'Line Chart'
+    const dateRange = startDate && endDate ? `${fmtDateDisplay(startDate)} – ${fmtDateDisplay(endDate)}` : ''
+
+    let titleLeft: string
     let name: string
     if (mode === 'cross') {
+      titleLeft = `${groupLabel} ${metricName} ${activePreset || ''} ${chartLabel}`.trim()
       name = startDate === endDate
         ? `cross_basket_returns_${group}_${fmtDate(endDate)}`
         : `cross_basket_returns_${group}_${fmtDate(startDate)}_${fmtDate(endDate)}`
     } else {
       const bName = dailyBasket || 'unknown'
+      const bDisplay = bName.replace(/_/g, ' ')
+      titleLeft = `${bDisplay} ${metricName} ${barPeriod} ${chartLabel}`.trim()
       name = startDate === endDate
         ? `single_basket_returns_${bName}_${fmtDate(endDate)}`
         : `single_basket_returns_${bName}_${fmtDate(startDate)}_${fmtDate(endDate)}`
     }
-    canvas.toBlob((blob) => {
+
+    // Draw labels directly onto a copy of the chart canvas
+    const dpr = window.devicePixelRatio || 1
+    const composite = document.createElement('canvas')
+    composite.width = canvas.width
+    composite.height = canvas.height
+    const cCtx = composite.getContext('2d')
+    if (!cCtx) return
+    cCtx.drawImage(canvas, 0, 0)
+    cCtx.scale(dpr, dpr)
+    const cW = canvas.width / dpr
+    // Title top-left (at page edge)
+    cCtx.fillStyle = '#586e75'
+    cCtx.font = 'bold 13px monospace'
+    cCtx.textAlign = 'left'
+    cCtx.textBaseline = 'top'
+    cCtx.fillText(titleLeft, 12, 8)
+    // Date range top-right (aligned to plot area right edge, before y-axis)
+    if (dateRange) {
+      cCtx.textAlign = 'right'
+      cCtx.fillText(dateRange, cW - 50, 8)
+    }
+
+    composite.toBlob((blob) => {
       if (!blob) return
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
@@ -1253,7 +1287,9 @@ export function BasketReturnsChart({ apiBase, exportTrigger, mode, initialBasket
         }
       }
       const dynamicBottom = showLabels ? Math.min(Math.ceil(maxLabelW * 0.707) + 16, Math.floor(_h * 0.4)) : 8
-      const pad = { top: showLabels ? 12 : 4, right: showLabels ? 50 : 4, bottom: dynamicBottom, left: showLabels ? 60 : 4 }
+      // Left padding needs room for the first rotated label extending left
+      const dynamicLeft = showLabels ? Math.min(Math.ceil(maxLabelW * 0.707) + 8, 80) : 4
+      const pad = { top: showLabels ? 12 : 4, right: showLabels ? dynamicLeft : 4, bottom: dynamicBottom, left: dynamicLeft }
       const plotW = _w - pad.left - pad.right
       const plotH = _h - pad.top - pad.bottom
       const barW = Math.max(2, Math.min(40, (plotW / n) * 0.75))
@@ -1274,8 +1310,8 @@ export function BasketReturnsChart({ apiBase, exportTrigger, mode, initialBasket
           const v = yMin + (yMax - yMin) * (i / nTicks)
           const y = yScale(v)
           _ctx.beginPath(); _ctx.moveTo(pad.left, y); _ctx.lineTo(_w - pad.right, y); _ctx.stroke()
-          _ctx.fillStyle = '#6c757d'; _ctx.font = '10px monospace'; _ctx.textAlign = 'right'
-          _ctx.fillText(fmtVal(v), pad.left - 5, y + 3)
+          _ctx.fillStyle = '#6c757d'; _ctx.font = '10px monospace'; _ctx.textAlign = 'left'
+          _ctx.fillText(fmtVal(v), _w - pad.right + 5, y + 3)
         }
       }
 
@@ -1389,7 +1425,7 @@ export function BasketReturnsChart({ apiBase, exportTrigger, mode, initialBasket
     } else {
       const n = dailyReturns.length
       if (n === 0) return
-      const pad = { top: 12, right: 50, bottom: 60, left: 60 }
+      const pad = { top: 12, right: 50, bottom: 60, left: 20 }
       const plotW = dims.w - pad.left - pad.right
       const plotH = dims.h - pad.top - pad.bottom
       // Bars fill the full plot width with 25% gap ratio
@@ -1410,8 +1446,8 @@ export function BasketReturnsChart({ apiBase, exportTrigger, mode, initialBasket
         const v = yMin + (yMax - yMin) * (i / nTicks)
         const y = yScale(v)
         ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(dims.w - pad.right, y); ctx.stroke()
-        ctx.fillStyle = '#6c757d'; ctx.font = '10px monospace'; ctx.textAlign = 'right'
-        ctx.fillText((v * 100).toFixed(2) + '%', pad.left - 5, y + 3)
+        ctx.fillStyle = '#6c757d'; ctx.font = '10px monospace'; ctx.textAlign = 'left'
+        ctx.fillText((v * 100).toFixed(2) + '%', dims.w - pad.right + 5, y + 3)
       }
 
       ctx.strokeStyle = '#adb5bd'; ctx.lineWidth = 1; ctx.setLineDash([4, 4])
