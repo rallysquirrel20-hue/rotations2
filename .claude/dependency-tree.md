@@ -1,22 +1,21 @@
 # Dependency Tree
-Updated: 2026-03-24 (incremental — signals log endpoint, import portfolios, export overhaul)
-Files scanned: 17
-Functions indexed: 242
+Updated: 2026-03-25 (incremental — PDF/xlsx/TradingView exports removed from rotations.py; 5 new split-pipeline files added; export_live_basket_signals added)
+Files scanned: 22
+Functions indexed: ~320
 
 ---
 
-## Cell Map — signals/rotations.py (6206 lines)
+## Cell Map — signals/rotations.py (6332 lines)
 
 | Cell # | Title | Lines | Key Functions |
 |--------|-------|-------|---------------|
 | 0 | Imports & Dependencies | 1-2 | (imports only) |
-| 1 | Configuration & Constants | 3-165 | `_resolve_onedrive_output_folder`, `_mirror_to_onedrive`, `_needs_write_and_mirror`, OutputPaths class, WriteThroughPath class |
-| 2 | Utility Functions | 166-285 | `build_pdf`, `_timed_print`, `_install_timed_print`, `reset_cell_timer`, `_get_current_quarter_key` |
-| 3 | Universe Construction | 286-1205 | `get_quarterly_vol`, `build_quarter_universe`, `is_universe_current`, `_universe_to_json`, `_json_to_universe`, `load_or_build_universe`, `get_universe`, `_quarter_end_from_key`, `_quarter_start_from_key`, `_calc_beta_quarterly`, `_safe_calc_beta`, `build_quarter_beta_universes`, `is_beta_universes_current`, `_beta_universes_to_json`, `_json_to_beta_universes`, `load_or_build_beta_universes`, `_calc_momentum_quarterly`, `_safe_calc_momentum`, `build_quarter_momentum_universes`, `is_momentum_universes_current`, `load_or_build_momentum_universes`, `_calc_risk_adj_momentum_quarterly`, `_safe_calc_risk_adj_momentum`, `build_quarter_risk_adj_momentum`, `is_risk_adj_momentum_current`, `load_or_build_risk_adj_momentum`, `_calc_dividend_yield_quarterly`, `_safe_calc_dividend_yield`, `_calc_trailing_dividends_quarterly`, `_safe_calc_trailing_divs`, `build_quarter_dividend_universes`, `is_dividend_universes_current`, `load_or_build_dividend_universes`, `_build_gics_mappings`, `_build_sector_universes`, `_build_industry_universes`, `_is_gics_current`, `_gics_to_json`, `_json_to_gics`, `load_or_build_gics_mappings` |
-| 4 | Signal Cache | 1206-2617 | `calc_rolling_stats`, RollingStatsAccumulator class, `_numba_passes_1_to_4`, `_numba_pass5_signal`, `_build_signals_from_df`, `_build_signals_next_row`, `build_signals_for_ticker`, `_build_signals_append_ticker`, `_incremental_update_signals`, `_get_latest_norgate_date`, `_signals_cache_is_current`, `load_or_build_signals` |
-| 5 | Basket Processing | 2628-4430 | `_cache_slugify_label`, `_cache_build_quarter_lookup`, `_cache_find_active_quarter`, `_compute_equity_close_for_cache`, `_get_data_signature`, `_prebuild_equity_cache_from_signals`, `compute_breadth_pivots`, `compute_signal_trades`, `_build_quarter_lookup`, `_find_active_quarter`, `_build_membership_df`, `_vectorized_quarter_filter`, `compute_breadth_from_trend`, `compute_breadth_from_breakout`, `_build_quarter_weights`, `compute_equity_ohlc`, `_build_universe_signature`, `_equity_cache_paths`, `_load_equity_cache`, `_save_equity_cache`, `_build_equity_meta`, `_is_equity_cache_valid`, `_basket_cache_folder`, `_cache_file_stem`, `_basket_cache_paths`, `_find_basket_parquet`, `_find_basket_meta`, `_get_chart_schema_version_from_parquet`, `_build_basket_signals_meta`, `_is_basket_signals_cache_valid`, `compute_equity_ohlc_cached`, `compute_equity_curve`, `_fmt_price`, `_fmt_bars`, `_fmt_pct`, `_append_trade_rows`, `_compute_within_basket_correlation`, `_augment_basket_signals_with_breadth`, `_finalize_basket_signals_output`, `_compute_and_save_contributions`, `_record_basket_timing`, `process_basket_signals`; pre-computation block (L4294-4430): builds `returns_matrix` + `ohlc_ret_matrices`, basket loop |
-| 6 | Live Intraday Data | 4406-6112 | `_load_env_file`, `get_realtime_prices`, `get_realtime_ohlcv`, `get_live_ohlc_bars`, `_get_latest_norgate_date_fallback`, `_extract_spy_trade_date_from_df`, `_get_spy_last_trade_date_databento`, `_get_live_update_gate`, `_is_market_open_via_spy_volume`, `_append_live_row`, `build_signals_for_ticker_live`, `_sort_signals_df`, `export_today_signals`, `append_live_today_to_signals_parquet`, `_get_basket_ohlc_for_reports`, `_compute_annual_returns_for_basket`, `_build_group_annual_return_grid`, `_compute_daily_returns_for_basket`, `_get_latest_norgate_rows_by_ticker`, `_compute_live_basket_return`, `_compute_live_basket_ohlc`, `_compute_live_basket_ohlcv`, `_get_live_update_context`, `_build_group_daily_return_grid`, `_render_return_table_pages`, `_render_return_bar_charts`, `_get_all_basket_specs_for_reports`, `_build_basket_annual_grid`, `_build_basket_daily_grid_last20`, `export_annual_returns`, `export_last_20_days_returns`, `_render_year_basket_bar_charts`, `_render_day_basket_bar_charts`, `export_annual_returns_by_year`, `export_last_20_days_returns_by_day`, `update_basket_parquets_with_live_ohlcv` |
-| 7 | Holdings Exports (TradingView lists) | 6127-6206 | `export_group_holdings`, `export_current_quarter_universe` |
+| 1 | Configuration & Constants | 3-175 | `_resolve_onedrive_output_folder`, `_mirror_to_onedrive`, `_needs_write_and_mirror`, OutputPaths class, WriteThroughPath class |
+| 2 | Utility Functions | 176-295 | `build_pdf`, `_timed_print`, `_install_timed_print`, `reset_cell_timer`, `_get_current_quarter_key` |
+| 3 | Universe Construction | 296-1571 | `get_quarterly_vol`, `build_quarter_universe`, `is_universe_current`, `_universe_to_json`, `_json_to_universe`, `load_or_build_universe`, `get_universe`, `build_quarter_etf_universe`, `load_or_build_etf_universe`, `_build_ticker_names`, `_quarter_end_from_key`, `_quarter_start_from_key`, `_calc_beta_quarterly`, `_safe_calc_beta`, `build_quarter_beta_universes`, `is_beta_universes_current`, `_beta_universes_to_json`, `_json_to_beta_universes`, `load_or_build_beta_universes`, `_calc_momentum_quarterly`, `_safe_calc_momentum`, `build_quarter_momentum_universes`, `is_momentum_universes_current`, `load_or_build_momentum_universes`, `_calc_risk_adj_momentum_quarterly`, `_safe_calc_risk_adj_momentum`, `build_quarter_risk_adj_momentum`, `is_risk_adj_momentum_current`, `load_or_build_risk_adj_momentum`, `_calc_dividend_yield_quarterly`, `_safe_calc_dividend_yield`, `_calc_trailing_dividends_quarterly`, `_safe_calc_trailing_divs`, `build_quarter_dividend_universes`, `is_dividend_universes_current`, `load_or_build_dividend_universes`, `_calc_avg_dollar_volume_quarterly`, `_safe_calc_dollar_volume`, `build_quarter_size_universes`, `is_size_universe_current`, `load_or_build_size_universes`, `_calc_quarterly_dollar_volume`, `_safe_calc_quarterly_dollar_volume`, `build_quarter_volume_growth_universes`, `is_volume_growth_current`, `load_or_build_volume_growth_universes`, `_build_gics_mappings`, `_build_sector_universes`, `_build_industry_universes`, `_is_gics_current`, `_gics_to_json`, `_json_to_gics`, `load_or_build_gics_mappings` |
+| 4 | Signal Cache | 1572-3308 | `calc_rolling_stats`, RollingStatsAccumulator class, `_numba_passes_1_to_4`, `_numba_pass5_signal`, `_build_signals_from_df`, `_build_signals_next_row`, `build_signals_for_ticker`, `_build_signals_append_ticker`, `_incremental_update_signals`, `_get_latest_norgate_date`, `_signals_cache_is_current`, `load_or_build_signals`, `_etf_signals_cache_is_current`, `_incremental_update_etf_signals`, `load_or_build_etf_signals` |
+| 5 | Basket Processing | 3309-5380 | `_cache_slugify_label`, `_cache_build_quarter_lookup`, `_cache_find_active_quarter`, `_compute_equity_close_for_cache`, `_get_data_signature`, `_prebuild_equity_cache_from_signals`, `compute_breadth_pivots`, `compute_signal_trades`, `_build_quarter_lookup`, `_find_active_quarter`, `_build_membership_df`, `_vectorized_quarter_filter`, `compute_breadth_from_trend`, `compute_breadth_from_breakout`, `_build_quarter_weights`, `compute_equity_ohlc`, `_build_universe_signature`, `_equity_cache_paths`, `_load_equity_cache`, `_save_equity_cache`, `_build_equity_meta`, `_is_equity_cache_valid`, `_basket_cache_folder`, `_cache_file_stem`, `_basket_cache_paths`, `_find_basket_parquet`, `_find_basket_meta`, `_get_chart_schema_version_from_parquet`, `_build_basket_signals_meta`, `_is_basket_signals_cache_valid`, `compute_equity_ohlc_cached`, `compute_equity_curve`, `_fmt_price`, `_fmt_bars`, `_fmt_pct`, `_append_trade_rows`, `_compute_within_basket_correlation`, `_compute_within_basket_correlation_incremental`, `_augment_basket_signals_with_breadth`, `_finalize_basket_signals_output`, `_compute_and_save_contributions`, `_compute_and_save_contributions_incremental`, `_record_basket_timing`, `process_basket_signals`; pre-computation block: builds `returns_matrix` + `ohlc_ret_matrices`, basket loop |
+| 6 | Live Intraday Data | 5381-6332 | `_load_env_file`, `get_realtime_prices`, `get_realtime_ohlcv`, `get_live_ohlc_bars`, `_get_latest_norgate_date_fallback`, `_extract_spy_trade_date_from_df`, `_get_spy_last_trade_date_databento`, `_get_live_update_gate`, `_is_market_open_via_spy_volume`, `_append_live_row`, `build_signals_for_ticker_live`, `_sort_signals_df`, `export_today_signals`, `append_live_today_to_signals_parquet`, `export_today_etf_signals`, `append_live_today_to_etf_signals_parquet`, `_get_latest_norgate_rows_by_ticker`, `_compute_live_basket_ohlc`, `_compute_live_basket_ohlcv`, `_get_live_update_context`, `export_live_basket_signals`, `update_basket_parquets_with_live_ohlcv` |
 
 ---
 
@@ -24,8 +23,13 @@ Functions indexed: 242
 
 | File | Lines | Functions | Purpose |
 |------|-------|-----------|---------|
-| signals/rotations.py | 6206 | 143 | Main pipeline: universe, signals, baskets, live, reports |
-| signals/rotations_old_outputs.py | 2177 | 35 | Extracted Group B report cells (Excel, correlations, charts, PDFs) |
+| signals/rotations.py | 6332 | ~150 | Main pipeline: universe, signals, baskets, live exports |
+| signals/foundation.py | 2027 | ~30 | Shared constants, paths, signal engine, basket cache helpers (imported by split-pipeline files) |
+| signals/universe.py | 1210 | 44 | Phase 1: quarterly universe construction (extracted from rotations.py) |
+| signals/tickersignals.py | 858 | 9 | Phase 2: daily ticker + ETF signal generation (extracted from rotations.py) |
+| signals/basketsignals.py | 1523 | 20 | Phase 3: basket equity/signal processing (extracted from rotations.py) |
+| signals/livesignals.py | 1120 | 17 | Phase 4: intraday live loop (extracted from rotations.py) |
+| signals/rotations_old_outputs.py | 2107 | 35 | Extracted Group B report cells (Excel, correlations, charts, PDFs) |
 | signals/databento_test.py | 624 | 16 | Databento API connectivity tests |
 | app/backend/main.py | 4300 | 46 | FastAPI REST endpoints + WebSocket |
 | signals/test_all_optimizations.py | 75 | 1 | Compares old vs new breadth/contributions/correlation values after rebuild |
@@ -85,19 +89,19 @@ Functions indexed: 242
 | `FORCE_REBUILD_BASKET_SIGNALS` | False | signals/rotations.py | 102 | Manual override |
 | `CHART_SCHEMA_VERSION` | 2 | signals/rotations.py | 103 | Bump to force chart PNG rebuild |
 | `BENCHMARK_BASKETS` | 0 | signals/rotations.py | 104 | If > 0, process only this many baskets then stop (benchmarking shortcut) |
-| `BENCHMARK_TIMING` | False | signals/rotations.py | 105 | If True, print per-step timing breakdown for each basket |
+| `BENCHMARK_TIMING` | True | signals/rotations.py | 105 | If True, print per-step timing breakdown for each basket |
 | `_basket_timing` | dict of lists | signals/rotations.py | 107-113 | Global accumulator for per-step timing data (written by `_record_basket_timing`) |
-| `_basket_timing_names` | list | signals/rotations.py | 114 | Ordered basket names parallel to `_basket_timing` rows |
+| `_basket_timing_names` | list | signals/rotations.py | 113 | Ordered basket names parallel to `_basket_timing` rows |
 | `THEME_SIZE` | 25 | signals/rotations.py | 411 | Stocks per thematic basket |
 | `DIV_THEME_SIZE` | 25 | signals/rotations.py | 416 | Stocks per dividend basket |
 | `LOOKBACK_DAYS` | 252 | signals/rotations.py | 414 | Beta rolling window |
 | `MOMENTUM_LOOKBACK_DAYS` | 252 | signals/rotations.py | 580 | Momentum rolling window |
 | `INDUSTRY_MIN_STOCKS` | 10 | signals/rotations.py | 1062 | Min stocks for industry basket |
-| `INCREMENTAL_MAX_DAYS` | 5 | signals/rotations.py | 2410 | Max staleness before full rebuild |
-| `RV_MULT` | sqrt(252)/sqrt(21) | signals/rotations.py | 1226 | Realized volatility multiplier |
-| `EMA_MULT` | 2.0/11.0 | signals/rotations.py | 1227 | Range EMA alpha |
-| `RV_EMA_ALPHA` | 2.0/11.0 | signals/rotations.py | 1228 | RV EMA span=10 alpha |
-| `SIGNALS` | ['Up_Rot','Down_Rot','Breakout','Breakdown','BTFD','STFR'] | signals/rotations.py | 1225 | Signal type list |
+| `INCREMENTAL_MAX_DAYS` | 5 | signals/rotations.py | 2784 | Max staleness before full rebuild |
+| `RV_MULT` | sqrt(252)/sqrt(21) | signals/rotations.py | 1604 | Realized volatility multiplier |
+| `EMA_MULT` | 2.0/11.0 | signals/rotations.py | 1605 | Range EMA alpha |
+| `RV_EMA_ALPHA` | 2.0/11.0 | signals/rotations.py | 1606 | RV EMA span=10 alpha |
+| `SIGNALS` | ['Up_Rot','Down_Rot','Breakout','Breakdown','BTFD','STFR'] | signals/rotations.py | 1603 | Signal type list |
 | `SIGNAL_TYPES` | ['Breakout','Breakdown','Up_Rot','Down_Rot','BTFD','STFR','Buy_Hold'] | app/backend/main.py | 1751 | Backtest signal type list (includes Buy_Hold) |
 | `BACKTEST_DIRECTION` | {Up_Rot:'long', Down_Rot:'short', Breakout:'long', Breakdown:'short', BTFD:'long', STFR:'short', Buy_Hold:'long'} | app/backend/main.py | 1759 | Signal-to-direction map (includes Buy_Hold) |
 
@@ -109,9 +113,9 @@ These functions exist in BOTH signals/rotations.py AND app/backend/signals_engin
 
 | Function | rotations.py | signals_engine.py | Difference |
 |----------|-------------|-------------------|------------|
-| `_build_signals_from_df` | L1804-1940 (numba-accelerated) | L85-343 (pure Python) | rotations.py uses `@numba.njit` for passes 1-5; signals_engine.py uses Python loops with set-based tracking |
-| `_build_signals_next_row` | L1943-2131 | L346-534 | Near-identical logic; both are Python; used for incremental 1-bar updates |
-| `RollingStatsAccumulator` | L1274-1351 (class, deque-based) | L11-82 (class, list-based) | Same interface; rotations.py uses `collections.deque(maxlen=3)`, signals_engine.py uses `list` with `pop(0)` |
+| `_build_signals_from_df` | L2160-2299 (numba-accelerated) | L85-343 (pure Python) | rotations.py uses `@numba.njit` for passes 1-5; signals_engine.py uses Python loops with set-based tracking |
+| `_build_signals_next_row` | L2299-2490 | L346-534 | Near-identical logic; both are Python; used for incremental 1-bar updates |
+| `RollingStatsAccumulator` | L1630-1710 (class, deque-based) | L11-82 (class, list-based) | Same interface; rotations.py uses `collections.deque(maxlen=3)`, signals_engine.py uses `list` with `pop(0)` |
 | `_build_leg_trades` | main.py L2518-2795 | — | Extracted trade-building logic; called only by `run_multi_backtest`; includes Buy_Hold early return; `run_backtest` still has its own inline trade-building logic; trade dicts include `entry_weight`/`exit_weight`/`contribution` fields |
 
 Functions in main.py that DUPLICATE logic from rotations.py (not exact copies but same purpose):
@@ -120,7 +124,7 @@ Functions in main.py that DUPLICATE logic from rotations.py (not exact copies bu
 |----------|---------|------------------------|-------|
 | `_find_basket_parquet` | L110-120 | L3510-3522 | Same glob logic, different folder source |
 | `_find_basket_meta` | L122-132 | L3525-3539 | Same glob logic, different folder source |
-| `_tally_breadth` | L279-324 | `compute_breadth_from_trend` L3020-3044 | Simplified live version, single-day |
+| `_tally_breadth` | L279-324 | `compute_breadth_from_trend` L3704-3731 | Simplified live version, single-day |
 | `_compute_live_breadth` | L327-377 | `_compute_within_basket_correlation` L3710-3800 | Live version includes correlation |
 | `_quarter_str_to_date` | L197-203 | `_quarter_start_from_key` L427-432 | Same conversion, different name |
 
@@ -132,13 +136,13 @@ Functions in audit_basket.py that duplicate rotations.py logic:
 | `_quarter_start_from_key` | L36-40 | L427-432 |
 | `_build_quarter_lookup` | L52-57 | L2966-2975 |
 | `_find_active_quarter` | L60-64 | L2978-2983 |
-| `walk_equity` | L67-127 | `compute_equity_ohlc` L3115-3361 |
+| `walk_equity` | L67-127 | `compute_equity_ohlc` L3799-4048 |
 
 Functions in verify_backtest.py that duplicate logic from other files (independent re-implementation for verification):
 
 | Function | verify_backtest.py | Equivalent in other file |
 |----------|--------------------|--------------------------|
-| `find_basket_parquet` | L107-117 | rotations.py `_find_basket_parquet` L3510-3522 |
+| `find_basket_parquet` | L107-117 | rotations.py `_find_basket_parquet` L4194-4209 |
 | `quarter_str_to_date` | L140-146 | main.py `_quarter_str_to_date` L197-203 |
 | `build_trades` | L243-317 | main.py `run_backtest` trade-building |
 | `build_equity_curve` | L346-418 | main.py `run_backtest` equity replay |
@@ -165,7 +169,7 @@ Functions in verify_backtest.py that duplicate logic from other files (independe
 |-------------|----------|----------|---------|
 | `Data_Storage/signals_{SIZE}.parquet` | `load_or_build_signals`, `_incremental_update_signals`, `append_live_today_to_signals_parquet` | `load_or_build_signals`, main.py (all signal endpoints), `_prebuild_equity_cache_from_signals` | Individual ticker signals |
 | `Data_Storage/live_signals_{SIZE}.parquet` | `export_today_signals` | main.py `_read_live_parquet(LIVE_SIGNALS_FILE)` | Live intraday ticker OHLC |
-| `Data_Storage/live_basket_signals_{SIZE}.parquet` | `_build_group_daily_return_grid` | main.py `_read_live_parquet(LIVE_BASKET_SIGNALS_FILE)` | Live basket OHLC bars |
+| `Data_Storage/live_basket_signals_{SIZE}.parquet` | `export_live_basket_signals` | main.py `_read_live_parquet(LIVE_BASKET_SIGNALS_FILE)` | Live basket OHLC bars |
 | `{type}_basket_cache/{slug}_*_of_{SIZE}_ohlc.parquet` | `_save_equity_cache` | `_load_equity_cache`, `_get_basket_ohlc_for_reports` | Basket equity OHLC curves |
 | `{type}_basket_cache/{slug}_*_of_{SIZE}_ohlc_meta.json` | `_save_equity_cache` | `_load_equity_cache`, `_finalize_basket_signals_output` | Equity cache metadata + state |
 | `{type}_basket_cache/{slug}_*_of_{SIZE}_signals.parquet` | `_finalize_basket_signals_output` | `process_basket_signals`, main.py `get_basket_data`, `get_basket_breadth`, `run_backtest` | Consolidated basket signals |
@@ -178,7 +182,6 @@ Functions in verify_backtest.py that duplicate logic from other files (independe
 
 | File Pattern | Producer | Purpose |
 |-------------|----------|---------|
-| `Live_Rotations/{date}_{time}_Live_Signals_for_top_{SIZE}.xlsx` | `export_today_signals` | Live signal export spreadsheet |
 | `Baskets/Basket_Reports/annual_reports/{date}_annual_returns.pdf` | `export_annual_returns` | Annual returns PDF |
 | `Baskets/Basket_Reports/annual_reports/{date}_annual_returns_by_year.pdf` | `export_annual_returns_by_year` | Per-year bar charts PDF |
 | `Baskets/Basket_Reports/{stamp}_last_20_days_returns.pdf` | `export_last_20_days_returns` | 20-day returns PDF |
@@ -342,383 +345,346 @@ Functions in verify_backtest.py that duplicate logic from other files (independe
 
 ### signals/rotations.py — Cell 4: Signal Cache
 
-#### `calc_rolling_stats` (L1231-1268)
+#### `calc_rolling_stats` (L1587-1630)
 - **Called by:** `_append_trade_rows`
 - **Returns dict keys:** Win_Rate, Avg_Winner, Avg_Loser, Avg_Winner_Bars, Avg_Loser_Bars, Avg_MFE, Avg_MAE, Historical_EV, Std_Dev, Risk_Adj_EV, EV_Last_3, Risk_Adj_EV_Last_3, Count
 
-#### `_numba_passes_1_to_4` (L1354-1517, @numba.njit)
+#### `_numba_passes_1_to_4` (L1710-1877, @numba.njit)
 - **Called by:** `_build_signals_from_df`
 - **Returns:** 22-element tuple of numpy arrays (trends, resistance, support, signals, etc.)
 
-#### `_numba_pass5_signal` (L1521-1801, @numba.njit)
+#### `_numba_pass5_signal` (L1877-2160, @numba.njit)
 - **Called by:** `_build_signals_from_df`
 - **Returns:** 20-element tuple (entry_price, change, exit data, 13 stats arrays)
 
-#### `_build_signals_from_df` (L1804-1940)
+#### `_build_signals_from_df` (L2160-2299)
 - **Called by:** `build_signals_for_ticker`, `build_signals_for_ticker_live`, `process_basket_signals`, main.py `get_basket_data` (via signals_engine)
 - **Calls:** `_numba_passes_1_to_4`, `_numba_pass5_signal`
 - **DataFrame columns read:** Date, Open, High, Low, Close, Volume
 - **DataFrame columns created:** RV, RV_EMA, Trend, Resistance_Pivot, Support_Pivot, Is_Up_Rotation, Is_Down_Rotation, Rotation_Open, Up_Range, Down_Range, Up_Range_EMA, Down_Range_EMA, Upper_Target, Lower_Target, Is_Breakout, Is_Breakdown, Is_BTFD, Is_STFR, BTFD_Target_Entry, STFR_Target_Entry, Rotation_ID, BTFD_Triggered, STFR_Triggered, Is_Breakout_Sequence, Ticker, {Sig}_Entry_Price, {Sig}_Change, {Sig}_Exit_Date, {Sig}_Exit_Price, {Sig}_Final_Change, {Sig}_MFE, {Sig}_MAE, {Sig}_Win_Rate, {Sig}_Avg_Winner, {Sig}_Avg_Loser, {Sig}_Avg_Winner_Bars, {Sig}_Avg_Loser_Bars, {Sig}_Avg_MFE, {Sig}_Avg_MAE, {Sig}_Historical_EV, {Sig}_Std_Dev, {Sig}_Risk_Adj_EV, {Sig}_EV_Last_3, {Sig}_Risk_Adj_EV_Last_3, {Sig}_Count
 - **PARALLEL IMPL:** app/backend/signals_engine.py L85-343
 
-#### `_build_signals_next_row` (L1943-2131)
+#### `_build_signals_next_row` (L2299-2490)
 - **Called by:** `_build_signals_append_ticker`, `export_today_signals`, `append_live_today_to_signals_parquet`, `process_basket_signals`, `update_basket_parquets_with_live_ohlcv`, main.py `list_live_signal_tickers`, `get_ticker_data`
 - **Calls:** (pure computation)
 - **PARALLEL IMPL:** app/backend/signals_engine.py L346-534
 
-#### `build_signals_for_ticker` (L2134-2143)
+#### `build_signals_for_ticker` (L2490-2502)
 - **Called by:** `_incremental_update_signals`, `load_or_build_signals`
 - **Calls:** norgatedata.price_timeseries, `_build_signals_from_df`
 
-#### `_build_signals_append_ticker` (L2146-2225)
+#### `_build_signals_append_ticker` (L2502-2584)
 - **Called by:** `_incremental_update_signals`
 - **Calls:** norgatedata.price_timeseries, `_build_signals_next_row`
 
-#### `_incremental_update_signals` (L2228-2405)
+#### `_incremental_update_signals` (L2584-2769)
 - **Called by:** `load_or_build_signals`
 - **Calls:** `_build_signals_append_ticker`, `build_signals_for_ticker`, WriteThroughPath
 - **Data I/O:** writes `signals_{SIZE}.parquet`
 - **DataFrame columns modified:** Source (set to 'norgate'), Trend (normalized to float32), bool cols, float32 stats cols
 
-#### `_get_latest_norgate_date` (L2413-2425)
+#### `_get_latest_norgate_date` (L2769-2784)
 - **Called by:** `_signals_cache_is_current`, `load_or_build_signals`, `_get_latest_norgate_date_fallback`, `_build_basket_annual_grid`, `export_annual_returns`, `export_annual_returns_by_year`
 - **Calls:** norgatedata.price_timeseries (SPY)
 
-#### `_signals_cache_is_current` (L2428-2459)
+#### `_signals_cache_is_current` (L2784-2822)
 - **Called by:** `load_or_build_signals`
 - **Calls:** `_get_latest_norgate_date`
 
-#### `load_or_build_signals` (L2462-2613)
-- **Called by:** module-level (L2616 -> all_signals_df)
+#### `load_or_build_signals` (L2822-3004)
+- **Called by:** module-level (L3007 -> all_signals_df)
 - **Calls:** `_signals_cache_is_current`, `_incremental_update_signals`, `build_signals_for_ticker`, `_get_latest_norgate_date`
 - **Data I/O:** reads/writes `Data_Storage/signals_{SIZE}.parquet`
 
 ### signals/rotations.py — Cell 5: Basket Processing
 
-#### `_cache_slugify_label` (L2636-2637)
+#### `_cache_slugify_label` (L3317-3321)
 - **Called by:** `_prebuild_equity_cache_from_signals`
 
-#### `_cache_build_quarter_lookup` / `_cache_find_active_quarter` (L2640-2657)
+#### `_cache_build_quarter_lookup` / `_cache_find_active_quarter` (L3321-3341)
 - **Called by:** `_compute_equity_close_for_cache`
 
-#### `_compute_equity_close_for_cache` (L2660-2702)
+#### `_compute_equity_close_for_cache` (L3341-3389)
 - **Called by:** (not directly called in current code — legacy helper)
 - **Calls:** `_cache_build_quarter_lookup`, `_cache_find_active_quarter`
 - **DataFrame columns:** Date, Ticker, Close, Volume, Prev_Close, Ret
 
-#### `_get_data_signature` (L2708-2730)
+#### `_get_data_signature` (L3389-3414)
 - **Called by:** `_prebuild_equity_cache_from_signals`, `compute_equity_ohlc_cached`, `process_basket_signals`
 - **Caches result in:** `_DATA_SIGNATURE_CACHE` global
 
-#### `_prebuild_equity_cache_from_signals` (L2733-2779)
+#### `_prebuild_equity_cache_from_signals` (L3414-3465)
 - **Called by:** (invoked in basket processing section, pre-builds equity caches)
 - **Calls:** `_get_data_signature`, `_cache_slugify_label`, `_load_equity_cache`, `_build_universe_signature`, `_is_equity_cache_valid`, `compute_equity_ohlc_cached`
 
-#### `compute_breadth_pivots` (L2781-2896)
+#### `compute_breadth_pivots` (L3465-3583)
 - **Called by:** `_finalize_basket_signals_output`
 - **Returns DataFrame columns:** B_Trend, B_Resistance, B_Support, B_Up_Rot, B_Down_Rot, B_Rot_High, B_Rot_Low, B_Bull_Div, B_Bear_Div
 
-#### `compute_signal_trades` (L2899-2960)
+#### `compute_signal_trades` (L3583-3650)
 - **Called by:** rotations_old_outputs.py `plot_basket_charts`
 - **Returns:** list of trade dicts (entry_date, exit_date, entry_price, exit_price, change, mfe, mae, bars)
 
-#### `_build_quarter_lookup` / `_find_active_quarter` (L2966-2983)
+#### `_build_quarter_lookup` / `_find_active_quarter` (L3650-3670)
 - **Called by:** `_vectorized_quarter_filter`, `compute_breadth_from_trend`, `compute_breadth_from_breakout`, `_build_quarter_weights`, `compute_equity_ohlc`, `_compute_within_basket_correlation`, `_compute_and_save_contributions`, `_augment_basket_signals_with_breadth`
 - **Parallel impl:** audit_basket.py L52-64
 
-#### `_build_membership_df` (L2986-2992) — NEW
+#### `_build_membership_df` (L3670-3679)
 - **Called by:** `_vectorized_quarter_filter`, `_augment_basket_signals_with_breadth`
 - **How it works:** flattens `universe_by_date` dict into a two-column DataFrame `(_q_key, Ticker)` for use as a hash-join table
 - **Returns:** pd.DataFrame with columns `_q_key`, `Ticker`
 
-#### `_vectorized_quarter_filter` (L2995-3017)
+#### `_vectorized_quarter_filter` (L3679-3704)
 - **Called by:** `compute_breadth_from_trend`, `compute_breadth_from_breakout`
 - **Calls:** `_build_membership_df` (if `membership_df` not provided)
 - **How it works:** assigns each row its active quarter via `np.searchsorted` on quarter_ends, then inner-joins on `(_q_key, Ticker)` for O(N) filtering vs O(N*Q) date-by-date loop
 - **DataFrame columns added:** `_q_key` (temporary, dropped after join)
 
-#### `compute_breadth_from_trend` (L3020-3044)
+#### `compute_breadth_from_trend` (L3704-3731)
 - **Signature:** `compute_breadth_from_trend(all_df, universe_by_date, membership_df=None)` — `membership_df` optional for reuse across breadth calls
 - **Called by:** `_augment_basket_signals_with_breadth`
 - **Calls:** `_build_quarter_lookup`, `_vectorized_quarter_filter`
 - **DataFrame columns read:** Date, Ticker, Trend
 - **DataFrame columns created:** Date, Uptrend_Count, Downtrend_Count, Total_Stocks, Breadth_Ratio
 
-#### `compute_breadth_from_breakout` (L3047-3067)
+#### `compute_breadth_from_breakout` (L3731-3754)
 - **Signature:** `compute_breadth_from_breakout(all_df, universe_by_date, membership_df=None)` — `membership_df` optional for reuse
 - **Called by:** `_augment_basket_signals_with_breadth`
 - **Calls:** `_build_quarter_lookup`, `_vectorized_quarter_filter`
 - **DataFrame columns read:** Date, Ticker, Is_Breakout_Sequence
 - **DataFrame columns created:** Date, Breakout_Count, Breakdown_Count, BO_Total_Stocks, BO_Breadth_Ratio
 
-#### `_build_quarter_weights` (L3070-3113)
+#### `_build_quarter_weights` (L3754-3799)
 - **Called by:** `compute_equity_ohlc`
 - **Calls:** `_quarter_end_from_key`
 - **How it works:** computes per-quarter initial dollar-volume weights by averaging Dollar_Vol per ticker per calendar quarter (via `groupby(['Ticker', pd.Grouper(freq='QE-DEC')])`), then normalizing within each quarter's universe using the PRIOR quarter's ranking date
 - **Returns:** dict[quarter_key -> dict[ticker -> normalized_weight]]
 - **Note:** `_compute_and_save_contributions` duplicates this weight-building logic internally (not yet calling this helper) to avoid dep on its result format
 
-#### `compute_equity_ohlc` (L3115-3361)
+#### `compute_equity_ohlc` (L3799-4048)
 - **Signature:** `compute_equity_ohlc(all_df, universe_by_date, start_after_date=None, initial_state=None, return_state=False, returns_matrix=None, ohlc_ret_matrices=None, return_contributions=False)`
 - **Called by:** `compute_equity_ohlc_cached`, `compute_equity_curve`
 - **Calls:** `_build_quarter_lookup`, `_build_quarter_weights`, `_find_active_quarter`
 - **DataFrame columns read:** Date, Ticker, Open, High, Low, Close, Volume
 - **DataFrame columns created (incremental path):** Ret, Open_Ret, High_Ret, Low_Ret; output: Date, Open, High, Low, Close
 - **Two paths:**
-  - **Fast vectorized path** (L3136-3244): when `returns_matrix` and `ohlc_ret_matrices` are provided and `start_after_date` is None; iterates per-quarter using pre-computed matrices; `cumprod` weight drift; optionally returns `contrib_df` as byproduct when `return_contributions=True`; also returns `last_state` for caching when `return_state=True`
-  - **Incremental loop path** (L3246-3361): for appending a few new days when cache has partial data; date-by-date loop with `initial_state`
+  - **Fast vectorized path** (L3820-3928): when `returns_matrix` and `ohlc_ret_matrices` are provided and `start_after_date` is None; iterates per-quarter using pre-computed matrices; `cumprod` weight drift; optionally returns `contrib_df` as byproduct when `return_contributions=True`; also returns `last_state` for caching when `return_state=True`
+  - **Incremental loop path** (L3930-4048): for appending a few new days when cache has partial data; date-by-date loop with `initial_state`
 
-#### `_build_universe_signature` (L3364-3372)
+#### `_build_universe_signature` (L4048-4059)
 - **Called by:** `_prebuild_equity_cache_from_signals`, `compute_equity_ohlc_cached`, `process_basket_signals`, `_finalize_basket_signals_output`
 
-#### `_equity_cache_paths` / `_load_equity_cache` / `_save_equity_cache` (L3375-3424)
+#### `_equity_cache_paths` / `_load_equity_cache` / `_save_equity_cache` (L4059-4111)
 - **Called by:** `_prebuild_equity_cache_from_signals`, `compute_equity_ohlc_cached`, `_finalize_basket_signals_output`
 - **Calls:** `_basket_cache_folder`, `_cache_file_stem`
 
-#### `_build_equity_meta` / `_is_equity_cache_valid` (L3427-3470)
+#### `_build_equity_meta` / `_is_equity_cache_valid` (L4111-4157)
 - **Called by:** `_prebuild_equity_cache_from_signals`, `compute_equity_ohlc_cached`
 - **References constants:** EQUITY_CACHE_SCHEMA_VERSION, EQUITY_SIGNAL_LOGIC_VERSION, EQUITY_UNIVERSE_LOGIC_VERSION
 
-#### `_basket_cache_folder` (L3473-3480)
+#### `_basket_cache_folder` (L4157-4167)
 - **Called by:** `_equity_cache_paths`, `_basket_cache_paths`, `_finalize_basket_signals_output`, `_compute_and_save_contributions`
 
-#### `_cache_file_stem` (L3483-3493)
+#### `_cache_file_stem` (L4167-4180)
 - **Called by:** `_equity_cache_paths`, `_basket_cache_paths`, `_finalize_basket_signals_output`, `_compute_and_save_contributions`
 - **Calls:** `_get_current_quarter_key`
 
-#### `_basket_cache_paths` (L3496-3507)
+#### `_basket_cache_paths` (L4180-4194)
 - **Called by:** (available for cache path resolution)
 
-#### `_find_basket_parquet` (L3510-3522)
-- **Called by:** `_get_chart_schema_version_from_parquet`, `process_basket_signals`, `_get_basket_ohlc_for_reports`, `_build_group_daily_return_grid`, `update_basket_parquets_with_live_ohlcv`
+#### `_find_basket_parquet` (L4194-4209)
+- **Called by:** `_get_chart_schema_version_from_parquet`, `process_basket_signals`, `update_basket_parquets_with_live_ohlcv`
 - **Parallel impl:** main.py L92-102
 
-#### `_find_basket_meta` (L3525-3539)
+#### `_find_basket_meta` (L4209-4226)
 - **Called by:** `process_basket_signals`
 - **Parallel impl:** main.py L104-114
 
-#### `_get_chart_schema_version_from_parquet` (L3542-3552)
+#### `_get_chart_schema_version_from_parquet` (L4226-4239)
 - **Called by:** rotations_old_outputs.py `plot_basket_charts`
 
-#### `_build_basket_signals_meta` / `_is_basket_signals_cache_valid` (L3555-3592)
+#### `_build_basket_signals_meta` / `_is_basket_signals_cache_valid` (L4239-4279)
 - **Called by:** `process_basket_signals`
 - **References constants:** BASKET_SIGNALS_CACHE_SCHEMA_VERSION, EQUITY_SIGNAL_LOGIC_VERSION
 
-#### `compute_equity_ohlc_cached` (L3595-3642)
+#### `compute_equity_ohlc_cached` (L4279-4329)
 - **Signature:** `compute_equity_ohlc_cached(all_df, universe_by_date, basket_name, slug, basket_type='sector', returns_matrix=None, ohlc_ret_matrices=None)`
 - **Returns:** `(ohlc_df, contrib_df)` tuple; `contrib_df` is non-None only on full rebuild
 - **Called by:** `_prebuild_equity_cache_from_signals`, `process_basket_signals`
 - **Calls:** `_get_data_signature`, `_build_universe_signature`, `_load_equity_cache`, `_is_equity_cache_valid`, `compute_equity_ohlc` (with `return_contributions=True` on full rebuild), `_build_equity_meta`, `_save_equity_cache`
-- **Key behavior:** `FORCE_REBUILD_BASKET_SIGNALS` (L3601) also triggers equity rebuild so `contrib_df` is always captured; incremental-append path (L3621-3642) uses the slow loop path (no matrix params) — `contrib_df` is None in that case
+- **Key behavior:** `FORCE_REBUILD_BASKET_SIGNALS` (L4285) also triggers equity rebuild so `contrib_df` is always captured; incremental-append path uses the slow loop path (no matrix params) — `contrib_df` is None in that case
 
-#### `compute_equity_curve` (L3645-3652)
+#### `compute_equity_curve` (L4329-4339)
 - **Called by:** (compatibility helper, not directly called in current code)
 
-#### `_fmt_price` / `_fmt_bars` / `_fmt_pct` (L3655-3664)
+#### `_fmt_price` / `_fmt_bars` / `_fmt_pct` (L4339-4351)
 - **Called by:** `export_today_signals`, rotations_old_outputs.py
 
-#### `_append_trade_rows` (L3667-3707)
+#### `_append_trade_rows` (L4351-4394)
 - **Called by:** rotations_old_outputs.py `plot_basket_charts`
 - **Calls:** `calc_rolling_stats`
 
-#### `_compute_within_basket_correlation` (L3710-3800)
+#### `_compute_within_basket_correlation` (L4394-4485)
 - **Signature:** `_compute_within_basket_correlation(universe_by_qtr, returns_matrix, window=21)`
-- **Called by:** `_finalize_basket_signals_output`
+- **Called by:** `_finalize_basket_signals_output` (full-recompute path when `incremental_dates` is None)
 - **Calls:** `_build_quarter_lookup`
 - **How it works:** numpy z-score variance decomposition per rolling window; for each date computes `avg_corr = (n * Var(EW z-portfolio) - 1) / (n - 1)` which is the exact simple average of all pairwise correlations, in O(n*w) per date vs O(n^2*w) for full .corr(); `window` warmup is included from the previous quarter's tail
 - **DataFrame columns created:** Date, Correlation_Pct (scaled 0-100)
 - **`returns_matrix` is now a required param** (no default); caller must pass the pre-computed pivot; function does NOT read `all_signals_df` directly
 
-#### `_augment_basket_signals_with_breadth` (L3803-3857)
+#### `_compute_within_basket_correlation_incremental` (L4487-4572)
+- **Signature:** `_compute_within_basket_correlation_incremental(universe_by_qtr, returns_matrix, new_dates, window=21)`
+- **Called by:** `_finalize_basket_signals_output` (incremental path when `incremental_dates` is set and `Correlation_Pct` already exists in `merged_all`)
+- **Calls:** `_build_quarter_lookup`, `_find_active_quarter`
+- **How it works:** same z-score variance decomposition as full version, but processes only the quarter(s) containing `new_dates`; groups new dates by active quarter to avoid redundant setup; for each date extracts a rolling window slice from `returns_matrix` ending at that date. 171x speedup over full version for 1-day append.
+- **DataFrame columns created:** Date, Correlation_Pct (scaled 0-100) — only rows for `new_dates`; caller merges back into `merged_all`
+
+#### `_augment_basket_signals_with_breadth` (L4575-4632)
 - **Called by:** `process_basket_signals`
 - **Calls:** `_build_quarter_lookup`, `_build_membership_df`, `compute_breadth_from_trend`, `compute_breadth_from_breakout`
 - **How it works:** builds `membership_df` once via `_build_membership_df`, then passes it to both breadth calls to avoid re-building it twice; timing instrumentation via `BENCHMARK_TIMING` / `BENCHMARK_BASKETS`
 - **DataFrame columns created/merged:** Uptrend_Pct, Downtrend_Pct, Breadth_EMA, Breakout_Pct, Breakdown_Pct, BO_Breadth_EMA
 
-#### `_finalize_basket_signals_output` (L3860-3987)
-- **Signature:** `_finalize_basket_signals_output(name, slug, hist_folder, merged_all, data_sig, universe_sig, universe_by_qtr, basket_type='sector', returns_matrix=None, contrib_df=None)`
+#### `_finalize_basket_signals_output` (L4632-4776)
+- **Signature:** `_finalize_basket_signals_output(name, slug, hist_folder, merged_all, data_sig, universe_sig, universe_by_qtr, basket_type='sector', returns_matrix=None, contrib_df=None, incremental_dates=None)`
 - **Called by:** `process_basket_signals`
-- **Calls:** `compute_breadth_pivots`, `_compute_within_basket_correlation`, `_cache_file_stem`, `_basket_cache_folder`, `_equity_cache_paths`, `_compute_and_save_contributions`, WriteThroughPath, pa.Table, pq.write_table
+- **Calls:** `compute_breadth_pivots`, `_compute_within_basket_correlation` OR `_compute_within_basket_correlation_incremental`, `_cache_file_stem`, `_basket_cache_folder`, `_equity_cache_paths`, `_compute_and_save_contributions` OR `_compute_and_save_contributions_incremental`, WriteThroughPath, pa.Table, pq.write_table
 - **DataFrame columns added:** B_Trend, B_Resistance, B_Support, B_Up_Rot, B_Down_Rot, B_Rot_High, B_Rot_Low, B_Bull_Div, B_Bear_Div, BO_B_* (same prefixed), Correlation_Pct, Source
 - **Data I/O:** writes `{type}_basket_cache/{stem}_signals.parquet`, `{stem}_signals_meta.json`
-- **Key behavior:** if `contrib_df` is provided (from `compute_equity_ohlc` vectorized path via `compute_equity_ohlc_cached`), saves it directly instead of recomputing; otherwise falls back to calling `_compute_and_save_contributions` with the provided `returns_matrix`
+- **New `incremental_dates` param:** when set (list of new dates), routes correlation to `_compute_within_basket_correlation_incremental` (if `Correlation_Pct` already in `merged_all`) and contributions to `_compute_and_save_contributions_incremental` (when `contrib_df` is None); full-recompute paths unchanged when `incremental_dates` is None
+- **Key behavior:** if `contrib_df` is provided (from `compute_equity_ohlc` vectorized path via `compute_equity_ohlc_cached`), saves it directly; otherwise falls back to incremental or full contributions recompute depending on `incremental_dates`
 
-#### `_compute_and_save_contributions` (L3989-4126)
+#### `_compute_and_save_contributions` (L4779-4917)
 - **Signature:** `_compute_and_save_contributions(slug, basket_type, universe_by_qtr, returns_matrix=None)`
-- **Called by:** `_finalize_basket_signals_output` (fallback when `contrib_df` is None)
+- **Called by:** `_finalize_basket_signals_output` (full-recompute fallback when `contrib_df` is None and `incremental_dates` is not set); also called by `_compute_and_save_contributions_incremental` as its own fallback
 - **Calls:** `_build_quarter_lookup`, `_quarter_end_from_key`, `_basket_cache_folder`, `_cache_file_stem`, WriteThroughPath
-- **How it works:** vectorized per-quarter with cumprod weight drift; accepts `returns_matrix` param to avoid rebuilding the pivot; if not provided, builds its own from `all_signals_df`; note the weight-building block is still duplicated here (not using `_build_quarter_weights`) to maintain independence from the equity OHLC path
+- **How it works:** vectorized per-quarter with cumprod weight drift; accepts `returns_matrix` param to avoid rebuilding the pivot; if not provided, builds its own from `all_signals_df`
 - **Data I/O:** writes `{type}_basket_cache/{stem}_contributions.parquet`
 - **DataFrame columns created:** Date, Ticker, Weight_BOD, Daily_Return, Contribution
 
-#### `_record_basket_timing` (L4129-4135)
+#### `_compute_and_save_contributions_incremental` (L4919-5083)
+- **Signature:** `_compute_and_save_contributions_incremental(slug, basket_type, universe_by_qtr, returns_matrix, new_dates)`
+- **Called by:** `_finalize_basket_signals_output` (when `incremental_dates` is set and `contrib_df` is None)
+- **Calls:** `_build_quarter_lookup`, `_find_active_quarter`, `_quarter_end_from_key`, `_basket_cache_folder`, `_cache_file_stem`, WriteThroughPath; falls back to `_compute_and_save_contributions` if no existing parquet
+- **How it works:** loads existing contributions parquet, determines active quarter for each new date, seeds BOD weights from last cached day's drifted weights, chains multi-day appends via `_carried_bod`, appends new rows, deduplicates, saves. 6.6x speedup over full version.
+- **Data I/O:** reads and overwrites `{type}_basket_cache/{stem}_contributions.parquet`
+- **DataFrame columns created:** Date, Ticker, Weight_BOD, Daily_Return, Contribution (same schema as full version)
+
+#### `_record_basket_timing` (L5086-5095)
 - **Called by:** `process_basket_signals`
 - **How it works:** appends per-step timing values to the global `_basket_timing` dict and `_basket_timing_names` list; prints a one-line summary per basket when `BENCHMARK_TIMING` or `BENCHMARK_BASKETS > 0`
 
-#### `process_basket_signals` (L4138-4292)
+#### `process_basket_signals` (L5095-5397)
 - **Signature:** `process_basket_signals(name, universe_by_qtr, charts_folder, basket_type='sector', returns_matrix=None, ohlc_ret_matrices=None)`
-- **Called by:** module-level basket loop (L4430+)
+- **Called by:** module-level basket loop
 - **Calls:** `_cache_slugify_label`, `_get_data_signature`, `_build_universe_signature`, `_find_basket_parquet`, `_find_basket_meta`, `_is_basket_signals_cache_valid`, `compute_equity_ohlc_cached`, `_build_signals_next_row`, `_augment_basket_signals_with_breadth`, `_build_signals_from_df`, `_finalize_basket_signals_output`, `_record_basket_timing`
 - **Accepts:** `returns_matrix` and `ohlc_ret_matrices` params (passed through to `compute_equity_ohlc_cached` and `_finalize_basket_signals_output`)
 - **Timing instrumentation:** when `BENCHMARK_TIMING=True` or `BENCHMARK_BASKETS>0`, records wall-clock per step and calls `_record_basket_timing` at end
 
-#### Pre-computation block (L4294-4430, module-level)
+#### Pre-computation block (module-level, after process_basket_signals definition)
 - **Purpose:** builds shared `returns_matrix` (Date x Ticker pivot of daily close returns) and `ohlc_ret_matrices` (dict of Date x Ticker pivots for Open_Ret, High_Ret, Low_Ret) once before the basket loop; caches `returns_matrix` to `Data_Storage/returns_matrix_500.parquet` with MD5 fingerprint check; `BENCHMARK_BASKETS` constant limits the loop to N baskets when set > 0
 - **Consumed by:** all `process_basket_signals` calls in the basket loop
 - **Data I/O:** reads/writes `Data_Storage/returns_matrix_500.parquet`, `Data_Storage/returns_matrix_500.fingerprint`
 
 ### signals/rotations.py — Cell 6: Live Intraday Data
 
-#### `_load_env_file` (L4435-4464)
+#### `_load_env_file` (L5397-5429)
 - **Called by:** module-level (L4466)
 
-#### `get_realtime_prices` (L4467-4526)
+#### `get_realtime_prices` (L5429-5491)
 - **Called by:** (available for external use)
 - **Calls:** db.Live
 
-#### `get_realtime_ohlcv` (L4529-4599)
+#### `get_realtime_ohlcv` (L5491-5564)
 - **Called by:** (available for external use)
 - **Calls:** db.Live
 
-#### `get_live_ohlc_bars` (L4602-4649)
+#### `get_live_ohlc_bars` (L5564-5614)
 - **Called by:** `export_today_signals`, `_get_live_update_context`
 - **Calls:** db.Historical
 
-#### `_get_latest_norgate_date_fallback` (L4652-4661)
+#### `_get_latest_norgate_date_fallback` (L5614-5626)
 - **Called by:** `_get_live_update_gate`
 - **Calls:** `_get_latest_norgate_date`
 
-#### `_extract_spy_trade_date_from_df` (L4664-4681)
+#### `_extract_spy_trade_date_from_df` (L5626-5646)
 - **Called by:** `_get_spy_last_trade_date_databento`
 
-#### `_get_spy_last_trade_date_databento` (L4684-4710)
+#### `_get_spy_last_trade_date_databento` (L5646-5675)
 - **Called by:** `_get_live_update_gate`
 - **Calls:** db.Historical, `_extract_spy_trade_date_from_df`
 
-#### `_get_live_update_gate` (L4713-4751)
+#### `_get_live_update_gate` (L5675-5716)
 - **Called by:** `_is_market_open_via_spy_volume`, `export_today_signals`, `append_live_today_to_signals_parquet`, `_get_live_update_context`
 - **Calls:** `_get_latest_norgate_date_fallback`, `_get_spy_last_trade_date_databento`
 
-#### `_is_market_open_via_spy_volume` (L4754-4757)
+#### `_is_market_open_via_spy_volume` (L5716-5722)
 - **Called by:** (compatibility wrapper)
 - **Calls:** `_get_live_update_gate`
 
-#### `_append_live_row` (L4760-4778)
+#### `_append_live_row` (L5722-5743)
 - **Called by:** `build_signals_for_ticker_live`
 
-#### `build_signals_for_ticker_live` (L4781-4794)
+#### `build_signals_for_ticker_live` (L5743-5759)
 - **Called by:** (available for external use)
 - **Calls:** `_append_live_row`, `_build_signals_from_df`
 
-#### `_sort_signals_df` (L4797-4814)
+#### `_sort_signals_df` (L5759-5779)
 - **Called by:** `export_today_signals`, rotations_old_outputs.py
 
-#### `export_today_signals` (L4817-5028)
-- **Called by:** module-level (L6130+)
+#### `export_today_signals` (L5779-5862)
+- **Called by:** module-level
 - **Calls:** `_get_live_update_gate`, `get_live_ohlc_bars`, `_get_latest_norgate_rows_by_ticker`, `_build_signals_next_row`, `_fmt_price`, `_fmt_bars`, `_sort_signals_df`, WriteThroughPath
-- **Data I/O:** writes `Live_Rotations/{date}_{time}_Live_Signals_for_top_{SIZE}.xlsx`, `Data_Storage/live_signals_{SIZE}.parquet`
+- **Data I/O:** writes `Data_Storage/live_signals_{SIZE}.parquet` (xlsx output removed)
 
-#### `append_live_today_to_signals_parquet` (L5031-5092)
+#### `append_live_today_to_signals_parquet` (L5862-5926)
 - **Called by:** (available for manual invocation)
 - **Calls:** `_get_live_update_gate`, `_get_live_update_context`, `_build_signals_next_row`
 - **Data I/O:** reads/writes `Data_Storage/signals_{SIZE}.parquet`
 
-#### `_get_basket_ohlc_for_reports` (L5095-5129)
-- **Called by:** `_compute_annual_returns_for_basket`, `_compute_daily_returns_for_basket`
-- **Calls:** `_find_basket_parquet`
-- **Data I/O:** reads basket parquet files
+#### `export_today_etf_signals` (L5926-5964)
+- **Called by:** module-level
+- **Calls:** `_get_live_update_gate`, `get_live_ohlc_bars`, `_build_signals_next_row`, `_sort_signals_df`
+- **Data I/O:** writes `Data_Storage/live_signals_etf_{ETF_SIZE}.parquet`
 
-#### `_compute_annual_returns_for_basket` (L5132-5161)
-- **Called by:** `_build_group_annual_return_grid`
-- **Calls:** `_get_basket_ohlc_for_reports`, `_compute_live_basket_return`
+#### `append_live_today_to_etf_signals_parquet` (L5964-6042)
+- **Called by:** module-level
+- **Calls:** `_get_live_update_gate`, `_build_signals_next_row`
+- **Data I/O:** reads/writes `Data_Storage/signals_etf_{ETF_SIZE}.parquet`
 
-#### `_build_group_annual_return_grid` (L5164-5184)
-- **Called by:** `_build_basket_annual_grid`
-- **Calls:** `_compute_annual_returns_for_basket`
-
-#### `_compute_daily_returns_for_basket` (L5187-5199)
-- **Called by:** `_build_group_daily_return_grid`
-- **Calls:** `_get_basket_ohlc_for_reports`
-
-#### `_get_latest_norgate_rows_by_ticker` (L5202-5212)
-- **Called by:** `export_today_signals`, `_get_live_update_context`, `append_live_today_to_signals_parquet`
+#### `_get_latest_norgate_rows_by_ticker` (L6042-6056)
+- **Called by:** `export_today_signals`, `export_live_basket_signals`, `_get_live_update_context`
 - **Reads:** all_signals_df global
 
-#### `_compute_live_basket_return` (L5215-5248)
-- **Called by:** `_compute_annual_returns_for_basket`, `_build_basket_daily_grid_last20`, `_build_group_daily_return_grid`
+#### `_compute_live_basket_ohlc` (L6056-6092)
+- **Called by:** `export_live_basket_signals`
+- **Signature:** `(universe_by_qtr, live_ohlc_map, last_rows, current_key, prev_basket_close)`
 
-#### `_compute_live_basket_ohlc` (L5251-5284)
-- **Called by:** `_build_group_daily_return_grid`
-
-#### `_compute_live_basket_ohlcv` (L5287-5339)
+#### `_compute_live_basket_ohlcv` (L6092-6147)
 - **Called by:** `update_basket_parquets_with_live_ohlcv`
 
-#### `_get_live_update_context` (L5342-5388)
-- **Called by:** `_build_basket_annual_grid`, `_build_basket_daily_grid_last20`, `_build_group_daily_return_grid`, `append_live_today_to_signals_parquet`
+#### `_get_live_update_context` (L6147-6196)
+- **Called by:** `export_live_basket_signals`, `append_live_today_to_signals_parquet`, `append_live_today_to_etf_signals_parquet`, module-level
 - **Calls:** `_get_live_update_gate`, `get_live_ohlc_bars`, `_get_latest_norgate_rows_by_ticker`
 
-#### `_build_group_daily_return_grid` (L5391-5451)
-- **Called by:** `_build_basket_daily_grid_last20`
-- **Calls:** `_compute_daily_returns_for_basket`, `_compute_live_basket_return`, `_compute_live_basket_ohlc`, `_find_basket_parquet`
+#### `export_live_basket_signals` (L6196-6235) — NEW
+- **Called by:** module-level
+- **Signature:** `export_live_basket_signals(live_ctx=None)`
+- **Calls:** `_get_live_update_context`, `_find_basket_parquet`, `_compute_live_basket_ohlc`
+- **How it works:** iterates all entries in `BASKET_RESULTS`; for each basket reads its last parquet Close as `prev_basket_close`; calls `_compute_live_basket_ohlc`; collects OHLC bars into a DataFrame and writes `Data_Storage/live_basket_signals_{SIZE}.parquet`
 - **Data I/O:** writes `Data_Storage/live_basket_signals_{SIZE}.parquet`
 
-#### `_render_return_table_pages` (L5454-5584)
-- **Called by:** rotations_old_outputs.py
-
-#### `_render_return_bar_charts` (L5587-5697)
-- **Called by:** `export_annual_returns`, `export_last_20_days_returns`, rotations_old_outputs.py
-
-#### `_get_all_basket_specs_for_reports` (L5700-5712)
-- **Called by:** `_build_basket_annual_grid`, `_build_basket_daily_grid_last20`
-
-#### `_build_basket_annual_grid` (L5715-5728)
-- **Called by:** `export_annual_returns`, `export_annual_returns_by_year`, rotations_old_outputs.py
-- **Calls:** `_get_latest_norgate_date`, `_get_live_update_context`, `_get_all_basket_specs_for_reports`, `_build_group_annual_return_grid`
-
-#### `_build_basket_daily_grid_last20` (L5731-5758)
-- **Called by:** `export_last_20_days_returns`, `export_last_20_days_returns_by_day`, rotations_old_outputs.py
-- **Calls:** `_get_all_basket_specs_for_reports`, `_get_live_update_context`, `_build_group_daily_return_grid`, `_compute_live_basket_return`
-
-#### `export_annual_returns` (L5761-5800)
-- **Called by:** module-level (L6130+)
-- **Calls:** `_get_latest_norgate_date`, `_needs_write_and_mirror`, `_build_basket_annual_grid`, `_render_return_bar_charts`, `build_pdf`
-
-#### `export_last_20_days_returns` (L5803-5826)
-- **Called by:** module-level (L6130+)
-- **Calls:** `_build_basket_daily_grid_last20`, `_render_return_bar_charts`, `build_pdf`
-
-#### `_render_year_basket_bar_charts` (L5829-5893)
-- **Called by:** `export_annual_returns_by_year`
-
-#### `_render_day_basket_bar_charts` (L5896-5960)
-- **Called by:** `export_last_20_days_returns_by_day`
-
-#### `export_annual_returns_by_year` (L5963-6000)
-- **Called by:** module-level (L6130+)
-- **Calls:** `_get_latest_norgate_date`, `_needs_write_and_mirror`, `_build_basket_annual_grid`, `_render_year_basket_bar_charts`, `build_pdf`
-
-#### `export_last_20_days_returns_by_day` (L6003-6023)
-- **Called by:** module-level (L6130+)
-- **Calls:** `_build_basket_daily_grid_last20`, `_render_day_basket_bar_charts`, `build_pdf`
-
-#### `update_basket_parquets_with_live_ohlcv` (L6026-6110)
-- **Called by:** (disabled in current code)
+#### `update_basket_parquets_with_live_ohlcv` (L6235-6322)
+- **Called by:** (available for manual invocation)
 - **Calls:** `_find_basket_parquet`, `_compute_live_basket_ohlcv`, `_build_signals_next_row`
 
 ### signals/rotations.py — Cell 7: Holdings Exports
 
-#### `export_group_holdings` (L6135-6189)
-- **Called by:** (available for manual invocation)
-- **Calls:** `_get_current_quarter_key`, WriteThroughPath
-- **Data I/O:** writes TradingView .txt files
-
-#### `export_current_quarter_universe` (L6192-6206)
-- **Called by:** (available for manual invocation)
-- **Calls:** `_get_current_quarter_key`
+> **Note:** Cell 7 (TradingView list exports) was removed from rotations.py in this update. `export_group_holdings` and `export_current_quarter_universe` no longer exist in the main pipeline.
 
 ---
 
-### signals/rotations_old_outputs.py (2177 lines)
+### signals/rotations_old_outputs.py (2107 lines)
 
 This file imports everything from rotations.py via `from rotations import *` plus specific private names. It contains the Group B report cells (9-15).
 
@@ -863,7 +829,7 @@ This file imports everything from rotations.py via `from rotations import *` plu
 
 #### `_quarter_str_to_date` (L197-203)
 - **Called by:** `_get_universe_tickers_for_range`, `_get_ticker_join_dates`, `_get_tickers_for_date`, `get_basket_summary`, `run_backtest`, `_build_leg_trades`, `run_benchmarks`
-- **PARALLEL IMPL:** signals/rotations.py `_quarter_start_from_key` L427-432
+- **PARALLEL IMPL:** signals/rotations.py `_quarter_start_from_key` L531-539
 
 #### `_get_universe_tickers_for_range` (L206-220)
 - **Called by:** `run_backtest`, `_build_leg_trades`, `run_benchmarks`
@@ -1065,7 +1031,7 @@ This file imports everything from rotations.py via `from rotations import *` plu
 
 #### `_build_signals_next_row` (L346-534)
 - **Called by:** main.py `list_live_signal_tickers`, `get_ticker_data`
-- **PARALLEL IMPL:** signals/rotations.py L1943-2131
+- **PARALLEL IMPL:** signals/rotations.py L2299-2490
 - **Near-identical logic; key for incremental live bar computation**
 
 ---
@@ -1245,30 +1211,208 @@ These are computed during cell execution and used by downstream cells:
 | Variable | Set At | Set By | Used By |
 |----------|--------|--------|---------|
 | `QUARTER_UNIVERSE` | L407 | `load_or_build_universe()` | Nearly everything |
-| `BETA_UNIVERSE` | L575 | `load_or_build_beta_universes()` | basket processing, exports |
-| `LOW_BETA_UNIVERSE` | L575 | `load_or_build_beta_universes()` | basket processing, exports |
-| `MOMENTUM_UNIVERSE` | L699 | `load_or_build_momentum_universes()` | basket processing, exports |
-| `MOMENTUM_LOSERS_UNIVERSE` | L699 | `load_or_build_momentum_universes()` | basket processing, exports |
-| `RISK_ADJ_MOM_UNIVERSE` | L817 | `load_or_build_risk_adj_momentum()` | basket processing, exports |
-| `HIGH_YIELD_UNIVERSE` | L1045 | `load_or_build_dividend_universes()` | basket processing, exports |
-| `DIV_GROWTH_UNIVERSE` | L1045 | `load_or_build_dividend_universes()` | basket processing, exports |
-| `TICKER_SECTOR` | L1212 | `load_or_build_gics_mappings()` | exports, signal filtering |
-| `TICKER_SUBINDUSTRY` | L1212 | `load_or_build_gics_mappings()` | exports, signal filtering |
-| `SECTOR_UNIVERSES` | L1212 | `load_or_build_gics_mappings()` | basket processing |
-| `INDUSTRY_UNIVERSES` | L1212 | `load_or_build_gics_mappings()` | basket processing |
-| `INDUSTRY_LIST` | L1063/1196 | `_build_industry_universes()` | basket processing |
-| `all_signals_df` | L2626 | `load_or_build_signals()` | basket processing, breadth, correlation, live exports |
-| `BASKET_RESULTS` | L4430+ | `process_basket_signals()` loop | `update_basket_parquets_with_live_ohlcv`, rotations_old_outputs.py |
-| `_live_ctx_for_reports` | L6130+ | `_get_live_update_context()` | exports, rotations_old_outputs.py |
+| `BETA_UNIVERSE` | L681 | `load_or_build_beta_universes()` | basket processing, exports |
+| `LOW_BETA_UNIVERSE` | L681 | `load_or_build_beta_universes()` | basket processing, exports |
+| `MOMENTUM_UNIVERSE` | L803 | `load_or_build_momentum_universes()` | basket processing, exports |
+| `MOMENTUM_LOSERS_UNIVERSE` | L803 | `load_or_build_momentum_universes()` | basket processing, exports |
+| `RISK_ADJ_MOM_UNIVERSE` | L929 | `load_or_build_risk_adj_momentum()` | basket processing, exports |
+| `HIGH_YIELD_UNIVERSE` | L1168 | `load_or_build_dividend_universes()` | basket processing, exports |
+| `DIV_GROWTH_UNIVERSE` | L1168 | `load_or_build_dividend_universes()` | basket processing, exports |
+| `TICKER_SECTOR` | L1568 | `load_or_build_gics_mappings()` | exports, signal filtering |
+| `TICKER_SUBINDUSTRY` | L1568 | `load_or_build_gics_mappings()` | exports, signal filtering |
+| `SECTOR_UNIVERSES` | L1568 | `load_or_build_gics_mappings()` | basket processing |
+| `INDUSTRY_UNIVERSES` | L1568 | `load_or_build_gics_mappings()` | basket processing |
+| `INDUSTRY_LIST` | L1478/1570 | `_build_industry_universes()` | basket processing |
+| `all_signals_df` | L3007 | `load_or_build_signals()` | basket processing, breadth, correlation, live exports |
+| `BASKET_RESULTS` | module-level basket loop | `process_basket_signals()` loop | `update_basket_parquets_with_live_ohlcv`, rotations_old_outputs.py |
+| `_live_ctx_for_reports` | L6327 | `_get_live_update_context()` | exports, rotations_old_outputs.py |
+
+---
+
+---
+
+### signals/foundation.py (2027 lines)
+
+**Purpose:** Shared infrastructure module imported by all four split-pipeline files (`universe.py`, `tickersignals.py`, `basketsignals.py`, `livesignals.py`). Contains no top-level side-effects; safe to import without hitting Norgate or building caches.
+
+**Sections:**
+1. Imports
+2. Constants (`START_YEAR`, `SIZE`, `BASE_OUTPUT_FOLDER`, version constants, timing globals)
+3. OneDrive / output path helpers (`_resolve_onedrive_output_folder`, `_mirror_to_onedrive`, `_needs_write_and_mirror`, `OutputPaths`, `WriteThroughPath`)
+4. Utility functions (`build_pdf`, `_timed_print`, `_install_timed_print`, `reset_cell_timer`)
+5. Serialisation helpers (`_universe_to_json`, `_json_to_universe`, `_beta_universes_to_json`, `_json_to_beta_universes`, `_gics_to_json`, `_json_to_gics`, `is_universe_current`)
+6. Cache loader functions — load from pre-built JSON caches without rebuilding:
+   - `get_current_quarter_key(quarter_universe)` — takes universe dict, returns most recent key
+   - `_quarter_end_from_key` / `_quarter_start_from_key` (L396-412)
+   - `get_universe(date, quarter_universe)` — prev-quarter look-ahead-safe universe (L412)
+   - `load_universe_from_cache()` / `load_etf_universe_from_cache()` / `load_beta_universes_from_cache()` / `load_momentum_universes_from_cache()` / `load_risk_adj_momentum_from_cache()` / `load_dividend_universes_from_cache()` / `load_size_universes_from_cache()` / `load_volume_growth_universes_from_cache()` / `load_gics_mappings_from_cache()` / `load_ticker_names_from_cache()` (L427-503)
+   - `load_all_universes()` — loads all caches and returns a named dict (L505-536)
+   - `build_all_basket_specs(universes)` — returns list of `(name, universe_dict, charts_folder, basket_type)` tuples for the standard 27-basket run (L539-555)
+7. Signal Computation Engine — identical numba-accelerated implementation:
+   - `calc_rolling_stats` (L567)
+   - `RollingStatsAccumulator` class (L607)
+   - `_numba_passes_1_to_4` (L682, @numba.njit)
+   - `_numba_pass5_signal` (L849, @numba.njit)
+   - `_build_signals_from_df` (L1132)
+   - `_build_signals_next_row` (L1271)
+   - `_get_latest_norgate_date` (L1462)
+8. Basket cache helpers — shared by `basketsignals.py` and `livesignals.py`:
+   - `_cache_slugify_label` (L1484)
+   - `_get_data_signature` / `reset_data_signature_cache` (L1488-1519)
+   - `compute_breadth_pivots` (L1519)
+   - `_build_quarter_lookup` / `_find_active_quarter` / `_build_membership_df` / `_vectorized_quarter_filter` (L1637-1691)
+   - `compute_breadth_from_trend` / `compute_breadth_from_breakout` (L1691-1741)
+   - `_build_quarter_weights` (L1741)
+   - `_build_universe_signature` (L1786)
+   - `_equity_cache_paths` / `_load_equity_cache` / `_save_equity_cache` / `_build_equity_meta` / `_is_equity_cache_valid` (L1797-1895)
+   - `_basket_cache_folder` / `_cache_file_stem` / `_basket_cache_paths` / `_find_basket_parquet` / `_find_basket_meta` / `_get_chart_schema_version_from_parquet` / `_build_basket_signals_meta` / `_is_basket_signals_cache_valid` (L1895-1994)
+
+**Key difference from rotations.py:** `get_current_quarter_key` takes the universe dict as a parameter (not a global). All cache-loader functions raise `FileNotFoundError` if the JSON cache is missing — callers must run the appropriate phase first.
+
+**Imported by:** `universe.py`, `tickersignals.py`, `basketsignals.py`, `livesignals.py`
+
+---
+
+### signals/universe.py (1210 lines)
+
+**Purpose:** Phase 1 of the split pipeline. Builds and caches all quarterly universes (top-500, ETF, beta, momentum, risk-adj momentum, dividends, size, volume growth, GICS). Writes JSON caches consumed by Phases 2-4 via `foundation.load_all_universes()`.
+
+**Run schedule:** Quarterly or on demand (Norgate universe changes).
+
+**Key public functions:**
+
+| Function | Line | What it does |
+|----------|------|-------------|
+| `get_quarterly_vol` | L60 | Per-ticker dollar-volume calculation (ThreadPoolExecutor worker) |
+| `build_quarter_universe` | L76 | Builds top-500 universe dict from Norgate |
+| `load_or_build_universe` | L120 | Cache-aware wrapper; writes `top500stocks.json` |
+| `build_quarter_etf_universe` | L149 | Builds ETF universe dict |
+| `load_or_build_etf_universe` | L185 | Cache-aware wrapper; writes `etf_universes_50.json` |
+| `build_quarter_beta_universes` | L275 | High/Low beta top-25 per quarter |
+| `load_or_build_beta_universes` | L350 | Cache-aware; writes `beta_universes_500.json` |
+| `build_quarter_momentum_universes` | L402 | Momentum winners/losers |
+| `load_or_build_momentum_universes` | L460 | Cache-aware; writes `momentum_universes_500.json` |
+| `build_quarter_risk_adj_momentum` | L522 | Risk-adjusted momentum universe |
+| `load_or_build_risk_adj_momentum` | L574 | Cache-aware; writes `risk_adj_momentum_500.json` |
+| `build_quarter_dividend_universes` | L695 | High yield / dividend growth universes |
+| `load_or_build_dividend_universes` | L803 | Cache-aware; writes `dividend_universes_500.json` |
+| `build_quarter_size_universes` | L864 | Size (market-cap proxy) universe |
+| `load_or_build_size_universes` | L916 | Cache-aware |
+| `build_quarter_volume_growth_universes` | L969 | Volume-growth universe |
+| `load_or_build_volume_growth_universes` | L1038 | Cache-aware |
+| `load_or_build_gics_mappings` | L1164 | Sector/industry GICS mappings; writes `gics_mappings_500.json` |
+
+**Imports from foundation.py:** `OutputPaths`, `WriteThroughPath`, `_universe_to_json`, `_json_to_universe`, `_beta_universes_to_json`, `_json_to_beta_universes`, `_gics_to_json`, `_json_to_gics`, `is_universe_current`, `_quarter_end_from_key`, `SIZE`, `BASE_OUTPUT_FOLDER` and path constants.
+
+**Module-level execution:** calls all `load_or_build_*` functions in sequence, writes all JSON caches, then exits.
+
+---
+
+### signals/tickersignals.py (858 lines)
+
+**Purpose:** Phase 2 of the split pipeline. Builds and incrementally updates the individual ticker signal parquet (`signals_500.parquet`) and ETF signal parquet (`signals_etf_50.parquet`). Requires universe JSON caches from Phase 1.
+
+**Run schedule:** Daily after Norgate data update.
+
+**Key public functions:**
+
+| Function | Line | What it does |
+|----------|------|-------------|
+| `build_signals_for_ticker` | L46 | Full signal rebuild for one ticker via `_build_signals_from_df` |
+| `_build_signals_append_ticker` | L58 | Incremental 1-2 bar append via `_build_signals_next_row` |
+| `_incremental_update_signals` | L140 | Incremental update driver: appends new days to cached parquet |
+| `_signals_cache_is_current` | L320 | Checks parquet freshness vs latest Norgate date |
+| `load_or_build_signals` | L358 | Cache-aware wrapper; writes `signals_500.parquet` |
+| `_etf_signals_cache_is_current` | L539 | ETF-specific cache check |
+| `_incremental_update_etf_signals` | L560 | Incremental ETF signal update |
+| `load_or_build_etf_signals` | L685 | Cache-aware wrapper; writes `signals_etf_50.parquet` |
+
+**Imports from foundation.py:** `_build_signals_from_df`, `_build_signals_next_row`, `_numba_passes_1_to_4`, `_numba_pass5_signal`, `RollingStatsAccumulator`, `_get_latest_norgate_date`, `WriteThroughPath`, `SIZE`, path constants, `load_universe_from_cache`, `load_etf_universe_from_cache`.
+
+**Module-level execution:** loads universes via `foundation.load_all_universes()`, calls `load_or_build_signals()` then `load_or_build_etf_signals()`.
+
+---
+
+### signals/basketsignals.py (1523 lines)
+
+**Purpose:** Phase 3 of the split pipeline. Processes all ~27 baskets: builds equity OHLC curves, computes breadth/correlation/contributions, writes basket parquets. Requires signal parquets from Phase 2.
+
+**Run schedule:** Daily after Phase 2 completes.
+
+**Key public functions:**
+
+| Function | Line | What it does |
+|----------|------|-------------|
+| `compute_signal_trades` | L99 | Extracts closed trade list from basket signals parquet |
+| `compute_equity_ohlc` | L163 | Vectorized basket equity OHLC construction (fast + incremental paths) |
+| `compute_equity_ohlc_cached` | L412 | Cache-aware wrapper returning `(ohlc_df, contrib_df)` |
+| `compute_equity_curve` | L462 | Compatibility shim |
+| `_compute_within_basket_correlation` | L527 | Full correlation rebuild (z-score variance decomposition) |
+| `_compute_within_basket_correlation_incremental` | L620 | Incremental correlation for new dates only |
+| `_augment_basket_signals_with_breadth` | L708 | Merges breadth columns into basket signals df |
+| `_finalize_basket_signals_output` | L765 | Writes `_signals.parquet` + `_signals_meta.json`; handles incremental path |
+| `_compute_and_save_contributions` | L912 | Full contributions rebuild |
+| `_compute_and_save_contributions_incremental` | L1052 | Incremental contributions for new dates only |
+| `_record_basket_timing` | L1219 | Per-step timing accumulator |
+| `process_basket_signals` | L1228 | Top-level per-basket driver: cache check, equity, breadth, correlation, contributions |
+
+**Imports from foundation.py:** all basket cache helpers, `_build_signals_from_df`, `_build_signals_next_row`, `compute_breadth_pivots`, `_build_quarter_lookup`, `_find_active_quarter`, `_build_membership_df`, `_vectorized_quarter_filter`, `compute_breadth_from_trend`, `compute_breadth_from_breakout`, `_build_quarter_weights`, `_get_data_signature`, `_build_universe_signature`, all equity/basket cache path helpers, `WriteThroughPath`, `SIZE`, path constants, `load_all_universes`, `build_all_basket_specs`.
+
+**Module-level execution:** loads universes + signals, builds `returns_matrix` + `ohlc_ret_matrices`, runs `process_basket_signals` for each basket in `build_all_basket_specs()`.
+
+---
+
+### signals/livesignals.py (1120 lines)
+
+**Purpose:** Phase 4 of the split pipeline. Intraday live loop: fetches Databento OHLC, computes live signal rows, appends `Source='live'` rows to all parquets. Runs approximately every 75 seconds during market hours.
+
+**Run schedule:** Every ~75s (market hours Mon-Fri 09:25-16:15 ET).
+
+**Key public functions:**
+
+| Function | Line | What it does |
+|----------|------|-------------|
+| `_load_env_file` | L53 | Loads `.env` for Databento credentials |
+| `get_realtime_prices` | L88 | Databento Live snapshot prices |
+| `get_realtime_ohlcv` | L150 | Databento Live OHLCV |
+| `get_live_ohlc_bars` | L223 | Databento Historical 1m OHLC aggregated to 1d |
+| `_get_live_update_gate` | L347 | Market-hours gate: returns context dict or None if outside hours |
+| `build_signals_for_ticker_live` | L419 | Appends live bar + computes signal row via `_build_signals_next_row` |
+| `export_today_signals` | L460 | Writes live ticker signals parquet (`live_signals_500.parquet`) |
+| `append_live_today_to_signals_parquet` | L543 | Idempotent append of live rows to `signals_500.parquet` |
+| `export_today_etf_signals` | L611 | Writes live ETF signals parquet |
+| `append_live_today_to_etf_signals_parquet` | L649 | Idempotent append of live rows to `signals_etf_50.parquet` |
+| `export_live_basket_signals` | L896 | Computes live basket OHLC for all baskets; writes `live_basket_signals_500.parquet` |
+| `update_basket_parquets_with_live_ohlcv` | L935 | Appends live OHLCV row to each basket's consolidated parquet (Option B path) |
+| `_load_universes_and_baskets` | L1030 | Helper: loads all universes + builds basket specs for the live loop |
+
+**Imports from foundation.py:** `_build_signals_from_df`, `_build_signals_next_row`, `_get_latest_norgate_date`, `_find_basket_parquet`, `_compute_live_basket_ohlc` (re-implemented locally), `WriteThroughPath`, `SIZE`, path constants, `load_all_universes`, `build_all_basket_specs`.
+
+**Module-level execution:** calls `_load_env_file()`, loads universes, runs the live update sequence (gate check → fetch → export_today_signals → export_today_etf_signals → append parquets → export_live_basket_signals).
 
 ---
 
 ## Cross-File Import Dependencies
 
 ```
+signals/foundation.py
+  └── standalone (no imports from other signals/ files)
+
+signals/universe.py
+  └── from foundation import * (constants, paths, serialisation helpers)
+
+signals/tickersignals.py
+  └── from foundation import * (signal engine, constants, paths)
+
+signals/basketsignals.py
+  └── from foundation import * (basket cache helpers, signal engine, constants)
+
+signals/livesignals.py
+  └── from foundation import * (signal engine, basket helpers, constants)
+
 signals/rotations_old_outputs.py
   └── from rotations import * (all public names)
-  └── from rotations import (24 specific private names)
+  └── from rotations import (specific private names — see file header)
 
 app/backend/main.py
   └── import signals_engine  (local module)

@@ -1,6 +1,24 @@
 # Monorepo Integration Map
 
-> Auto-generated 2026-03-16. Last updated 2026-03-24 (batch 9). Tracks all communication points between signals/ and app/backend/.
+> Auto-generated 2026-03-16. Last updated 2026-03-25 (batch 10). Tracks all communication points between signals/ and app/backend/.
+
+## Pipeline Split (2026-03-25)
+
+`rotations.py` remains the legacy monolithic pipeline (run via `live_loop.py` every 15 min). Five new files implement a split architecture where each phase runs independently:
+
+| File | Phase | Writes |
+|------|-------|--------|
+| `foundation.py` | Shared lib | No data files (constants, paths, signal engine) |
+| `universe.py` | Phase 1 | `top500stocks.json`, `etf_universes_50.json`, `ticker_names.json`, `beta_universes_500.json`, `momentum_universes_500.json`, `risk_adj_momentum_500.json`, `dividend_universes_500.json`, `size_universes_500.json`, `volume_growth_universes_500.json`, `gics_mappings_500.json` |
+| `tickersignals.py` | Phase 2 | `signals_500.parquet` (Source='norgate'), `signals_etf_50.parquet` (Source='norgate') |
+| `basketsignals.py` | Phase 3 | All basket parquets, basket meta JSONs, contributions parquets, `returns_matrix_500.parquet` + `.fingerprint` |
+| `livesignals.py` | Phase 4 | `live_signals_500.parquet`, `live_signals_etf_50.parquet`, `live_basket_signals_500.parquet` (backward compat snapshots) + appends `Source='live'` rows to `signals_500.parquet`, `signals_etf_50.parquet`, and individual basket parquets |
+
+**Live data strategy change (Option A):** `livesignals.py` appends `Source='live'` rows directly into consolidated parquets. The separate `live_*.parquet` snapshot files are still written for backward compatibility while the backend still reads them. Once the backend is updated to filter on `Source='live'` from consolidated files, the snapshot files can be removed.
+
+**Removed outputs:** `export_today_signals()` in `rotations.py` no longer writes xlsx files to `Live_Rotations/`. The `openpyxl` import remains but is unused by the active code path.
+
+---
 
 ## New Endpoint: GET /api/signals/log (added 2026-03-24)
 
@@ -16,9 +34,9 @@ Returns recent signal firings across stocks/ETFs/baskets with entry/exit, MAE, M
 - **Live overlay**: updates exit price, %chg, MAE, MFE for open trades with intraday prices
 - **Frontend consumer**: `SignalsPanel.tsx`
 
-## Signal Refresh Entry Point
+## Signal Refresh Entry Points
 
-### `signals/live_loop.py` — PM2-managed 15-minute refresh driver (added 2026-03-16, updated 2026-03-20)
+### Legacy: `signals/live_loop.py` — PM2-managed 15-minute refresh driver (added 2026-03-16, updated 2026-03-20)
 
 - **Role**: Thin scheduler — the sole purpose is to invoke `signals/rotations.py` on a recurring interval. It does not read or write any data files itself.
 - **Mechanism**: Calls `runpy.run_path("signals/rotations.py", run_name="__main__")` inside an infinite `while True` loop with `time.sleep(900)` (15 minutes) between iterations. Each call gets a fresh module namespace.
@@ -27,13 +45,34 @@ Returns recent signal firings across stocks/ETFs/baskets with entry/exit, MAE, M
 - **Market-hours gate**: `rotations.py`'s `_get_live_update_gate()` function no-ops outside Mon–Fri 09:25–16:15 ET, so the loop runs continuously but full I/O is suppressed outside trading hours. Cache guards (`is_*_current()`) additionally skip re-building already-current data within a run.
 - **Error isolation** (updated 2026-03-20): The `try/except` now catches `BaseException` (not just `Exception`) to prevent pm2 crash loops from uncaught `SystemExit`, `GeneratorExit`, or other `BaseException` subclasses raised by `rotations.py`. `KeyboardInterrupt` is explicitly re-raised via `break` to allow clean shutdown. All other exceptions (including `BaseException` subclasses) are logged via `traceback.print_exc()` and the loop continues.
 
+### Split mode: `signals/livesignals.py` — Independent live loop (~75s interval, added 2026-03-25)
+
+- **Role**: Replaces the live intraday portion of `rotations.py`. Runs as a standalone process fetching Databento OHLC and appending `Source='live'` rows to all consolidated parquets.
+- **Mechanism**: Continuous `while True` loop with `time.sleep(75)`. Each cycle: gate check → fetch Databento OHLC → write live snapshots → append to signals/ETF/basket parquets.
+- **Six steps per cycle**:
+  1. `export_today_signals()` — writes `live_signals_500.parquet` (backward compat snapshot)
+  2. `append_live_today_to_signals_parquet()` — appends `Source='live'` rows to `signals_500.parquet`
+  3. `export_today_etf_signals()` — writes `live_signals_etf_50.parquet` (backward compat snapshot)
+  4. `append_live_today_to_etf_signals_parquet()` — appends `Source='live'` rows to `signals_etf_50.parquet`
+  5. `export_live_basket_signals()` — writes `live_basket_signals_500.parquet` (backward compat snapshot)
+  6. `update_basket_parquets_with_live_ohlcv()` — appends `Source='live'` rows to each individual basket parquet
+- **Idempotent**: Existing `Source='live'` rows for today are dropped before re-appending.
+- **No in-memory globals**: Loads universes from JSON cache and signals from parquet each cycle (not from `all_signals_df`).
+- **Status**: Not yet the primary execution path. `live_loop.py` → `rotations.py` is still active via PM2.
+
+### Split mode: other phases (added 2026-03-25)
+
+- `universe.py` — run quarterly/on demand. Writes JSON universe caches.
+- `tickersignals.py` — run daily after Norgate update. Writes `signals_500.parquet`, `signals_etf_50.parquet`.
+- `basketsignals.py` — run daily after signals. Writes basket parquets, contributions, returns_matrix.
+
 ---
 
 ## Shared Data Directory
 
 `~/Documents/Python_Outputs/Data_Storage/`
 
-- **Producer**: `signals/rotations.py`
+- **Producer**: `signals/rotations.py` (legacy), `signals/universe.py`, `signals/tickersignals.py`, `signals/basketsignals.py`, `signals/livesignals.py` (split mode)
 - **Consumer**: `app/backend/main.py`, `app/backend/signals_engine.py`, `app/backend/verify_backtest.py`
 
 ---
@@ -97,15 +136,16 @@ Returns recent signal firings across stocks/ETFs/baskets with entry/exit, MAE, M
 - **Status**: OK
 
 ### Basket Contributions Parquets (`*_basket_cache/`)
-- **Written by**: `_finalize_basket_signals_output()` — `signals/rotations.py:3860`
-  - Uses pre-computed `contrib_df` from `compute_equity_ohlc_cached()` when available (line 3976 area), otherwise falls back to `_compute_and_save_contributions()` (line 4120)
+- **Written by**: `_finalize_basket_signals_output()` — `signals/rotations.py:4632`
+  - Uses pre-computed `contrib_df` from `compute_equity_ohlc_cached()` when available, otherwise falls back to `_compute_and_save_contributions()` (full recompute) or `_compute_and_save_contributions_incremental()` (when `incremental_dates` is set)
+  - **Incremental variant** (`optimize-incremental-rebuild` branch): `_compute_and_save_contributions_incremental()` reads the existing contributions parquet, appends only new dates' rows (BOD weights chained from last cached day's drifted weights), and writes back to the same path. Falls back to full recompute if no existing file. Same column contract.
   - Naming: `{slug}_{n}_of_500_contributions.parquet` (thematic), `{slug}_of_500_contributions.parquet` (sector/industry)
 - **Read by**: `_find_basket_contributions()`, `get_basket_weights_from_contributions()`, `get_basket_contributions()`, `get_basket_contributions_day()` — `app/backend/main.py:1549`, `242`, `1562`, `1652`
   - Naming glob: `{slug}_*_of_*_contributions.parquet` (with `{slug}_of_*_contributions.parquet` fallback) — `app/backend/main.py:1554`
   - `get_basket_summary()` cumulative returns path reads contributions to build per-ticker weighted return series — `app/backend/main.py:~1440`
   - `get_basket_weights_from_contributions()` reads latest `Weight_BOD` per ticker — `app/backend/main.py:242`
 - **Columns**: `Date`, `Ticker`, `Weight_BOD`, `Daily_Return`, `Contribution`
-- **Status**: OK — schema and file locations unchanged (2026-03-17)
+- **Status**: OK — schema and file locations unchanged. Incremental variant uses identical column contract (2026-03-25)
 
 ### Thematic Universe JSONs
 - `beta_universes_500.json` — Written: `signals/rotations.py:555` (write at line 567). Read: `app/backend/main.py:131`, `168`. Schema: `{high: {quarter: [...]}, low: {quarter: [...]}}`. Status: OK
@@ -147,7 +187,7 @@ Returns recent signal firings across stocks/ETFs/baskets with entry/exit, MAE, M
 
 ### `correlation_cache/`
 - `basket_correlations_of_500.parquet` + `correlation_meta_500.json`
-- **Written by**: NOBODY — `_save_corr_cache()` was removed when `rotations.py` was trimmed from ~8000 to ~5800 lines. Correlation is now computed inline by `_compute_within_basket_correlation()` (`signals/rotations.py:3710`) and stored directly as `Correlation_Pct` column in basket signals parquets.
+- **Written by**: NOBODY — `_save_corr_cache()` was removed when `rotations.py` was trimmed from ~8000 to ~5800 lines. Correlation is now computed inline by `_compute_within_basket_correlation()` (`signals/rotations.py:4394`) and stored directly as `Correlation_Pct` column in basket signals parquets. **Incremental variant** (`optimize-incremental-rebuild` branch): `_compute_within_basket_correlation_incremental()` computes only the new dates' correlation values and merges them into the existing `Correlation_Pct` column — same output schema, no new files.
 - **Read by**: Nothing in `app/backend/main.py` or `app/backend/signals_engine.py`
 - **Status**: STALE/REMOVED — These standalone files are no longer produced. Correlation data is now embedded in basket signals parquets.
 

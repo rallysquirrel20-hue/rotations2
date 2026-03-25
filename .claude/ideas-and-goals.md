@@ -87,6 +87,16 @@ Add variable position sizing feature to backtest.
 ### ~~15. Optimize Basket Signals Build Time~~ — COMPLETED (2026-03-17)
 ~~Basket signals build and amend process is too slow — adding new themes or industries takes way too long. Needs performance optimization.~~ Full rebuild dropped from ~30 min to 7 min 47s (467s), averaging 16.9s per basket. Six optimizations: pre-computed returns matrices, correlation vectorization (numpy z-score variance decomposition), breadth vectorization (searchsorted + groupby), equity OHLC cumprod path, contributions merged into equity OHLC, extracted shared `_build_quarter_weights`.
 
+### 17. Incremental Basket Rebuild Optimization — PENDING MERGE (2026-03-25)
+Optimize the incremental basket rebuild so 1-2 new OHLC days don't trigger full-history recomputation of correlation, contributions, and breadth pivots across all 27 baskets.
+- Branch: `optimize-incremental-rebuild`
+- Implementation complete: incremental correlation (171x speedup), incremental contributions (6.6x speedup)
+- All 30 baskets validated against production (exact match)
+- Test scripts: `prep_test_data.py`, `test_incremental_run.py`, `test_incremental_benchmark.py`
+- Plan doc: `.claude/optimize_basket_rebuild.md`
+- Awaiting user verification before merge to main
+- Phase 2 (breadth pivot state caching) and Phase 3 (parallelism) deferred
+
 ### 16. Export Button — IN PROGRESS (2026-03-24)
 Export button properly functions with all features on the frontend, with titles / good aesthetic for charts.
 Completed sub-goals:
