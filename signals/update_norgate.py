@@ -1,0 +1,18 @@
+import os
+import sys
+import subprocess
+from pathlib import Path
+
+# Force the core rotations file to only run Norgate (historical) updates
+os.environ['ROTATIONS_RUN_MODE'] = 'NORGATE'
+
+script = str(Path(__file__).parent / "rotations.py")
+
+if __name__ == "__main__":
+    print("Starting Norgate Historical Update...")
+    try:
+        subprocess.run([sys.executable, script], check=True)
+        print("Norgate Update Complete.")
+    except subprocess.CalledProcessError as exc:
+        print(f"Error: Norgate update failed with code {exc.returncode}")
+        sys.exit(exc.returncode)

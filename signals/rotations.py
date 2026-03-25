@@ -6926,10 +6926,11 @@ _live_ctx_for_reports = _get_live_update_context()
 export_today_signals(live_ctx=_live_ctx_for_reports)
 export_today_etf_signals(live_ctx=_live_ctx_for_reports)
 append_live_today_to_etf_signals_parquet()
-export_annual_returns(live_ctx=_live_ctx_for_reports)
-export_annual_returns_by_year(live_ctx=_live_ctx_for_reports)
-export_last_20_days_returns(live_ctx=_live_ctx_for_reports)
-export_last_20_days_returns_by_day(live_ctx=_live_ctx_for_reports)
+# PDF Generation disabled per user request
+# export_annual_returns(live_ctx=_live_ctx_for_reports)
+# export_annual_returns_by_year(live_ctx=_live_ctx_for_reports)
+# export_last_20_days_returns(live_ctx=_live_ctx_for_reports)
+# export_last_20_days_returns_by_day(live_ctx=_live_ctx_for_reports)
 # update_basket_parquets_with_live_ohlcv: disabled — live data is written to
 # live_signals_500.parquet and live_basket_signals_500.parquet instead.
 

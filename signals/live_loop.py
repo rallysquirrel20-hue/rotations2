@@ -9,7 +9,7 @@ iteration gets a fresh namespace.  Cache guards in rotations.py
 
 import sys
 import time
-import runpy
+import subprocess
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -31,10 +31,14 @@ while True:
     log(f"[live_loop] Cycle {cycle} starting at {datetime.now():%Y-%m-%d %H:%M:%S}")
     log(f"{'='*60}")
     try:
-        runpy.run_path(script, run_name="__main__")
+        # Use subprocess instead of runpy to force complete memory reclamation
+        subprocess.run([sys.executable, script], check=True)
+    except subprocess.CalledProcessError as exc:
+        log(f"[live_loop] Error: Script exited with code {exc.returncode}")
     except BaseException as exc:
         traceback.print_exc()
         if isinstance(exc, KeyboardInterrupt):
+            log("[live_loop] Stopping loop.")
             break
     log(f"[live_loop] Cycle {cycle} finished at {datetime.now():%Y-%m-%d %H:%M:%S}")
     log(f"[live_loop] Sleeping {INTERVAL // 60} minutes...")

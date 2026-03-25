@@ -1,7 +1,7 @@
 # Dependency Tree
-Updated: 2026-03-23 (incremental — batch benchmarks endpoint, stats table rewrite, incrementProgress fix)
-Files scanned: 16
-Functions indexed: 241
+Updated: 2026-03-24 (incremental — signals log endpoint, import portfolios, export overhaul)
+Files scanned: 17
+Functions indexed: 242
 
 ---
 
@@ -1041,7 +1041,18 @@ This file imports everything from rotations.py via `from rotations import *` plu
   - Inter-leg correlation matrix from daily returns of standalone equity curves
   - Per-leg contribution = alloc_frac * leg_return
 
-#### `uvicorn.run` (L3963) — entry point
+#### `get_signals_log` (L4864-5074) — GET /api/signals/log
+- **Params:** `universe` (stocks|etfs|baskets), `period` (1d|1w|1m|3m|6m|1y)
+- **Reads:** `signals_500.parquet` (stocks), `signals_etf_50.parquet` (ETFs), `*_of_*_signals.parquet` from basket cache folders (baskets)
+- **Also reads:** `top500stocks.json`, `etf_universes_50.json` (universe filtering), `gics_mappings_500.json` (sector/industry), `ticker_names.json` (names), `live_signals_500.parquet`, `live_signals_etf_50.parquet`, `live_basket_signals_500.parquet` (live overlay)
+- **Calls:** `_read_live_parquet`, `_live_is_current`, `safe_float`
+- **Signal columns:** `Is_Breakout`, `Is_Breakdown`, `Is_Up_Rotation`, `Is_Down_Rotation`, `Is_BTFD`, `Is_STFR`, `{sig}_Entry_Price`, `{sig}_Exit_Date`, `{sig}_Exit_Price`, `{sig}_MFE`, `{sig}_MAE`
+- **Open/closed detection:** checks latest row per ticker for NaT exit_date (not firing row)
+- **Live overlay:** updates exit price, pct_chg, MAE, MFE for open trades
+- **Note:** fully vectorized (no iterrows), numpy types converted for JSON serialization
+- **Frontend consumer:** `SignalsPanel.tsx`
+
+#### `uvicorn.run` (L5082) — entry point
 
 ---
 
