@@ -32,22 +32,16 @@ from rotations import *  # noqa: F403
 # --- rotations.py: private helpers that cells 9-15 reference ---
 from rotations import (  # noqa: F811
     _append_trade_rows,
-    _build_basket_annual_grid,
-    _build_basket_daily_grid_last20,
-    _build_group_daily_return_grid,
     _build_universe_signature,
-    _compute_live_basket_return,
     _fmt_bars,
     _fmt_pct,
     _fmt_price,
-    _get_all_basket_specs_for_reports,
     _get_chart_schema_version_from_parquet,
     _get_latest_norgate_date,
     _get_latest_norgate_date_fallback,
     _get_live_update_context,
     _live_ctx_for_reports,
     _needs_write_and_mirror,
-    _render_return_bar_charts,
     _SIGNAL_ORDER,
     _SIGNAL_RANK,
     _sort_signals_df,
@@ -1844,77 +1838,13 @@ def generate_summary_pdf(live_ctx=None):
     if live_ctx is None:
         live_ctx = _get_live_update_context()
 
-    all_specs = _get_all_basket_specs_for_reports()
-
     print("Building Summary PDF...")
 
     with PdfPages(summary_path) as pdf:
         # ------------------------------------------------------------------
-        # 1-3. Returns by group: Annual â†’ Last 20 Days â†’ YTD Rebase
-        #      Order: Themes, then Sectors, then Industries
+        # 1. Basket Signals Table + basket charts for signalling baskets
         # ------------------------------------------------------------------
-        print("  [1-3/6] Building return grids...")
-        basket_year_grid = _build_basket_annual_grid(live_ctx=live_ctx)
-        basket_date_grid = _build_basket_daily_grid_last20(live_ctx=live_ctx)
-        daily_grid_full = _build_group_daily_return_grid(all_specs, live_ctx=live_ctx)
-        if not daily_grid_full.empty:
-            daily_grid_full = daily_grid_full.sort_index()
-            if live_ctx is not None:
-                live_today = live_ctx['today']
-                for spec in all_specs:
-                    group_name = spec[0]
-                    universe_by_qtr = spec[1]
-                    live_ret = _compute_live_basket_return(
-                        universe_by_qtr, live_ctx['live_price_map'],
-                        live_ctx['last_rows'], live_ctx['current_key'])
-                    if pd.notna(live_ret):
-                        daily_grid_full.loc[live_today, group_name] = float(live_ret)
-
-        for _grp_prefix, _grp_label in [
-            ('Theme: ',    'Themes'),
-            ('Sector: ',   'Sectors'),
-            ('Industry: ', 'Industries'),
-        ]:
-            def _grp_rows(grid, prefix=_grp_prefix):
-                if grid.empty:
-                    return grid
-                rows = [i for i in grid.index if i.startswith(prefix)]
-                return grid.loc[rows] if rows else grid.iloc[:0]
-
-            grp_year = _grp_rows(basket_year_grid)
-            grp_date = _grp_rows(basket_date_grid)
-
-            # Annual returns — asymmetric y-axis based on this group's actual min/max
-            if not grp_year.empty:
-                _yr_min = min(-0.10, round(float(grp_year.min().min()) * 1.05 - 0.01, 2))
-                _yr_max = max( 0.10, round(float(grp_year.max().max()) * 1.05 + 0.01, 2))
-                _render_return_bar_charts(
-                    pdf, f'Annual Returns — {_grp_label}',
-                    grp_year, y_min=_yr_min, y_max=_yr_max,
-                    figsize=(_PAGE_W, _PAGE_H), n_cols=4, n_rows_fixed=3,
-                )
-
-            # Last 20 days — asymmetric y-axis based on this group's actual min/max
-            if not grp_date.empty:
-                _d20_min = min(-0.03, round(float(grp_date.min().min()) * 1.05 - 0.005, 3))
-                _d20_max = max( 0.03, round(float(grp_date.max().max()) * 1.05 + 0.005, 3))
-                _render_return_bar_charts(
-                    pdf, f'Daily Returns — Last 20 Days ({_grp_label})',
-                    grp_date, y_min=_d20_min, y_max=_d20_max,
-                    figsize=(_PAGE_W, _PAGE_H), n_cols=4, n_rows_fixed=3,
-                )
-
-            # YTD rebase
-            if not daily_grid_full.empty:
-                _render_ytd_rebase_page(
-                    pdf, daily_grid_full, _grp_prefix,
-                    f'YTD Returns — {_grp_label}',
-                )
-
-        # ------------------------------------------------------------------
-        # 4. Basket Signals Table + basket charts for signalling baskets
-        # ------------------------------------------------------------------
-        print("  [4/6] Basket signals table...")
+        print("  [1/3] Basket signals table...")
         _daily_xlsx = None
         if report_date_prefix:
             _daily_xlsx = _find_latest_file(
@@ -1945,9 +1875,9 @@ def generate_summary_pdf(live_ctx=None):
                 _embed_image_page(pdf, chart_path, basket_name, landscape=True)
 
         # ------------------------------------------------------------------
-        # 5. Individual Stock Signals Table
+        # 2. Individual Stock Signals Table
         # ------------------------------------------------------------------
-        print("  [5/6] Individual stock signals table...")
+        print("  [2/3] Individual stock signals table...")
         stock_cols = ['Ticker', 'Signal_Type', 'Theme', 'Sector',
                       'Entry_Price', 'Win_Rate', 'Historical_EV', 'Risk_Adj_EV',
                       'Avg_Winner', 'Avg_Loser', 'Avg_Winner_Bars', 'Avg_Loser_Bars',
@@ -1961,9 +1891,9 @@ def generate_summary_pdf(live_ctx=None):
             print("    No daily signals workbook found — skipping stock signals table.")
 
         # ------------------------------------------------------------------
-        # 6. Live Signals Table (only if today's live file exists with rows)
+        # 3. Live Signals Table (only if today's live file exists with rows)
         # ------------------------------------------------------------------
-        print("  [6/6] Live signals (if available)...")
+        print("  [3/3] Live signals (if available)...")
         today_prefix = datetime.now().strftime('%Y_%m_%d')
         live_xlsx = _find_latest_file(LIVE_ROTATIONS_FOLDER,
                                       f'{today_prefix}*_Live_Signals_for_top_{SIZE}.xlsx')

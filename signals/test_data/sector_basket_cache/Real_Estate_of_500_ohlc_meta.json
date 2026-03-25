@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "signal_logic_version": "2026-03-13-btfd-stfr-prev-trend",
+  "universe_logic_version": "2026-02-10-codex-1",
+  "data_fingerprint": "f294e044f3ebde74b7b42fc2aa8e8c010637b57dc18fe7da80e1b09e95e79bc0",
+  "latest_source_date": "2026-03-24",
+  "last_cached_date": "2026-03-24",
+  "universe_signature": "b2d92eb89b46dc6f713b91c8c148568a9d1db74d88c1080395ebf82f9afa2d0d",
+  "state": {
+    "current_quarter": "2026 Q1",
+    "equity_prev_close": 3.8976656903582048,
+    "weights": {
+      "VICI": 0.06720270578590716,
+      "SPG": 0.04866210579440751,
+      "OPEN": 0.15570292067462183,
+      "AMT": 0.11032440502598752,
+      "CCI": 0.047895503651028154,
+      "O": 0.07459246174438086,
+      "PLD": 0.08927534718112567,
+      "PSA": 0.062085613758457364,
+      "WELL": 0.13346220330230837,
+      "CSGP": 0.03485496191590006,
+      "EQIX": 0.10705569054073007,
+      "DLR": 0.06888608062514541
+    }
+  }
+}

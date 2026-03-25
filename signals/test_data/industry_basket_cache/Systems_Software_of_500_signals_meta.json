@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "signal_logic_version": "2026-03-13-btfd-stfr-prev-trend",
+  "universe_logic_version": "2026-02-10-codex-1",
+  "data_fingerprint": "f294e044f3ebde74b7b42fc2aa8e8c010637b57dc18fe7da80e1b09e95e79bc0",
+  "latest_source_date": "2026-03-24",
+  "last_cached_date": "2026-03-24",
+  "universe_signature": "b98fae45e1187f735c89ebb48f5ea40247b1a90f8913ee9a8a117b4cc69e2fd3",
+  "basket_type": "industry",
+  "state": {
+    "current_quarter": "2026 Q1",
+    "equity_prev_close": 4.969370844924918,
+    "weights": {
+      "CRWD": 0.049692449907224885,
+      "MSFT": 0.44412577027450567,
+      "FTNT": 0.02207770350624141,
+      "NBIS": 0.12756220772853977,
+      "ZS": 0.014302600770057093,
+      "PANW": 0.047279098708411474,
+      "NOW": 0.04712656164125885,
+      "ORCL": 0.22510753602129763,
+      "RBRK": 0.007861329313835314,
+      "PATH": 0.014864742128627843
+    }
+  }
+}

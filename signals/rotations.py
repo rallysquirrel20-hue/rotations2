@@ -4484,6 +4484,94 @@ def _compute_within_basket_correlation(universe_by_qtr, returns_matrix, window=2
     return result
 
 
+def _compute_within_basket_correlation_incremental(universe_by_qtr, returns_matrix, new_dates, window=21):
+    """Compute rolling within-basket correlation for only the specified new dates.
+
+    Same z-score variance decomposition as the full version, but only processes
+    the active quarter(s) for the new dates instead of all quarters x all dates.
+    """
+    if returns_matrix is None or returns_matrix.empty or not universe_by_qtr or not new_dates:
+        return pd.DataFrame(columns=['Date', 'Correlation_Pct'])
+
+    quarter_labels, quarter_ends = _build_quarter_lookup(universe_by_qtr)
+    min_obs = max(10, int(window * 0.70))
+    new_dates_norm = sorted(pd.to_datetime(d).normalize() for d in new_dates)
+
+    all_dates = []
+    all_corrs = []
+
+    # Group new dates by their active quarter to avoid redundant setup
+    quarter_date_groups = {}
+    for d in new_dates_norm:
+        q_key = _find_active_quarter(d, quarter_labels, quarter_ends)
+        if q_key is not None:
+            quarter_date_groups.setdefault(q_key, []).append(d)
+
+    for q_key, dates_in_q in quarter_date_groups.items():
+        tickers = [t for t in universe_by_qtr.get(q_key, set()) if t in returns_matrix.columns]
+        if len(tickers) < 2:
+            for d in dates_in_q:
+                all_dates.append(d)
+                all_corrs.append(np.nan)
+            continue
+
+        # Get the quarter's index in the lookup for date range
+        q_idx = quarter_labels.index(q_key)
+        q_start = quarter_ends[q_idx]
+
+        # Filter to tickers with sufficient data in the quarter
+        q_data = returns_matrix.loc[q_start:, tickers]
+        valid_tickers = [t for t in tickers if q_data[t].notna().sum() >= min_obs]
+        if len(valid_tickers) < 2:
+            for d in dates_in_q:
+                all_dates.append(d)
+                all_corrs.append(np.nan)
+            continue
+
+        for d in dates_in_q:
+            # Extract window slice ending at d
+            d_idx_in_matrix = returns_matrix.index.searchsorted(d)
+            if d_idx_in_matrix >= len(returns_matrix.index) or returns_matrix.index[d_idx_in_matrix] != d:
+                all_dates.append(d)
+                all_corrs.append(np.nan)
+                continue
+            start_idx = max(0, d_idx_in_matrix - window + 1)
+            w_slice = returns_matrix.iloc[start_idx:d_idx_in_matrix + 1][valid_tickers].values
+
+            if len(w_slice) < min_obs:
+                all_dates.append(d)
+                all_corrs.append(np.nan)
+                continue
+
+            # Valid columns: enough non-NaN in this window
+            col_counts = np.sum(~np.isnan(w_slice), axis=0)
+            col_valid = col_counts >= min_obs
+            nv = col_valid.sum()
+            if nv < 2:
+                all_dates.append(d)
+                all_corrs.append(np.nan)
+                continue
+            w = w_slice[:, col_valid]
+            means = np.nanmean(w, axis=0)
+            stds = np.nanstd(w, axis=0, ddof=1)
+            stds[stds == 0] = np.nan
+            z = (w - means) / stds
+            z_port = np.nanmean(z, axis=1)
+            z_valid = z_port[~np.isnan(z_port)]
+            if len(z_valid) < min_obs:
+                all_dates.append(d)
+                all_corrs.append(np.nan)
+                continue
+            var_z = np.var(z_valid, ddof=1)
+            avg_corr = (nv * var_z - 1) / (nv - 1)
+            all_dates.append(d)
+            all_corrs.append(np.clip(avg_corr * 100, -100, 100))
+
+    if not all_dates:
+        return pd.DataFrame(columns=['Date', 'Correlation_Pct'])
+    return pd.DataFrame({'Date': all_dates, 'Correlation_Pct': all_corrs})
+
+
 def _augment_basket_signals_with_breadth(signals_df, universe_by_qtr):
     _do_timing = BENCHMARK_TIMING or BENCHMARK_BASKETS > 0
 
@@ -4541,7 +4629,7 @@ def _augment_basket_signals_with_breadth(signals_df, universe_by_qtr):
     return merged_all
 
 
-def _finalize_basket_signals_output(name, slug, hist_folder, merged_all, data_sig, universe_sig, universe_by_qtr, basket_type='sector', returns_matrix=None, contrib_df=None):
+def _finalize_basket_signals_output(name, slug, hist_folder, merged_all, data_sig, universe_sig, universe_by_qtr, basket_type='sector', returns_matrix=None, contrib_df=None, incremental_dates=None):
     _do_timing = BENCHMARK_TIMING or BENCHMARK_BASKETS > 0
 
     if _do_timing:
@@ -4572,16 +4660,30 @@ def _finalize_basket_signals_output(name, slug, hist_folder, merged_all, data_si
     # Compute within-basket correlation and merge as Correlation_Pct column
     if _do_timing:
         _t0 = time.perf_counter()
-    corr_df = _compute_within_basket_correlation(universe_by_qtr, returns_matrix)
-    if not corr_df.empty:
-        merged_all = merged_all.copy()
-        merged_all['Date'] = pd.to_datetime(merged_all['Date']).dt.normalize()
-        corr_df['Date'] = pd.to_datetime(corr_df['Date']).dt.normalize()
-        if 'Correlation_Pct' in merged_all.columns:
-            merged_all = merged_all.drop(columns=['Correlation_Pct'])
-        merged_all = pd.merge(merged_all, corr_df[['Date', 'Correlation_Pct']], on='Date', how='left')
-    elif 'Correlation_Pct' not in merged_all.columns:
-        merged_all['Correlation_Pct'] = np.nan
+    if incremental_dates and 'Correlation_Pct' in merged_all.columns:
+        # Incremental path: only compute correlation for new dates
+        incr_corr = _compute_within_basket_correlation_incremental(
+            universe_by_qtr, returns_matrix, incremental_dates)
+        if not incr_corr.empty:
+            merged_all = merged_all.copy()
+            merged_all['Date'] = pd.to_datetime(merged_all['Date']).dt.normalize()
+            incr_corr['Date'] = pd.to_datetime(incr_corr['Date']).dt.normalize()
+            # Update only the new dates' correlation values
+            incr_map = incr_corr.set_index('Date')['Correlation_Pct']
+            mask = merged_all['Date'].isin(incr_map.index)
+            merged_all.loc[mask, 'Correlation_Pct'] = merged_all.loc[mask, 'Date'].map(incr_map).values
+    else:
+        # Full recompute
+        corr_df = _compute_within_basket_correlation(universe_by_qtr, returns_matrix)
+        if not corr_df.empty:
+            merged_all = merged_all.copy()
+            merged_all['Date'] = pd.to_datetime(merged_all['Date']).dt.normalize()
+            corr_df['Date'] = pd.to_datetime(corr_df['Date']).dt.normalize()
+            if 'Correlation_Pct' in merged_all.columns:
+                merged_all = merged_all.drop(columns=['Correlation_Pct'])
+            merged_all = pd.merge(merged_all, corr_df[['Date', 'Correlation_Pct']], on='Date', how='left')
+        elif 'Correlation_Pct' not in merged_all.columns:
+            merged_all['Correlation_Pct'] = np.nan
     if _do_timing:
         _finalize_basket_signals_output._last_correlation_time = time.perf_counter() - _t0
 
@@ -4653,7 +4755,11 @@ def _finalize_basket_signals_output(name, slug, hist_folder, merged_all, data_si
     if _do_timing:
         _t0 = time.perf_counter()
     if contrib_df is None or contrib_df.empty:
-        _compute_and_save_contributions(slug, basket_type, universe_by_qtr, returns_matrix=returns_matrix)
+        if incremental_dates:
+            _compute_and_save_contributions_incremental(
+                slug, basket_type, universe_by_qtr, returns_matrix, incremental_dates)
+        else:
+            _compute_and_save_contributions(slug, basket_type, universe_by_qtr, returns_matrix=returns_matrix)
     else:
         basket_folder_c = _basket_cache_folder(basket_type)
         stem_c = _cache_file_stem(slug, basket_type, universe_by_qtr, 'contributions')
@@ -4810,6 +4916,173 @@ def _compute_and_save_contributions(slug, basket_type, universe_by_qtr, returns_
     print(f"Saved: {contrib_path}")
 
 
+def _compute_and_save_contributions_incremental(slug, basket_type, universe_by_qtr, returns_matrix, new_dates):
+    """Incrementally update contributions parquet for newly appended dates.
+
+    Loads existing contributions, computes only new rows for the current quarter,
+    appends, and saves.  Falls back to full recompute if no existing file.
+    """
+    basket_folder = _basket_cache_folder(basket_type)
+    stem = _cache_file_stem(slug, basket_type, universe_by_qtr, 'contributions')
+    contrib_path = basket_folder / f'{stem}.parquet'
+
+    # Load existing contributions
+    if not contrib_path.exists():
+        _compute_and_save_contributions(slug, basket_type, universe_by_qtr, returns_matrix=returns_matrix)
+        return
+
+    try:
+        existing_df = pd.read_parquet(contrib_path)
+    except Exception:
+        _compute_and_save_contributions(slug, basket_type, universe_by_qtr, returns_matrix=returns_matrix)
+        return
+
+    if existing_df.empty:
+        _compute_and_save_contributions(slug, basket_type, universe_by_qtr, returns_matrix=returns_matrix)
+        return
+
+    new_dates_norm = sorted(pd.to_datetime(d).normalize() for d in new_dates)
+    quarter_labels, quarter_ends = _build_quarter_lookup(universe_by_qtr)
+
+    # Build quarter weights (same logic as full version)
+    all_df = all_signals_df
+    needed_cols = ['Date', 'Ticker', 'Close']
+    if 'Volume' in all_df.columns:
+        needed_cols.append('Volume')
+    df_w = all_df[needed_cols].copy()
+    df_w['Date'] = pd.to_datetime(df_w['Date']).dt.normalize()
+    df_w = df_w.dropna(subset=['Close'])
+    if 'Volume' in df_w.columns:
+        df_w['Dollar_Vol'] = df_w['Close'] * df_w['Volume']
+
+    quarter_weights = {}
+    if 'Dollar_Vol' in df_w.columns:
+        dv_q = (
+            df_w[['Date', 'Ticker', 'Dollar_Vol']]
+            .dropna(subset=['Dollar_Vol'])
+            .groupby(['Ticker', pd.Grouper(key='Date', freq='QE-DEC')])['Dollar_Vol']
+            .mean()
+        )
+    else:
+        dv_q = None
+
+    for label in quarter_labels:
+        if label not in universe_by_qtr or dv_q is None:
+            continue
+        prev_universe = universe_by_qtr[label]
+        if isinstance(label, str):
+            y, q = label.split()
+            yr, qn = int(y), int(q.replace("Q", ""))
+            if qn == 1:
+                ranking_date = _quarter_end_from_key(f"{yr - 1} Q4")
+            else:
+                ranking_date = _quarter_end_from_key(f"{yr} Q{qn - 1}")
+        else:
+            ranking_date = label
+        weights = {}
+        total = 0.0
+        for t in prev_universe:
+            val = dv_q.get((t, ranking_date), np.nan)
+            if pd.notna(val) and val > 0:
+                weights[t] = float(val)
+                total += float(val)
+        if total > 0:
+            quarter_weights[label] = {t: v / total for t, v in weights.items()}
+    del df_w
+
+    # Determine which quarter the new dates fall into
+    existing_df['Date'] = pd.to_datetime(existing_df['Date']).dt.normalize()
+    existing_max_date = existing_df['Date'].max()
+
+    new_rows = []
+    # Track drifted weights across consecutive new dates so multi-day appends chain correctly
+    _carried_bod = None  # will hold BOD weights for the next date
+    _carried_q_key = None
+
+    for d in new_dates_norm:
+        if d <= existing_max_date:
+            continue  # already in existing data
+        q_key = _find_active_quarter(d, quarter_labels, quarter_ends)
+        if q_key is None:
+            continue
+        w_dict = quarter_weights.get(q_key)
+        if not w_dict:
+            continue
+        tickers = [t for t in w_dict if t in returns_matrix.columns]
+        if not tickers:
+            continue
+
+        # If we have carried-forward weights from the previous new date in the same quarter, use them
+        if _carried_bod is not None and _carried_q_key == q_key:
+            bod_weights = _carried_bod
+        else:
+            # Seed from existing cached data
+            q_idx = quarter_labels.index(q_key)
+            q_start = quarter_ends[q_idx]
+            existing_q = existing_df[existing_df['Date'] >= q_start]
+
+            if existing_q.empty:
+                # New quarter: use initial weights as BOD weights
+                w0 = pd.Series({t: w_dict[t] for t in tickers})
+                w0 = w0 / w0.sum()
+                bod_weights = w0
+            else:
+                # Get latest day's drifted weights from existing data
+                last_day = existing_q[existing_q['Date'] == existing_q['Date'].max()]
+                if last_day.empty:
+                    continue
+                eod = {}
+                for _, row in last_day.iterrows():
+                    t = row['Ticker']
+                    if t in tickers:
+                        eod[t] = row['Weight_BOD'] * (1 + row['Daily_Return'])
+                if not eod:
+                    continue
+                total_eod = sum(eod.values())
+                if total_eod == 0:
+                    continue
+                bod_weights = pd.Series({t: v / total_eod for t, v in eod.items()})
+
+        # Get daily returns for this date
+        if d not in returns_matrix.index:
+            continue
+        day_rets = returns_matrix.loc[d, [t for t in tickers if t in bod_weights.index]].fillna(0.0)
+
+        for t in bod_weights.index:
+            if t in day_rets.index:
+                new_rows.append({
+                    'Date': d,
+                    'Ticker': t,
+                    'Weight_BOD': bod_weights[t],
+                    'Daily_Return': day_rets[t],
+                    'Contribution': bod_weights[t] * day_rets[t],
+                })
+
+        # Carry forward: compute end-of-day drifted weights for the next date
+        eod_weights = bod_weights * (1 + day_rets.reindex(bod_weights.index, fill_value=0.0))
+        total_eod = eod_weights.sum()
+        if total_eod > 0:
+            _carried_bod = eod_weights / total_eod
+        else:
+            _carried_bod = None
+        _carried_q_key = q_key
+
+    if new_rows:
+        new_df = pd.DataFrame(new_rows)
+        contrib_df = pd.concat([existing_df, new_df], ignore_index=True)
+        contrib_df = contrib_df.drop_duplicates(subset=['Date', 'Ticker'], keep='last')
+        contrib_df = contrib_df.sort_values(['Date', 'Ticker']).reset_index(drop=True)
+    else:
+        contrib_df = existing_df
+
+    pq.write_table(
+        pa.Table.from_pandas(contrib_df, preserve_index=False),
+        contrib_path, compression='snappy',
+    )
+    WriteThroughPath(contrib_path).sync()
+    print(f"Saved: {contrib_path}")
+
+
 def _record_basket_timing(name, **timings):
     """Record per-step timings for a basket into the global accumulator."""
     _basket_timing_names.append(name)
@@ -4923,9 +5196,11 @@ def process_basket_signals(name, universe_by_qtr, charts_folder, basket_type='se
                     .sort_values('Date')
                     .reset_index(drop=True)
                 )
+                _new_dates = sorted(pd.to_datetime(appended_ohlc['Date']).dt.normalize().unique())
                 result = _finalize_basket_signals_output(
                     name, slug, hist_folder, merged_all, _bsig_data_sig, _bsig_universe_sig, universe_by_qtr, basket_type,
                     returns_matrix=returns_matrix, contrib_df=_contrib_df,
+                    incremental_dates=_new_dates,
                 )
                 if _do_timing:
                     _record_basket_timing(
@@ -5581,137 +5856,6 @@ def export_today_signals(verbose=False, live_ctx=None):
             last_rows = _get_latest_norgate_rows_by_ticker(before_date=live_ctx['today'])
 
     _LIVE_UPDATE_CONTEXT_CACHE = live_ctx
-
-    if not current_universe:
-        print(f"No universe found for {current_key}")
-        return None
-
-    current_universe = QUARTER_UNIVERSE.get(current_key, set())
-
-    signal_flags = {
-        'Up_Rot': 'Is_Up_Rotation',
-        'Down_Rot': 'Is_Down_Rotation',
-        'Breakout': 'Is_Breakout',
-        'Breakdown': 'Is_Breakdown',
-        'BTFD': 'Is_BTFD',
-        'STFR': 'Is_STFR',
-    }
-
-    rows = []
-    total = len(tickers)
-    last_milestone = 0
-
-    for i, ticker in enumerate(tickers, start=1):
-        try:
-            live_price = price_map.get(ticker)
-            if live_price is None:
-                if verbose:
-                    print(f"[{i}/{len(tickers)}] {ticker} failed: no Databento price")
-                continue
-            if ticker not in last_rows.index:
-                if verbose:
-                    print(f"[{i}/{len(tickers)}] {ticker} failed: no cached history")
-                continue
-            last_row = last_rows.loc[ticker]
-            ohlc = live_ohlc_map.get(ticker, {})
-            new_row = _build_signals_next_row(
-                last_row, live_price, now,
-                live_high=ohlc.get('High'),
-                live_low=ohlc.get('Low'),
-                live_open=ohlc.get('Open'),
-            )
-            if new_row is None:
-                continue
-            last_row = new_row
-            for sig_name, flag_col in signal_flags.items():
-                if bool(last_row.get(flag_col, False)):
-                    hist_ev = last_row.get(f'{sig_name}_Historical_EV', np.nan)
-                    ev_last_3 = last_row.get(f'{sig_name}_EV_Last_3', np.nan)
-                    risk_adj_ev = last_row.get(f'{sig_name}_Risk_Adj_EV', np.nan)
-                    risk_adj_ev_last_3 = last_row.get(f'{sig_name}_Risk_Adj_EV_Last_3', np.nan)
-                    rows.append({
-                        'Date': now.date(),
-                        'Ticker': ticker,
-                        'Close': live_price,
-                        'Signal_Type': sig_name,
-                        'Theme': _get_ticker_theme(ticker) if '_get_ticker_theme' in globals() else '',
-                        'Sector': TICKER_SECTOR.get(ticker, '') if 'TICKER_SECTOR' in globals() else '',
-                        'Industry': TICKER_SUBINDUSTRY.get(ticker, '') if 'TICKER_SUBINDUSTRY' in globals() else '',
-                        'Entry_Price': last_row.get(f'{sig_name}_Entry_Price', np.nan),
-                        'Win_Rate': last_row.get(f'{sig_name}_Win_Rate', np.nan),
-                        'Avg_Winner': last_row.get(f'{sig_name}_Avg_Winner', np.nan),
-                        'Avg_Loser': last_row.get(f'{sig_name}_Avg_Loser', np.nan),
-                        'Avg_Winner_Bars': last_row.get(f'{sig_name}_Avg_Winner_Bars', np.nan),
-                        'Avg_Loser_Bars': last_row.get(f'{sig_name}_Avg_Loser_Bars', np.nan),
-                        'Avg_MFE': last_row.get(f'{sig_name}_Avg_MFE', np.nan),
-                        'Avg_MAE': last_row.get(f'{sig_name}_Avg_MAE', np.nan),
-                        'Std_Dev': last_row.get(f'{sig_name}_Std_Dev', np.nan),
-                        'Historical_EV': hist_ev,
-                        'EV_Last_3': ev_last_3,
-                        'Risk_Adj_EV': risk_adj_ev,
-                        'Risk_Adj_EV_Last_3': risk_adj_ev_last_3,
-                        'Count': last_row.get(f'{sig_name}_Count', np.nan),
-                    })
-        except Exception as exc:
-            if verbose:
-                print(f"[{i}/{len(current_universe)}] {ticker} failed: {exc}")
-
-        if total > 0:
-            percent = int((i / total) * 100)
-            milestone = percent // 10 * 10
-            if milestone > last_milestone and milestone % 10 == 0:
-                print(f"  {milestone}% complete ({i} / {total} stocks)")
-                last_milestone = milestone
-
-    out_df = pd.DataFrame(rows)
-    if not out_df.empty:
-        col_order = [
-            'Date', 'Ticker', 'Close', 'Signal_Type',
-            'Theme', 'Sector', 'Industry',
-            'Entry_Price',
-            'Win_Rate', 'Avg_Winner', 'Avg_Loser', 'Avg_Winner_Bars', 'Avg_Loser_Bars',
-            'Avg_MFE', 'Avg_MAE',
-            'Std_Dev', 'Historical_EV', 'EV_Last_3',
-            'Risk_Adj_EV', 'Risk_Adj_EV_Last_3', 'Count',
-        ]
-        out_df = out_df[[c for c in col_order if c in out_df.columns]]
-        pct_cols = [
-            'Win_Rate', 'Avg_Winner', 'Avg_Loser',
-            'Avg_MFE', 'Avg_MAE', 'Std_Dev',
-            'Historical_EV', 'EV_Last_3',
-            'Risk_Adj_EV', 'Risk_Adj_EV_Last_3',
-        ]
-        for col in pct_cols:
-            if col in out_df.columns:
-                out_df[col] = out_df[col].apply(
-                    lambda x: f"{x * 100:.2f}%" if pd.notna(x) else ""
-                )
-        for col in ['Close', 'Entry_Price']:
-            if col in out_df.columns:
-                out_df[col] = out_df[col].apply(_fmt_price)
-        for col in ['Avg_Winner_Bars', 'Avg_Loser_Bars', 'Count']:
-            if col in out_df.columns:
-                out_df[col] = out_df[col].apply(_fmt_bars)
-        out_df = _sort_signals_df(out_df)
-    today_str = now.strftime('%Y_%m_%d')
-    time_str = now.strftime('%H%M')
-    out_file = LIVE_ROTATIONS_FOLDER / f'{today_str}_{time_str}_Live_Signals_for_top_{SIZE}.xlsx'
-    _n_live = len(out_df)
-    try:
-        out_df.to_excel(out_file, index=False, engine='openpyxl')
-        WriteThroughPath(out_file).sync()
-        print(f"Saved live signals ({_n_live} rows): {out_file}")
-    except PermissionError:
-        # Common case: file already open/locked (e.g., Excel). Fallback to a unique name.
-        time_str_fallback = now.strftime('%H%M%S')
-        out_file = LIVE_ROTATIONS_FOLDER / f'{today_str}_{time_str_fallback}_Live_Signals_for_top_{SIZE}.xlsx'
-        suffix = 1
-        while out_file.exists():
-            out_file = LIVE_ROTATIONS_FOLDER / f'{today_str}_{time_str_fallback}_{suffix}_Live_Signals_for_top_{SIZE}.xlsx'
-            suffix += 1
-        out_df.to_excel(out_file, index=False, engine='openpyxl')
-        WriteThroughPath(out_file).sync()
-        print(f"Primary xlsx path was locked; saved fallback ({_n_live} rows): {out_file}")
     return None
 
 
@@ -5895,113 +6039,6 @@ def append_live_today_to_etf_signals_parquet():
     print(f"[ETF live] Appended {len(new_rows)} live rows for {pd.Timestamp(today).date()} to {ETF_SIGNALS_CACHE_FILE.name}")
 
 
-def _get_basket_ohlc_for_reports(group_name, universe_by_qtr, cache_key_name=None):
-    cache_name = cache_key_name if cache_key_name else group_name
-    if '_slugify_label' in globals():
-        slug = _slugify_label(cache_name)
-    else:
-        slug = str(cache_name).replace('/', ' ').replace('&', 'and').replace('-', ' ').replace(' ', '_')
-    # Try consolidated basket parquet first
-    basket_pq = _find_basket_parquet(slug)
-    if basket_pq:
-        try:
-            cached = pd.read_parquet(basket_pq)
-            if isinstance(cached, pd.DataFrame) and not cached.empty:
-                return cached
-        except Exception:
-            pass
-    # Fallback to equity cache (search all basket cache folders)
-    for _eq_folder in [paths.thematic_basket_cache, paths.sector_basket_cache, paths.industry_basket_cache, DATA_FOLDER]:
-        # New naming: *_ohlc.parquet
-        _ohlc_matches = list(_eq_folder.glob(f'{slug}_*_of_{SIZE}_ohlc.parquet'))
-        if not _ohlc_matches:
-            _ohlc_matches = list(_eq_folder.glob(f'{slug}_of_{SIZE}_ohlc.parquet'))
-        # Legacy fallback: *_equity_ohlc.parquet
-        if not _ohlc_matches:
-            _legacy = _eq_folder / f'{slug}_equity_ohlc.parquet'
-            if _legacy.exists():
-                _ohlc_matches = [_legacy]
-        for cache_path in _ohlc_matches[:1]:
-            try:
-                cached = pd.read_parquet(cache_path)
-                if isinstance(cached, pd.DataFrame) and not cached.empty:
-                    return cached
-            except Exception:
-                pass
-    print(f"[{cache_name}] basket parquet missing. Run basket processing cell first.")
-    return pd.DataFrame()
-
-
-def _compute_annual_returns_for_basket(group_name, universe_by_qtr, cache_key_name=None, live_ctx=None):
-    ohlc_df = _get_basket_ohlc_for_reports(group_name, universe_by_qtr, cache_key_name)
-    if ohlc_df.empty:
-        return None
-    eq = ohlc_df[['Date', 'Close']].copy()
-    eq['Date'] = pd.to_datetime(eq['Date']).dt.normalize()
-    eq = eq.dropna(subset=['Close']).sort_values('Date')
-    if eq.empty:
-        return None
-    eq['Year'] = eq['Date'].dt.year
-    yearly = eq.groupby('Year')['Close'].agg(['first', 'last'])
-    out = np.where(yearly['first'] > 0, (yearly['last'] / yearly['first']) - 1.0, np.nan)
-    out_series = pd.Series(out, index=yearly.index, name=group_name)
-
-    if live_ctx is not None:
-        live_year = int(pd.Timestamp(live_ctx['today']).year)
-        if live_year in yearly.index:
-            first_close = yearly.at[live_year, 'first']
-            last_close = yearly.at[live_year, 'last']
-            if pd.notna(first_close) and pd.notna(last_close) and float(first_close) > 0 and float(last_close) > 0:
-                live_ret = _compute_live_basket_return(
-                    universe_by_qtr,
-                    live_ctx['live_price_map'],
-                    live_ctx['last_rows'],
-                    live_ctx['current_key'],
-                )
-                if pd.notna(live_ret):
-                    live_close = float(last_close) * (1.0 + float(live_ret))
-                    out_series.loc[live_year] = (live_close / float(first_close)) - 1.0
-    return out_series
-
-
-def _build_group_annual_return_grid(group_specs, live_ctx=None):
-    by_group = {}
-    for spec in group_specs:
-        if len(spec) == 3:
-            group_name, universe_by_qtr, cache_key_name = spec
-        else:
-            group_name, universe_by_qtr = spec
-            cache_key_name = group_name
-        annual_series = _compute_annual_returns_for_basket(
-            group_name,
-            universe_by_qtr,
-            cache_key_name,
-            live_ctx=live_ctx,
-        )
-        if annual_series is not None and not annual_series.empty:
-            by_group[group_name] = annual_series
-    if not by_group:
-        return pd.DataFrame()
-    grid = pd.concat(by_group, axis=1).sort_index()
-    grid.index.name = 'Year'
-    return grid
-
-
-def _compute_daily_returns_for_basket(group_name, universe_by_qtr, cache_key_name=None):
-    ohlc_df = _get_basket_ohlc_for_reports(group_name, universe_by_qtr, cache_key_name)
-    if ohlc_df.empty:
-        return None
-    eq = ohlc_df[['Date', 'Close']].copy()
-    eq['Date'] = pd.to_datetime(eq['Date']).dt.normalize()
-    eq = eq.dropna(subset=['Close']).sort_values('Date')
-    if eq.empty:
-        return None
-    eq['Daily_Return'] = eq['Close'].pct_change()
-    out = eq.set_index('Date')['Daily_Return'].dropna()
-    out.name = group_name
-    return out
-
-
 def _get_latest_norgate_rows_by_ticker(before_date=None):
     df = all_signals_df
     if before_date is not None:
@@ -6014,42 +6051,6 @@ def _get_latest_norgate_rows_by_ticker(before_date=None):
         .tail(1)
         .set_index('Ticker')
     )
-
-
-def _compute_live_basket_return(universe_by_qtr, live_price_map, last_rows, current_key):
-    """Compute one-day basket return from Norgate-close -> live-price move."""
-    current_universe = universe_by_qtr.get(current_key, set())
-    if not current_universe:
-        return np.nan
-
-    tickers = [t for t in current_universe if t in live_price_map and t in last_rows.index]
-    if not tickers:
-        return np.nan
-
-    weights = []
-    rets = []
-    for t in tickers:
-        prev_close = last_rows.at[t, 'Close'] if 'Close' in last_rows.columns else np.nan
-        live_price = live_price_map.get(t, np.nan)
-        if pd.isna(prev_close) or pd.isna(live_price) or float(prev_close) <= 0:
-            continue
-        ret = (float(live_price) / float(prev_close)) - 1.0
-        vol = last_rows.at[t, 'Volume'] if 'Volume' in last_rows.columns else np.nan
-        if pd.notna(vol) and float(vol) > 0:
-            w = float(prev_close) * float(vol)
-        else:
-            w = 1.0
-        rets.append(ret)
-        weights.append(w)
-
-    if not rets:
-        return np.nan
-
-    w_arr = np.asarray(weights, dtype=float)
-    r_arr = np.asarray(rets, dtype=float)
-    if np.nansum(w_arr) > 0:
-        return float(np.nansum(w_arr * r_arr) / np.nansum(w_arr))
-    return float(np.nanmean(r_arr))
 
 
 def _compute_live_basket_ohlc(universe_by_qtr, live_ohlc_map, last_rows, current_key, prev_basket_close):
@@ -6192,642 +6193,43 @@ def _get_live_update_context():
     return ctx
 
 
-def _build_group_daily_return_grid(group_specs, live_ctx=None):
+def export_live_basket_signals(live_ctx=None):
+    """Compute live intraday OHLC for every basket and write live_basket_signals parquet."""
     if live_ctx is None:
         live_ctx = _get_live_update_context()
-    if live_ctx is not None:
-        print("Live update enabled (Databento SPY date newer than Norgate); updating final daily return.")
+    if live_ctx is None:
+        return
 
-    by_group = {}
-    used_live_today = False
+    live_ohlc_map = live_ctx.get('live_ohlc_map', {})
+    if not live_ohlc_map:
+        return
+
     live_basket_rows = []
-    for spec in group_specs:
-        if len(spec) == 3:
-            group_name, universe_by_qtr, cache_key_name = spec
-        else:
-            group_name, universe_by_qtr = spec
-            cache_key_name = group_name
-        daily_series = _compute_daily_returns_for_basket(group_name, universe_by_qtr, cache_key_name)
-        if daily_series is not None and not daily_series.empty:
-            if live_ctx is not None:
-                live_ret = _compute_live_basket_return(
-                    universe_by_qtr,
-                    live_ctx['live_price_map'],
-                    live_ctx['last_rows'],
-                    live_ctx['current_key'],
-                )
-                if pd.notna(live_ret):
-                    daily_series.loc[live_ctx['today']] = float(live_ret)
-                    used_live_today = True
-                live_ohlc_map = live_ctx.get('live_ohlc_map', {})
-                if live_ohlc_map:
-                    _cache_slug = cache_key_name.replace(' ', '_').replace('&', 'and')
-                    _basket_pq = _find_basket_parquet(_cache_slug)
-                    _prev_basket_close = None
-                    if _basket_pq:
-                        try:
-                            _eq_df = pd.read_parquet(str(_basket_pq), columns=['Date', 'Close'])
-                            _eq_df['Date'] = pd.to_datetime(_eq_df['Date']).dt.normalize()
-                            _prev_basket_close = float(_eq_df.sort_values('Date').iloc[-1]['Close'])
-                        except Exception:
-                            pass
-                    bar = _compute_live_basket_ohlc(
-                        universe_by_qtr, live_ohlc_map,
-                        live_ctx['last_rows'], live_ctx['current_key'], _prev_basket_close
-                    )
-                    if bar:
-                        bar['Date'] = live_ctx['today'].strftime('%Y-%m-%d')
-                        bar['BasketName'] = group_name
-                        live_basket_rows.append(bar)
-            by_group[group_name] = daily_series
-    if live_basket_rows:
-        _basket_df = pd.DataFrame(live_basket_rows)
-        _basket_path = paths.data / f'live_basket_signals_{SIZE}.parquet'
-        _basket_df.to_parquet(_basket_path, index=False)
-        print(f"Saved live basket OHLC ({len(_basket_df)} baskets): {_basket_path}")
-    if not by_group:
-        return pd.DataFrame()
-    grid = pd.concat(by_group, axis=1).sort_index()
-    grid.index.name = 'Date'
-    grid.attrs['used_live_today'] = bool(used_live_today)
-    if live_ctx is not None:
-        grid.attrs['live_today_date'] = live_ctx['today']
-    return grid
-
-
-def _render_return_table_pages(pdf, title, basket_col_grid, columns_per_page=10, fixed_range=0.50):
-    if basket_col_grid.empty:
-        return
-
-    basket_col_grid = basket_col_grid.sort_index(axis=1)
-    col_labels = basket_col_grid.columns.tolist()
-    for start in range(0, len(col_labels), columns_per_page):
-        sub_cols = col_labels[start:start + columns_per_page]
-        sub = basket_col_grid[sub_cols].copy()
-        text_rows = []
-        color_rows = []
-        bar_specs = []
-
-        range_abs = abs(float(fixed_range))
-        if range_abs <= 0:
-            range_abs = 0.50
-        col_norm = {col: (-range_abs, range_abs) for col in sub_cols}
-        col_axis = {col: 0.5 for col in sub_cols}
-
-        for basket_name, row in sub.iterrows():
-            text_row = [basket_name]
-            color_row = [(1.0, 1.0, 1.0, 1.0)]
-            for col_idx, v in enumerate(row.values):
-                col = sub_cols[col_idx]
-                if pd.isna(v):
-                    text_row.append("")
-                    color_row.append((1.0, 1.0, 1.0, 1.0))
-                else:
-                    text_row.append(f"{float(v) * 100:.2f}%")
-                    bounds = col_norm.get(col)
-                    if bounds is None:
-                        color_row.append((1.0, 1.0, 1.0, 1.0))
-                    else:
-                        vmin, vmax = bounds
-                        v_clipped = min(max(float(v), vmin), vmax)
-                        t = (v_clipped - vmin) / (vmax - vmin)
-                        t = max(0.0, min(1.0, t))
-                        axis_t = max(0.0, min(1.0, float(col_axis.get(col, 0.0))))
-                        bar_specs.append((len(text_rows), col_idx, t, axis_t))
-                        color_row.append((1.0, 1.0, 1.0, 1.0))
-            text_rows.append(text_row)
-            color_rows.append(color_row)
-
-        fig = plt.figure(figsize=(11, 8.5))
-        ax = fig.add_axes([0.03, 0.06, 0.94, 0.88])
-        ax.axis('off')
-        first_col = sub_cols[0] if sub_cols else None
-        last_col = sub_cols[-1] if sub_cols else None
-        if first_col is not None and last_col is not None:
-            if isinstance(first_col, (pd.Timestamp, datetime)):
-                first_label = pd.Timestamp(first_col).strftime('%Y-%m-%d')
-                last_label = pd.Timestamp(last_col).strftime('%Y-%m-%d')
-            else:
-                first_label = str(first_col)
-                last_label = str(last_col)
-            page_suffix = f" ({first_label} to {last_label})"
-        else:
-            page_suffix = ""
-        ax.set_title(f"{title}{page_suffix}", fontsize=12, fontweight='bold', pad=8)
-
-        headers = ['Basket']
-        for col in sub_cols:
-            if isinstance(col, (pd.Timestamp, datetime)):
-                headers.append(pd.Timestamp(col).strftime('%Y-%m-%d'))
-            else:
-                headers.append(str(col))
-        left_col_w = 0.36
-        col_w = (1.0 - left_col_w) / max(1, len(sub_cols))
-        col_widths = [left_col_w] + [col_w] * len(sub_cols)
-        table = ax.table(
-            cellText=text_rows,
-            colLabels=headers,
-            cellColours=color_rows,
-            colLoc='center',
-            cellLoc='center',
-            colWidths=col_widths,
-            bbox=[0.0, 0.0, 1.0, 0.95],
-        )
-        table.auto_set_font_size(False)
-        n_rows = max(1, len(text_rows))
-        n_cols = max(1, len(headers))
-        font_size = max(3.2, min(8.0, 10.0 - 0.14 * n_cols - 0.06 * n_rows))
-        table.set_fontsize(font_size)
-        table.scale(1.0, max(0.33, min(1.00, 1.06 - 0.0048 * n_rows)))
-        for (r, c), cell in table.get_celld().items():
-            if r == 0:
-                cell.set_facecolor((0.93, 0.93, 0.93))
-                cell.set_text_props(weight='bold')
-            if c == 0 and r > 0:
-                cell.get_text().set_ha('left')
-                cell.PAD = 0.02
-            cell.set_edgecolor((0.75, 0.75, 0.75))
-            cell.set_linewidth(0.55)
-
-        fig.canvas.draw()
-        renderer = fig.canvas.get_renderer()
-        inv = ax.transAxes.inverted()
-
-        for row_idx, col_idx, t, axis_t in bar_specs:
-            cell = table.get_celld().get((row_idx + 1, col_idx + 1))
-            if cell is None:
-                continue
-            bbox = cell.get_window_extent(renderer=renderer)
-            (x0, y0) = inv.transform((bbox.x0, bbox.y0))
-            (x1, y1) = inv.transform((bbox.x1, bbox.y1))
-            w = x1 - x0
-            h = y1 - y0
-            if w <= 0 or h <= 0:
-                continue
-
-            left_pad = w * 0.03
-            right_pad = w * 0.03
-            bar_max_w = max(0.0, w - left_pad - right_pad)
-            bar_h = h * 0.62
-            bar_y = y0 + (h - bar_h) / 2.0
-            bar_x = x0 + left_pad
-            axis_x = bar_x + bar_max_w * axis_t
-            t = max(0.0, min(1.0, float(t)))
-            if t >= axis_t:
-                frac = 0.0 if axis_t >= 1.0 else (t - axis_t) / (1.0 - axis_t)
-                bar_w = bar_max_w * frac * (1.0 - axis_t)
-                if bar_w > 0:
-                    ax.add_patch(Rectangle((axis_x, bar_y), bar_w, bar_h, facecolor='#0066ff', edgecolor='none', alpha=0.42, zorder=1.5))
-            else:
-                frac = 0.0 if axis_t <= 0.0 else (axis_t - t) / axis_t
-                bar_w = bar_max_w * frac * axis_t
-                if bar_w > 0:
-                    ax.add_patch(Rectangle((axis_x - bar_w, bar_y), bar_w, bar_h, facecolor='#ff3296', edgecolor='none', alpha=0.42, zorder=1.5))
-
-        pdf.savefig(fig)
-        plt.close(fig)
-
-
-def _render_return_bar_charts(
-    pdf_or_list,
-    title,
-    basket_col_grid,
-    y_min=-0.50,
-    y_max=0.50,
-    n_cols=6,
-    figsize=(11, 8.5),
-    n_rows_fixed=None,
-):
-    """Render one column-bar chart per basket on a grid page.
-    If n_rows_fixed is provided, every page uses that exact grid size.
-
-    ``pdf_or_list``: pass a ``PdfPages`` object to write directly (legacy),
-    or pass a list to collect figures for use with ``build_pdf()``.
-    """
-    if basket_col_grid.empty:
-        return
-
-    basket_col_grid = basket_col_grid.sort_index(axis=1)
-    cols = basket_col_grid.columns.tolist()
-    baskets = basket_col_grid.index.tolist()
-
-    # Determine x-axis label format from column type
-    def _col_label(col):
-        if isinstance(col, (pd.Timestamp, datetime)):
-            return pd.Timestamp(col).strftime('%b\n%d')
+    for basket_name, (_, slug, _, universe_by_qtr) in BASKET_RESULTS.items():
+        basket_pq = _find_basket_parquet(slug)
+        if not basket_pq:
+            continue
         try:
-            return str(int(col))
-        except (TypeError, ValueError):
-            return str(col)
+            eq_df = pd.read_parquet(str(basket_pq), columns=['Date', 'Close'])
+            eq_df['Date'] = pd.to_datetime(eq_df['Date']).dt.normalize()
+            prev_basket_close = float(eq_df.sort_values('Date').iloc[-1]['Close'])
+        except Exception:
+            continue
 
-    x_labels = [_col_label(c) for c in cols]
+        bar = _compute_live_basket_ohlc(
+            universe_by_qtr, live_ohlc_map,
+            live_ctx['last_rows'], live_ctx['current_key'], prev_basket_close
+        )
+        if bar:
+            bar['Date'] = live_ctx['today'].strftime('%Y-%m-%d')
+            bar['BasketName'] = basket_name
+            live_basket_rows.append(bar)
 
-    # Strip group-type prefix from basket name to save subplot title space
-    def _short_name(name):
-        for prefix in ('Theme: ', 'Sector: ', 'Industry: '):
-            if name.startswith(prefix):
-                return name[len(prefix):]
-        return name
-
-    default_rows = 4
-    rows_per_page = int(n_rows_fixed) if n_rows_fixed is not None else default_rows
-    if rows_per_page < 1:
-        rows_per_page = default_rows
-    charts_per_page = n_cols * rows_per_page
-
-    for page_start in range(0, len(baskets), charts_per_page):
-        page_baskets = baskets[page_start:page_start + charts_per_page]
-        n_rows = rows_per_page if n_rows_fixed is not None else max(1, -(-len(page_baskets) // n_cols))
-
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
-        fig.patch.set_facecolor('white')
-        fig.suptitle(title, fontsize=11, fontweight='bold', y=0.99)
-
-        # Normalise axes to always be 2-D array
-        if n_rows == 1 and n_cols == 1:
-            axes = [[axes]]
-        elif n_rows == 1:
-            axes = [list(axes)]
-        elif n_cols == 1:
-            axes = [[ax] for ax in axes]
-        else:
-            axes = [list(row) for row in axes]
-
-        for idx, basket_name in enumerate(page_baskets):
-            r, c = divmod(idx, n_cols)
-            ax = axes[r][c]
-            row_series = basket_col_grid.loc[basket_name]
-            values = [float(row_series[col]) if pd.notna(row_series[col]) else 0.0 for col in cols]
-            bar_colors = ['#0066ff' if v >= 0 else '#ff3296' for v in values]
-
-            ax.bar(range(len(cols)), values, color=bar_colors, width=0.7, zorder=2)
-            ax.axhline(0, color='#333333', linewidth=0.6, zorder=3)
-            ax.set_ylim(y_min, y_max)
-            ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{x * 100:.0f}%"))
-            ax.yaxis.set_tick_params(labelsize=5)
-            ax.set_xticks(range(len(cols)))
-            single_chart = (n_cols == 1 and rows_per_page == 1)
-            x_fs = (6.5 if isinstance(cols[0], (pd.Timestamp, datetime)) else 7.5) if single_chart else \
-                   (4.5 if isinstance(cols[0], (pd.Timestamp, datetime)) else 5.5)
-            n_x = len(cols)
-            sparse_threshold = 30 if single_chart else 8
-            if n_x > sparse_threshold:
-                mid = n_x // 2
-                sparse = [x_labels[i] if i in (0, mid, n_x - 1) else '' for i in range(n_x)]
-            else:
-                sparse = x_labels
-            ax.set_xticklabels(sparse, fontsize=x_fs, rotation=0, linespacing=0.9)
-            ax.tick_params(axis='x', length=2, pad=1)
-            ax.tick_params(axis='y', length=2, pad=1)
-            _title_fs = 11 if (n_cols == 1 and rows_per_page == 1) else 6.5
-            ax.set_title(_short_name(basket_name), fontsize=_title_fs, pad=2, fontweight='bold')
-            ax.grid(axis='y', linewidth=0.3, alpha=0.4, zorder=0)
-            ax.set_facecolor('white')
-            for spine in ax.spines.values():
-                spine.set_linewidth(0.4)
-                spine.set_edgecolor('#aaaaaa')
-
-        # Hide any unused subplot slots
-        total_slots = n_rows * n_cols
-        for idx in range(len(page_baskets), total_slots):
-            r, c = divmod(idx, n_cols)
-            axes[r][c].set_visible(False)
-
-        plt.tight_layout(rect=[0, 0, 1, 0.97])
-        if isinstance(pdf_or_list, list):
-            pdf_or_list.append(fig)
-        else:
-            pdf_or_list.savefig(fig, dpi=150)
-            plt.close(fig)
-
-
-def _get_all_basket_specs_for_reports():
-    specs = [
-        ('Theme: High Beta',           BETA_UNIVERSE,           'High Beta'),
-        ('Theme: Low Beta',            LOW_BETA_UNIVERSE,        'Low Beta'),
-        ('Theme: Momentum Leaders',    MOMENTUM_UNIVERSE,        'Momentum Leaders'),
-        ('Theme: Momentum Losers',     MOMENTUM_LOSERS_UNIVERSE, 'Momentum Losers'),
-        ('Theme: High Dividend Yield', HIGH_YIELD_UNIVERSE,      'High Dividend Yield'),
-        ('Theme: Dividend Growth',     DIV_GROWTH_UNIVERSE,      'Dividend Growth'),
-        ('Theme: Dividend with Growth', DIV_WITH_GROWTH_UNIVERSE, 'Dividend with Growth'),
-        ('Theme: Risk Adj Momentum',   RISK_ADJ_MOM_UNIVERSE,    'Risk Adj Momentum'),
-        ('Theme: Size',                SIZE_UNIVERSE,            'Size'),
-        ('Theme: Volume Growth',       VOLUME_GROWTH_UNIVERSE,   'Volume Growth'),
-    ]
-    specs += [(f"Sector: {name}", SECTOR_UNIVERSES[name], name) for name in sorted(SECTOR_UNIVERSES.keys())]
-    specs += [(f"Industry: {name}", INDUSTRY_UNIVERSES[name], name) for name in sorted(INDUSTRY_UNIVERSES.keys())]
-    return specs
-
-
-def _build_basket_annual_grid(live_ctx=None):
-    """Return basket_year_grid DataFrame (baskets Ã— years) for _render_return_bar_charts."""
-    latest_norgate = _get_latest_norgate_date()
-    if latest_norgate is None and 'all_signals_df' in globals() and not all_signals_df.empty and 'Date' in all_signals_df.columns:
-        latest_norgate = pd.to_datetime(all_signals_df['Date']).max().normalize()
-    if latest_norgate is None:
-        return pd.DataFrame()
-    if live_ctx is None:
-        live_ctx = _get_live_update_context()
-    all_specs = _get_all_basket_specs_for_reports()
-    annual_grid = _build_group_annual_return_grid(all_specs, live_ctx=live_ctx)
-    if annual_grid.empty:
-        return pd.DataFrame()
-    return annual_grid.T.sort_index(axis=1)
-
-
-def _build_basket_daily_grid_last20(live_ctx=None):
-    """Return basket_date_grid (baskets Ã— last-20 dates) for _render_return_bar_charts."""
-    all_specs = _get_all_basket_specs_for_reports()
-    if live_ctx is None:
-        live_ctx = _get_live_update_context()
-    daily_grid = _build_group_daily_return_grid(all_specs, live_ctx=live_ctx)
-    if daily_grid.empty:
-        return pd.DataFrame()
-    daily_grid = daily_grid.sort_index()
-    if live_ctx is not None:
-        live_today = live_ctx['today']
-        for spec in all_specs:
-            group_name = spec[0]
-            universe_by_qtr = spec[1]
-            live_ret = _compute_live_basket_return(
-                universe_by_qtr, live_ctx['live_price_map'],
-                live_ctx['last_rows'], live_ctx['current_key'])
-            if pd.notna(live_ret):
-                daily_grid.loc[live_today, group_name] = float(live_ret)
-        if live_today in daily_grid.index:
-            hist_19 = daily_grid[daily_grid.index < live_today].tail(19)
-            live_row = daily_grid.loc[[live_today]]
-            daily_grid = pd.concat([hist_19, live_row]).sort_index()
-        else:
-            daily_grid = daily_grid.tail(20)
-    else:
-        daily_grid = daily_grid.tail(20)
-    return daily_grid.T.sort_index(axis=1)
-
-
-def export_annual_returns(live_ctx=None):
-    summary_folder = BASE_OUTPUT_FOLDER / 'Baskets' / 'Basket_Reports'
-    annual_reports_folder = summary_folder / 'annual_reports'
-    annual_reports_folder.mkdir(parents=True, exist_ok=True)
-
-    latest_norgate = _get_latest_norgate_date()
-    if latest_norgate is None and 'all_signals_df' in globals() and not all_signals_df.empty and 'Date' in all_signals_df.columns:
-        latest_norgate = pd.to_datetime(all_signals_df['Date']).max().normalize()
-    if latest_norgate is None:
-        print("Unable to determine latest Norgate date for annual returns export.")
-        return
-
-    report_asof_date = pd.Timestamp(live_ctx['today']).normalize() if live_ctx is not None else pd.Timestamp(latest_norgate).normalize()
-    date_str = report_asof_date.strftime('%Y_%m_%d')
-    out_path = annual_reports_folder / f'{date_str}_annual_returns.pdf'
-    _need_write, _need_mirror = _needs_write_and_mirror(out_path)
-    if not _need_write and not _need_mirror:
-        print(f"Annual returns report already exists for {date_str}, skipping export: {out_path}")
-        return
-    if not _need_write and _need_mirror:
-        WriteThroughPath(out_path).sync()
-        return
-
-    basket_year_grid = _build_basket_annual_grid(live_ctx=live_ctx)
-    if basket_year_grid.empty:
-        print("No annual return data generated.")
-        return
-
-    _yr_min = min(-0.10, round(float(basket_year_grid.min().min()) * 1.05 - 0.01, 2))
-    _yr_max = max( 0.10, round(float(basket_year_grid.max().max()) * 1.05 + 0.01, 2))
-    _annual_figs = []
-    _render_return_bar_charts(
-        _annual_figs,
-        'Annual Returns - All Baskets',
-        basket_year_grid,
-        y_min=_yr_min, y_max=_yr_max,
-        figsize=(11.0, 8.5), n_cols=1, n_rows_fixed=1,
-    )
-    build_pdf(_annual_figs, out_path)
-    print(f"Saved annual returns PDF: {out_path}")
-
-
-def export_last_20_days_returns(live_ctx=None):
-    summary_folder = BASE_OUTPUT_FOLDER / 'Baskets' / 'Basket_Reports'
-    summary_folder.mkdir(parents=True, exist_ok=True)
-    _now = datetime.now()
-    _stamp = _now.strftime('%Y_%m_%d_%H%M')
-    out_path = summary_folder / f'{_stamp}_last_20_days_returns.pdf'
-
-    basket_date_grid = _build_basket_daily_grid_last20(live_ctx=live_ctx)
-    if basket_date_grid.empty:
-        print("No daily return data generated.")
-        return
-
-    _d20_min = min(-0.03, round(float(basket_date_grid.min().min()) * 1.05 - 0.005, 3))
-    _d20_max = max( 0.03, round(float(basket_date_grid.max().max()) * 1.05 + 0.005, 3))
-    _d20_figs = []
-    _render_return_bar_charts(
-        _d20_figs,
-        'Daily Returns - Last 20 Trading Days (All Baskets)',
-        basket_date_grid,
-        y_min=_d20_min, y_max=_d20_max,
-        figsize=(11.0, 8.5), n_cols=1, n_rows_fixed=1,
-    )
-    build_pdf(_d20_figs, out_path)
-    print(f"Saved 20-day returns PDF: {out_path}")
-
-
-def _render_year_basket_bar_charts(fig_list, year_basket_grid, y_min, y_max, n_cols=4, n_rows_fixed=3, x_fontsize=4):
-    """One subplot per year; x-axis = baskets; bars = that year's annual return per basket."""
-    if year_basket_grid.empty:
-        return
-
-    years = sorted(year_basket_grid.index.tolist())
-    baskets = year_basket_grid.columns.tolist()
-
-    def _short_name(name):
-        for prefix in ('Theme: ', 'Sector: ', 'Industry: '):
-            if name.startswith(prefix):
-                return name[len(prefix):]
-        return name
-
-    charts_per_page = n_cols * n_rows_fixed
-
-    for page_start in range(0, len(years), charts_per_page):
-        page_years = years[page_start:page_start + charts_per_page]
-
-        fig, axes = plt.subplots(n_rows_fixed, n_cols, figsize=(11, 8.5))
-        fig.patch.set_facecolor('white')
-        fig.suptitle('Annual Returns by Year — All Baskets', fontsize=11, fontweight='bold', y=0.99)
-
-        if n_rows_fixed == 1 and n_cols == 1:
-            axes = [[axes]]
-        elif n_rows_fixed == 1:
-            axes = [list(axes)]
-        elif n_cols == 1:
-            axes = [[ax] for ax in axes]
-        else:
-            axes = [list(row) for row in axes]
-
-        for idx, year in enumerate(page_years):
-            r, c = divmod(idx, n_cols)
-            ax = axes[r][c]
-            row = year_basket_grid.loc[year]
-            # Sort baskets by return ascending (lowest left, highest right)
-            sorted_baskets = sorted(baskets, key=lambda b: float(row[b]) if pd.notna(row[b]) else float('-inf'))
-            values = [float(row[b]) if pd.notna(row[b]) else 0.0 for b in sorted_baskets]
-            sorted_labels = [_short_name(b) for b in sorted_baskets]
-            bar_colors = ['#0066ff' if v >= 0 else '#ff3296' for v in values]
-
-            ax.bar(range(len(sorted_baskets)), values, color=bar_colors, width=0.7, zorder=2)
-            ax.axhline(0, color='#333333', linewidth=0.6, zorder=3)
-            ax.set_ylim(y_min, y_max)
-            ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{x * 100:.0f}%"))
-            ax.yaxis.set_tick_params(labelsize=5)
-            ax.set_xticks(range(len(sorted_baskets)))
-            ax.set_xticklabels(sorted_labels, fontsize=x_fontsize, rotation=45, ha='right')
-            ax.tick_params(axis='x', length=2, pad=1)
-            ax.tick_params(axis='y', length=2, pad=1)
-            ax.set_title(str(int(year)), fontsize=7, pad=2, fontweight='bold')
-            ax.grid(axis='y', linewidth=0.3, alpha=0.4, zorder=0)
-            ax.set_facecolor('white')
-            for spine in ax.spines.values():
-                spine.set_linewidth(0.4)
-                spine.set_edgecolor('#aaaaaa')
-
-        total_slots = n_rows_fixed * n_cols
-        for idx in range(len(page_years), total_slots):
-            r, c = divmod(idx, n_cols)
-            axes[r][c].set_visible(False)
-
-        plt.tight_layout(rect=[0, 0, 1, 0.97])
-        fig_list.append(fig)
-
-
-def _render_day_basket_bar_charts(fig_list, date_basket_grid, y_min, y_max, n_cols=2, n_rows_fixed=2, x_fontsize=5):
-    """One subplot per trading day; x-axis = baskets sorted by return; bars = that day's return per basket."""
-    if date_basket_grid.empty:
-        return
-
-    dates = sorted(date_basket_grid.index.tolist())
-    baskets = date_basket_grid.columns.tolist()
-
-    def _short_name(name):
-        for prefix in ('Theme: ', 'Sector: ', 'Industry: '):
-            if name.startswith(prefix):
-                return name[len(prefix):]
-        return name
-
-    charts_per_page = n_cols * n_rows_fixed
-
-    for page_start in range(0, len(dates), charts_per_page):
-        page_dates = dates[page_start:page_start + charts_per_page]
-
-        fig, axes = plt.subplots(n_rows_fixed, n_cols, figsize=(11, 8.5))
-        fig.patch.set_facecolor('white')
-        fig.suptitle('Daily Returns by Day — All Baskets', fontsize=11, fontweight='bold', y=0.99)
-
-        if n_rows_fixed == 1 and n_cols == 1:
-            axes = [[axes]]
-        elif n_rows_fixed == 1:
-            axes = [list(axes)]
-        elif n_cols == 1:
-            axes = [[ax] for ax in axes]
-        else:
-            axes = [list(row) for row in axes]
-
-        for idx, date in enumerate(page_dates):
-            r, c = divmod(idx, n_cols)
-            ax = axes[r][c]
-            row = date_basket_grid.loc[date]
-            sorted_baskets = sorted(baskets, key=lambda b: float(row[b]) if pd.notna(row[b]) else float('-inf'))
-            values = [float(row[b]) if pd.notna(row[b]) else 0.0 for b in sorted_baskets]
-            sorted_labels = [_short_name(b) for b in sorted_baskets]
-            bar_colors = ['#0066ff' if v >= 0 else '#ff3296' for v in values]
-
-            ax.bar(range(len(sorted_baskets)), values, color=bar_colors, width=0.7, zorder=2)
-            ax.axhline(0, color='#333333', linewidth=0.6, zorder=3)
-            ax.set_ylim(y_min, y_max)
-            ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{x * 100:.1f}%"))
-            ax.yaxis.set_tick_params(labelsize=5)
-            ax.set_xticks(range(len(sorted_baskets)))
-            ax.set_xticklabels(sorted_labels, fontsize=x_fontsize, rotation=45, ha='right')
-            ax.tick_params(axis='x', length=2, pad=1)
-            ax.tick_params(axis='y', length=2, pad=1)
-            date_label = pd.Timestamp(date).strftime('%a  %b %d, %Y')
-            ax.set_title(date_label, fontsize=7, pad=2, fontweight='bold')
-            ax.grid(axis='y', linewidth=0.3, alpha=0.4, zorder=0)
-            ax.set_facecolor('white')
-            for spine in ax.spines.values():
-                spine.set_linewidth(0.4)
-                spine.set_edgecolor('#aaaaaa')
-
-        total_slots = n_rows_fixed * n_cols
-        for idx in range(len(page_dates), total_slots):
-            r, c = divmod(idx, n_cols)
-            axes[r][c].set_visible(False)
-
-        plt.tight_layout(rect=[0, 0, 1, 0.97])
-        fig_list.append(fig)
-
-
-def export_annual_returns_by_year(live_ctx=None):
-    """Per-year bar charts: each subplot is one year, bars = annual return per basket."""
-    summary_folder = BASE_OUTPUT_FOLDER / 'Baskets' / 'Basket_Reports' / 'annual_reports'
-    summary_folder.mkdir(parents=True, exist_ok=True)
-
-    latest_norgate = _get_latest_norgate_date()
-    if latest_norgate is None and 'all_signals_df' in globals() and not all_signals_df.empty and 'Date' in all_signals_df.columns:
-        latest_norgate = pd.to_datetime(all_signals_df['Date']).max().normalize()
-    if latest_norgate is None:
-        print("Unable to determine latest Norgate date for annual-by-year export.")
-        return
-
-    report_asof_date = pd.Timestamp(live_ctx['today']).normalize() if live_ctx is not None else pd.Timestamp(latest_norgate).normalize()
-    date_str = report_asof_date.strftime('%Y_%m_%d')
-    out_path = summary_folder / f'{date_str}_annual_returns_by_year.pdf'
-
-    _need_write, _need_mirror = _needs_write_and_mirror(out_path)
-    if not _need_write and not _need_mirror:
-        print(f"Annual-by-year report already exists for {date_str}, skipping: {out_path}")
-        return
-    if not _need_write and _need_mirror:
-        WriteThroughPath(out_path).sync()
-        return
-
-    # basket_year_grid: index=baskets, columns=years — transpose to get years × baskets
-    basket_year_grid = _build_basket_annual_grid(live_ctx=live_ctx)
-    if basket_year_grid.empty:
-        print("No annual return data generated.")
-        return
-
-    year_basket_grid = basket_year_grid.T  # index=years, columns=baskets
-
-    _yr_min = min(-0.10, round(float(year_basket_grid.min().min()) * 1.05 - 0.01, 2))
-    _yr_max = max( 0.10, round(float(year_basket_grid.max().max()) * 1.05 + 0.01, 2))
-    _figs = []
-    _render_year_basket_bar_charts(_figs, year_basket_grid, _yr_min, _yr_max, n_cols=1, n_rows_fixed=1, x_fontsize=7)
-    build_pdf(_figs, out_path)
-    print(f"Saved annual-by-year returns PDF: {out_path}")
-
-
-def export_last_20_days_returns_by_day(live_ctx=None):
-    """Per-day bar charts: each subplot is one trading day, bars = that day's return per basket (sorted)."""
-    summary_folder = BASE_OUTPUT_FOLDER / 'Baskets' / 'Basket_Reports'
-    summary_folder.mkdir(parents=True, exist_ok=True)
-    _stamp = datetime.now().strftime('%Y_%m_%d_%H%M')
-    out_path = summary_folder / f'{_stamp}_last_20_days_returns_by_day.pdf'
-
-    basket_date_grid = _build_basket_daily_grid_last20(live_ctx=live_ctx)
-    if basket_date_grid.empty:
-        print("No daily return data generated.")
-        return
-
-    # basket_date_grid: index=baskets, columns=dates — transpose to get dates × baskets
-    date_basket_grid = basket_date_grid.T  # index=dates, columns=baskets
-
-    _d_min = min(-0.03, round(float(date_basket_grid.min().min()) * 1.05 - 0.005, 3))
-    _d_max = max( 0.03, round(float(date_basket_grid.max().max()) * 1.05 + 0.005, 3))
-    _figs = []
-    _render_day_basket_bar_charts(_figs, date_basket_grid, _d_min, _d_max, n_cols=2, n_rows_fixed=2, x_fontsize=5)
-    build_pdf(_figs, out_path)
-    print(f"Saved 20-day by-day returns PDF: {out_path}")
+    if live_basket_rows:
+        basket_df = pd.DataFrame(live_basket_rows)
+        basket_path = paths.data / f'live_basket_signals_{SIZE}.parquet'
+        basket_df.to_parquet(basket_path, index=False)
+        print(f"Saved live basket OHLC ({len(basket_df)} baskets): {basket_path}")
 
 
 def update_basket_parquets_with_live_ohlcv(live_ctx):
@@ -6926,94 +6328,5 @@ _live_ctx_for_reports = _get_live_update_context()
 export_today_signals(live_ctx=_live_ctx_for_reports)
 export_today_etf_signals(live_ctx=_live_ctx_for_reports)
 append_live_today_to_etf_signals_parquet()
-# PDF Generation disabled per user request
-# export_annual_returns(live_ctx=_live_ctx_for_reports)
-# export_annual_returns_by_year(live_ctx=_live_ctx_for_reports)
-# export_last_20_days_returns(live_ctx=_live_ctx_for_reports)
-# export_last_20_days_returns_by_day(live_ctx=_live_ctx_for_reports)
-# update_basket_parquets_with_live_ohlcv: disabled — live data is written to
-# live_signals_500.parquet and live_basket_signals_500.parquet instead.
-
-# %% [markdown]
-## Holdings Exports (TradingView lists) [Group B — Report Only]
-# %%
-
-if 'reset_cell_timer' in globals():
-    reset_cell_timer("Holdings Exports (TradingView lists)")
-
-
-def export_group_holdings():
-    current_qtr = _get_current_quarter_key()
-    if not current_qtr:
-        print("No quarter data available.")
-        return
-
-    theme_file    = HOLDINGS_FOLDER / f"Theme of Top {SIZE} {current_qtr}.txt"
-    sector_file   = HOLDINGS_FOLDER / f"Sector of Top {SIZE} {current_qtr}.txt"
-    industry_file = HOLDINGS_FOLDER / f"Industry of Top {SIZE} {current_qtr}.txt"
-
-    # Thematic groups
-    theme_lines = []
-    thematic_groups = [
-        ("High Beta",           BETA_UNIVERSE),
-        ("Low Beta",            LOW_BETA_UNIVERSE),
-        ("Momentum Leaders",    MOMENTUM_UNIVERSE),
-        ("Momentum Losers",     MOMENTUM_LOSERS_UNIVERSE),
-        ("High Dividend Yield", HIGH_YIELD_UNIVERSE),
-        ("Dividend Growth",     DIV_GROWTH_UNIVERSE),
-        ("Dividend with Growth", DIV_WITH_GROWTH_UNIVERSE),
-        ("Risk Adj Momentum",   RISK_ADJ_MOM_UNIVERSE),
-        ("Size",                SIZE_UNIVERSE),
-        ("Volume Growth",       VOLUME_GROWTH_UNIVERSE),
-    ]
-    for name, universe in thematic_groups:
-        tickers = sorted(universe.get(current_qtr, set()))
-        theme_lines.append(f"###{name} of top {SIZE}")
-        for t in tickers:
-            theme_lines.append(t)
-        theme_lines.append("")
-
-    # Sector groups
-    sector_lines = []
-    for sector in SECTOR_LIST:
-        universe = SECTOR_UNIVERSES.get(sector, {})
-        tickers = sorted(universe.get(current_qtr, set()))
-        sector_lines.append(f"###{sector} of top {SIZE}")
-        for t in tickers:
-            sector_lines.append(t)
-        sector_lines.append("")
-
-    # Industry groups
-    industry_lines = []
-    for industry in sorted(INDUSTRY_UNIVERSES.keys()):
-        universe = INDUSTRY_UNIVERSES.get(industry, {})
-        tickers = sorted(universe.get(current_qtr, set()))
-        industry_lines.append(f"###{industry} of top {SIZE}")
-        for t in tickers:
-            industry_lines.append(t)
-        industry_lines.append("")
-
-    for path, lines in [
-        (theme_file, theme_lines),
-        (sector_file, sector_lines),
-        (industry_file, industry_lines),
-    ]:
-        WriteThroughPath(path).write_text('\n'.join(lines))
-        print(f"Saved: {path}")
-
-
-def export_current_quarter_universe():
-    current_qtr = _get_current_quarter_key()
-    if not current_qtr:
-        print("No quarter data available.")
-        return
-
-    tickers = sorted(QUARTER_UNIVERSE.get(current_qtr, set()))
-    if not tickers:
-        print(f"No universe tickers found for {current_qtr}.")
-        return
-
-    universe_file = HOLDINGS_FOLDER / f"Universe Top {SIZE} {current_qtr}.txt"
-    WriteThroughPath(universe_file).write_text('\n'.join(tickers))
-    print(f"Saved {len(tickers)} tickers to: {universe_file}")
+export_live_basket_signals(live_ctx=_live_ctx_for_reports)
 
