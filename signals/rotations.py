@@ -6519,6 +6519,48 @@ def _get_all_basket_specs_for_reports():
     return specs
 
 
+def _write_live_basket_ohlc(live_ctx):
+    """Write live_basket_signals_{SIZE}.parquet with today's basket OHLC bars."""
+    if live_ctx is None:
+        return
+    live_ohlc_map = live_ctx.get('live_ohlc_map', {})
+    if not live_ohlc_map:
+        return
+
+    all_specs = _get_all_basket_specs_for_reports()
+    live_basket_rows = []
+    for spec in all_specs:
+        if len(spec) == 3:
+            group_name, universe_by_qtr, cache_key_name = spec
+        else:
+            group_name, universe_by_qtr = spec
+            cache_key_name = group_name
+        _cache_slug = cache_key_name.replace(' ', '_').replace('&', 'and')
+        _basket_pq = _find_basket_parquet(_cache_slug)
+        _prev_basket_close = None
+        if _basket_pq:
+            try:
+                _eq_df = pd.read_parquet(str(_basket_pq), columns=['Date', 'Close'])
+                _eq_df['Date'] = pd.to_datetime(_eq_df['Date']).dt.normalize()
+                _prev_basket_close = float(_eq_df.sort_values('Date').iloc[-1]['Close'])
+            except Exception:
+                pass
+        bar = _compute_live_basket_ohlc(
+            universe_by_qtr, live_ohlc_map,
+            live_ctx['last_rows'], live_ctx['current_key'], _prev_basket_close
+        )
+        if bar:
+            bar['Date'] = live_ctx['today'].strftime('%Y-%m-%d')
+            bar['BasketName'] = group_name
+            live_basket_rows.append(bar)
+
+    if live_basket_rows:
+        _basket_df = pd.DataFrame(live_basket_rows)
+        _basket_path = paths.data / f'live_basket_signals_{SIZE}.parquet'
+        _basket_df.to_parquet(_basket_path, index=False)
+        print(f"Saved live basket OHLC ({len(_basket_df)} baskets): {_basket_path}")
+
+
 def _build_basket_annual_grid(live_ctx=None):
     """Return basket_year_grid DataFrame (baskets Ã— years) for _render_return_bar_charts."""
     latest_norgate = _get_latest_norgate_date()
@@ -6926,13 +6968,15 @@ _live_ctx_for_reports = _get_live_update_context()
 export_today_signals(live_ctx=_live_ctx_for_reports)
 export_today_etf_signals(live_ctx=_live_ctx_for_reports)
 append_live_today_to_etf_signals_parquet()
+_write_live_basket_ohlc(_live_ctx_for_reports)
 # PDF Generation disabled per user request
 # export_annual_returns(live_ctx=_live_ctx_for_reports)
 # export_annual_returns_by_year(live_ctx=_live_ctx_for_reports)
 # export_last_20_days_returns(live_ctx=_live_ctx_for_reports)
 # export_last_20_days_returns_by_day(live_ctx=_live_ctx_for_reports)
 # update_basket_parquets_with_live_ohlcv: disabled — live data is written to
-# live_signals_500.parquet and live_basket_signals_500.parquet instead.
+# live_signals_500.parquet and live_basket_signals_500.parquet instead
+# (the latter via _write_live_basket_ohlc above).
 
 # %% [markdown]
 ## Holdings Exports (TradingView lists) [Group B — Report Only]
