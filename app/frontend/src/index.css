@@ -471,31 +471,53 @@ html, body, #root {
 }
 
 /* Search / Autocomplete */
+.header-left-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
 .search-container {
   position: relative;
 }
 
 .search-input-wrapper {
   cursor: text;
+  border: 2px solid var(--border-color);
+  background-color: var(--bg-main);
+  padding: 0 12px;
+  height: 32px;
+  width: 240px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
 }
 
 .main-title {
   margin: 0;
-  font-size: 18px;
+  font-size: 12px;
   font-weight: bold;
   color: var(--text-bold);
+  text-transform: uppercase;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .search-input {
   font-family: inherit;
-  font-size: 18px;
+  font-size: 12px;
   font-weight: bold;
   color: var(--text-bold);
-  background: var(--bg-main);
-  border: 2px solid var(--color-blue);
-  padding: 2px 8px;
+  text-transform: uppercase;
+  background: transparent;
+  border: none;
+  padding: 0;
   outline: none;
-  width: 300px;
+  width: 100%;
+  text-align: center;
 }
 
 .search-dropdown {
@@ -602,8 +624,7 @@ html, body, #root {
 }
 
 .main-header {
-  display: grid;
-  grid-template-columns: auto auto 1fr auto;
+  display: flex;
   align-items: center;
   gap: 16px;
   padding: 8px 16px;
@@ -617,21 +638,27 @@ html, body, #root {
   display: flex;
   align-items: center;
   gap: 8px;
-  justify-self: end;
+  flex: 0 0 auto;
+  margin-left: auto;
 }
 
 .header-actions.header-actions-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
+  grid-template-columns: repeat(3, 120px);
   gap: 4px;
+}
+
+.header-actions-grid .control-btn {
+  width: 120px;
 }
 
 .header-right-stack {
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: auto auto auto;
   row-gap: 4px;
   column-gap: 8px;
   align-items: center;
+  flex: 0 0 auto;
 }
 
 .header-quarter-row,
@@ -652,10 +679,17 @@ html, body, #root {
   display: flex;
   align-items: center;
   gap: 4px;
+  min-width: 0;
+}
+
+.range-inputs .date-input,
+.range-inputs .quarter-select {
+  min-width: 0;
 }
 
 .range-action-btn {
   width: 64px;
+  min-width: 0;
   text-align: center;
   box-sizing: border-box;
 }
@@ -693,13 +727,17 @@ html, body, #root {
   cursor: pointer;
   text-transform: uppercase;
   border-radius: 0 !important;
+  min-width: 0;
   width: 120px;
   height: 32px;
-  padding: 0;
+  padding: 0 4px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   box-sizing: border-box;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .control-btn.primary {
@@ -731,10 +769,47 @@ html, body, #root {
 
 /* Overlay Toggles */
 .header-toggles {
+  position: relative;
+}
+
+.indicator-menu-btn {
+  font-size: 12px;
+  font-weight: bold;
+  font-family: inherit;
+  border: 2px solid var(--border-color);
+  background-color: var(--bg-main);
+  color: var(--text-main);
+  cursor: pointer;
+  text-transform: uppercase;
+  border-radius: 0 !important;
+  padding: 0 12px;
+  width: 240px;
+  height: 32px;
+  white-space: nowrap;
+  box-sizing: border-box;
+}
+
+.indicator-menu-backdrop {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 999;
+}
+
+.indicator-menu-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 1000;
+  background: var(--bg-sidebar);
+  border: 2px solid var(--border-color);
+  padding: 8px 4px;
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 2px 10px;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 4px;
 }
 
 .chart-overlay-toggles {
@@ -753,12 +828,16 @@ html, body, #root {
 .overlay-checkbox {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   font-size: 11px;
   font-weight: bold;
   color: var(--text-main);
   cursor: pointer;
-  padding: 4px 8px;
+  padding: 4px 4px;
+  white-space: nowrap;
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .overlay-checkbox input {

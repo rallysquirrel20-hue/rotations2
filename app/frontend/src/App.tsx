@@ -137,6 +137,7 @@ function App() {
   const [showCorrelation, setShowCorrelation] = useState(true)
   const [showRV, setShowRV] = useState(true)
   const [showCandleDetail, setShowCandleDetail] = useState(true)
+  const [indicatorMenuOpen, setIndicatorMenuOpen] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(460)
   const sidebarDragging = useRef(false)
   const [hiddenCols, setHiddenCols] = useState<Set<string>>(new Set())
@@ -336,12 +337,11 @@ function App() {
   const searchResults = useMemo(() => {
     const results: SearchResult[] = []
     const q = searchQuery.toLowerCase().trim()
-    if (!q) return results
     const add = (items: string[], category: ViewType) => {
       if (searchFilter !== 'all' && searchFilter !== category) return
       for (const item of items) {
         const display = item.replace(/_/g, ' ')
-        if (item.toLowerCase().includes(q) || display.toLowerCase().includes(q)) {
+        if (!q || item.toLowerCase().includes(q) || display.toLowerCase().includes(q)) {
           results.push({ name: item, category, displayName: display })
         }
       }
@@ -1214,73 +1214,85 @@ function App() {
         <div className="main-content">
           {loading && <div className="loading-overlay"><span className="loading-text">Loading...</span></div>}
           <div className="main-header">
-            <div className="search-container">
-              <div className="search-input-wrapper" onClick={() => { setSearchOpen(true); setTimeout(() => searchInputRef.current?.focus(), 0); }}>
-                {searchOpen ? (
-                  <input
-                    ref={searchInputRef}
-                    className="search-input"
-                    value={searchQuery}
-                    onChange={e => { setSearchQuery(e.target.value); setSearchHighlight(0); }}
-                    onKeyDown={handleSearchKeyDown}
-                    onBlur={() => setTimeout(() => setSearchOpen(false), 200)}
-                    placeholder={activeTicker || selectedItem.replace(/_/g, ' ')}
-                    autoFocus
-                  />
-                ) : (
-                  <h2 className="main-title">{activeTicker || selectedItem.replace(/_/g, ' ')}</h2>
+            <div className="header-left-stack">
+              <div className="search-container">
+                <div className="search-input-wrapper" onClick={() => { setSearchOpen(true); setTimeout(() => searchInputRef.current?.focus(), 0); }}>
+                  {searchOpen ? (
+                    <input
+                      ref={searchInputRef}
+                      className="search-input"
+                      value={searchQuery}
+                      onChange={e => { setSearchQuery(e.target.value); setSearchHighlight(0); }}
+                      onKeyDown={handleSearchKeyDown}
+                      onBlur={() => setTimeout(() => setSearchOpen(false), 200)}
+                      placeholder={activeTicker || selectedItem.replace(/_/g, ' ')}
+                      autoFocus
+                    />
+                  ) : (
+                    <h2 className="main-title">{activeTicker || selectedItem.replace(/_/g, ' ')}</h2>
+                  )}
+                </div>
+                {searchOpen && (
+                  <div className="search-dropdown">
+                    <div className="search-filters">
+                      {(['all', 'ETFs', 'Themes', 'Sectors', 'Industries', 'Tickers'] as const).map(f => (
+                        <button
+                          key={f}
+                          className={`search-filter-btn ${searchFilter === f ? 'active' : ''}`}
+                          onMouseDown={e => { e.preventDefault(); setSearchFilter(f); }}
+                        >
+                          {f === 'all' ? 'All' : f}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="search-results">
+                      {searchResults.map((r, i) => (
+                        <div
+                          key={`${r.category}-${r.name}`}
+                          className={`search-result-item ${i === searchHighlight ? 'highlighted' : ''}`}
+                          onMouseDown={() => handleSearchSelect(r)}
+                          onMouseEnter={() => setSearchHighlight(i)}
+                        >
+                          <span className="search-result-name">{r.displayName}</span>
+                          <span className="search-result-tag">{r.category}</span>
+                        </div>
+                      ))}
+                      {searchResults.length === 0 && (
+                        <div className="search-result-empty">No matches</div>
+                      )}
+                    </div>
+                  </div>
                 )}
               </div>
-              {searchOpen && searchQuery.trim() && (
-                <div className="search-dropdown">
-                  <div className="search-filters">
-                    {(['all', 'ETFs', 'Themes', 'Sectors', 'Industries', 'Tickers'] as const).map(f => (
-                      <button
-                        key={f}
-                        className={`search-filter-btn ${searchFilter === f ? 'active' : ''}`}
-                        onMouseDown={e => { e.preventDefault(); setSearchFilter(f); }}
-                      >
-                        {f === 'all' ? 'All' : f}
-                      </button>
-                    ))}
-                  </div>
-                  <div className="search-results">
-                    {searchResults.map((r, i) => (
-                      <div
-                        key={`${r.category}-${r.name}`}
-                        className={`search-result-item ${i === searchHighlight ? 'highlighted' : ''}`}
-                        onMouseDown={() => handleSearchSelect(r)}
-                        onMouseEnter={() => setSearchHighlight(i)}
-                      >
-                        <span className="search-result-name">{r.displayName}</span>
-                        <span className="search-result-tag">{r.category}</span>
-                      </div>
-                    ))}
-                    {searchResults.length === 0 && (
-                      <div className="search-result-empty">No matches</div>
-                    )}
-                  </div>
-                </div>
-              )}
-            </div>
-            <div className="header-toggles">
-              <label className="overlay-checkbox"><input type="checkbox" checked={showPivots} onChange={e => setShowPivots(e.target.checked)} /> Pivots</label>
-              <label className="overlay-checkbox"><input type="checkbox" checked={showTargets} onChange={e => setShowTargets(e.target.checked)} /> Targets</label>
-              {!isBasketView && (
-                <>
-                  <label className="overlay-checkbox"><input type="checkbox" checked={showRV} onChange={e => setShowRV(e.target.checked)} /> RV%</label>
-                  <label className="overlay-checkbox"><input type="checkbox" checked={showVolume} onChange={e => setShowVolume(e.target.checked)} /> Volume</label>
-                </>
-              )}
-              {isBasketView && (
-                <>
-                  <label className="overlay-checkbox"><input type="checkbox" checked={showBreadth} onChange={e => setShowBreadth(e.target.checked)} /> Breadth%</label>
-                  <label className="overlay-checkbox"><input type="checkbox" checked={showBreakout} onChange={e => setShowBreakout(e.target.checked)} /> Breakout%</label>
-                  <label className="overlay-checkbox"><input type="checkbox" checked={showCorrelation} onChange={e => setShowCorrelation(e.target.checked)} /> Correlation%</label>
-                  <label className="overlay-checkbox"><input type="checkbox" checked={showRV} onChange={e => setShowRV(e.target.checked)} /> RV%</label>
-                  <label className="overlay-checkbox"><input type="checkbox" checked={showCandleDetail} onChange={e => setShowCandleDetail(e.target.checked)} /> Constituents</label>
-                </>
-              )}
+              <div className="header-toggles">
+                <button className="indicator-menu-btn" onClick={() => setIndicatorMenuOpen(v => !v)}>
+                  Indicators &#9662;
+                </button>
+                {indicatorMenuOpen && (
+                  <>
+                    <div className="indicator-menu-backdrop" onClick={() => setIndicatorMenuOpen(false)} />
+                    <div className="indicator-menu-dropdown">
+                      <label className="overlay-checkbox"><input type="checkbox" checked={showPivots} onChange={e => setShowPivots(e.target.checked)} /> Pivots</label>
+                      <label className="overlay-checkbox"><input type="checkbox" checked={showTargets} onChange={e => setShowTargets(e.target.checked)} /> Targets</label>
+                      {!isBasketView && (
+                        <>
+                          <label className="overlay-checkbox"><input type="checkbox" checked={showRV} onChange={e => setShowRV(e.target.checked)} /> RV%</label>
+                          <label className="overlay-checkbox"><input type="checkbox" checked={showVolume} onChange={e => setShowVolume(e.target.checked)} /> Volume</label>
+                        </>
+                      )}
+                      {isBasketView && (
+                        <>
+                          <label className="overlay-checkbox"><input type="checkbox" checked={showBreadth} onChange={e => setShowBreadth(e.target.checked)} /> Breadth%</label>
+                          <label className="overlay-checkbox"><input type="checkbox" checked={showBreakout} onChange={e => setShowBreakout(e.target.checked)} /> Breakout%</label>
+                          <label className="overlay-checkbox"><input type="checkbox" checked={showCorrelation} onChange={e => setShowCorrelation(e.target.checked)} /> Correlation%</label>
+                          <label className="overlay-checkbox"><input type="checkbox" checked={showRV} onChange={e => setShowRV(e.target.checked)} /> RV%</label>
+                          <label className="overlay-checkbox"><input type="checkbox" checked={showCandleDetail} onChange={e => setShowCandleDetail(e.target.checked)} /> Constituents</label>
+                        </>
+                      )}
+                    </div>
+                  </>
+                )}
+              </div>
             </div>
             <div className="header-actions header-actions-grid">
               <button

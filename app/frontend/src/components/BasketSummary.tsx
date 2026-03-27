@@ -1060,6 +1060,7 @@ function applyPreset(preset: typeof BASKET_RETURN_PRESETS[number], maxDate: stri
 export function BasketReturnsChart({ apiBase, exportTrigger, mode, initialBasket }: { apiBase: string; exportTrigger?: number; mode: BasketReturnMode; initialBasket?: string }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
+  const barGeoRef = useRef<{ padLeft: number; padRight: number; barW: number; gap: number; n: number } | null>(null)
   const [dims, setDims] = useState({ w: 800, h: 400 })
   const [group, setGroup] = useState<BasketReturnGroup>('all')
   const [dateBounds, setDateBounds] = useState<{ min: string; max: string }>({ min: '', max: '' })
@@ -1294,6 +1295,7 @@ export function BasketReturnsChart({ apiBase, exportTrigger, mode, initialBasket
       const plotH = _h - pad.top - pad.bottom
       const barW = Math.max(2, Math.min(40, (plotW / n) * 0.75))
       const gap = (plotW - barW * n) / (n + 1)
+      barGeoRef.current = { padLeft: pad.left, padRight: pad.right, barW, gap, n }
 
       let yMin = 0, yMax = 0
       items.forEach(b => { yMin = Math.min(yMin, b.ret); yMax = Math.max(yMax, b.ret) })
@@ -1431,6 +1433,7 @@ export function BasketReturnsChart({ apiBase, exportTrigger, mode, initialBasket
       // Bars fill the full plot width with 25% gap ratio
       const barW = Math.max(1, (plotW / n) * 0.75)
       const gap = (plotW - barW * n) / (n + 1)
+      barGeoRef.current = { padLeft: pad.left, padRight: pad.right, barW, gap, n }
 
       let yMin = 0, yMax = 0
       dailyReturns.forEach(r => { yMin = Math.min(yMin, r); yMax = Math.max(yMax, r) })
@@ -1504,38 +1507,18 @@ export function BasketReturnsChart({ apiBase, exportTrigger, mode, initialBasket
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!canvasRef.current) return
     if (mode === 'cross' && chartView === 'line') return // hover via legend only
+    const geo = barGeoRef.current
+    if (!geo || !geo.n) return
     const rect = canvasRef.current.getBoundingClientRect()
     const scaleX = dims.w / rect.width
     const mx = (e.clientX - rect.left) * scaleX
 
-    if (mode === 'cross') {
-      const items = baskets.map(b => ({ name: b.name, ret: b.return }))
-      const n = items.length
-      if (!n) return
-      const pad = { left: 60, right: 50 }
-      const plotW = dims.w - pad.left - pad.right
-      const barW = Math.max(4, Math.min(40, (plotW / n) * 0.75))
-      const gap = (plotW - barW * n) / (n + 1)
-      let found = -1
-      for (let i = 0; i < n; i++) {
-        const x = pad.left + gap + i * (barW + gap)
-        if (mx >= x && mx <= x + barW) { found = i; break }
-      }
-      setHoveredIdx(found >= 0 ? found : null)
-    } else {
-      const n = dailyReturns.length
-      if (!n) return
-      const pad = { left: 60, right: 50 }
-      const plotW = dims.w - pad.left - pad.right
-      const barW = Math.max(1, (plotW / n) * 0.75)
-      const gap = (plotW - barW * n) / (n + 1)
-      let found = -1
-      for (let i = 0; i < n; i++) {
-        const x = pad.left + gap + i * (barW + gap)
-        if (mx >= x && mx <= x + barW) { found = i; break }
-      }
-      setHoveredIdx(found >= 0 ? found : null)
+    let found = -1
+    for (let i = 0; i < geo.n; i++) {
+      const x = geo.padLeft + geo.gap + i * (geo.barW + geo.gap)
+      if (mx >= x && mx <= x + geo.barW) { found = i; break }
     }
+    setHoveredIdx(found >= 0 ? found : null)
   }
 
   const hovered = hoveredIdx !== null ? (mode === 'cross' && chartView === 'bar' && baskets[hoveredIdx]

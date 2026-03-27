@@ -482,7 +482,16 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
 
     resize();
     window.addEventListener('resize', resize);
-    return () => window.removeEventListener('resize', resize);
+    const wrapper = wrapperRef.current;
+    let ro: ResizeObserver | null = null;
+    if (wrapper) {
+      ro = new ResizeObserver(() => resize());
+      ro.observe(wrapper);
+    }
+    return () => {
+      window.removeEventListener('resize', resize);
+      ro?.disconnect();
+    };
   }, [paneHeights, showVolume, showBreadth, showBreakout, showCorrelation, showRV, props.layoutHeight]);
 
   // Handle rangeUpdateTrigger (Reset 1Y button and date range picker)
