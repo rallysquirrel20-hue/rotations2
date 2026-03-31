@@ -1633,7 +1633,15 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
         # Determine which column to read based on metric
         metric_col_map = {"returns": "Close", "volatility": "RV_EMA", "correlation": "Correlation_Pct"}
         data_col = metric_col_map.get(metric, "Close")
-        read_cols = ['Date', data_col] if data_col != 'Close' else ['Date', 'Close']
+        if data_col == 'RV_EMA':
+            read_cols = ['Date', 'RV_EMA', 'Close']  # need Close to compute live RV
+        elif data_col != 'Close':
+            read_cols = ['Date', data_col]
+        else:
+            read_cols = ['Date', 'Close']
+
+        # Pre-compute live metrics from constituents for non-Close metrics
+        live_breadth_cum = _compute_live_breadth_batch(list(all_slugs)) if live_closes and data_col == 'Correlation_Pct' else {}
 
         # Collect series per basket
         basket_series = {}
@@ -1649,11 +1657,25 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
                 df = pd.read_parquet(pf, columns=read_cols)
                 df['Date'] = pd.to_datetime(df['Date'])
                 df = df.sort_values('Date').dropna(subset=[data_col])
-                if data_col == 'Close' and slug in live_closes:
+                if slug in live_closes:
                     live_date, live_close = live_closes[slug]
                     if live_date not in df['Date'].values:
-                        live_row = pd.DataFrame({'Date': [live_date], 'Close': [live_close]})
-                        df = pd.concat([df, live_row], ignore_index=True).sort_values('Date')
+                        if data_col == 'Close':
+                            live_row = pd.DataFrame({'Date': [live_date], 'Close': [live_close]})
+                            df = pd.concat([df, live_row], ignore_index=True).sort_values('Date')
+                        elif data_col == 'RV_EMA' and len(df) >= 1:
+                            prev_close = df['Close'].iloc[-1]
+                            prev_rv = df['RV_EMA'].iloc[-1]
+                            if pd.notna(prev_close) and prev_close != 0 and pd.notna(prev_rv):
+                                live_rv = 2.0/11.0 * abs(live_close / prev_close - 1) + (1 - 2.0/11.0) * prev_rv
+                                live_row = pd.DataFrame({'Date': [live_date], 'RV_EMA': [live_rv], 'Close': [live_close]})
+                                df = pd.concat([df, live_row], ignore_index=True).sort_values('Date')
+                        elif data_col == 'Correlation_Pct':
+                            lb = live_breadth_cum.get(slug, {})
+                            live_corr = lb.get('Correlation_Pct')
+                            if live_corr is not None:
+                                live_row = pd.DataFrame({'Date': [live_date], 'Correlation_Pct': [live_corr]})
+                                df = pd.concat([df, live_row], ignore_index=True).sort_values('Date')
                 if end:
                     df = df[df['Date'] <= pd.Timestamp(end)]
                 if start:
@@ -1666,9 +1688,16 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
                         df = in_range
                 if len(df) < 2: continue
                 base_val = float(df.iloc[0][data_col])
-                if base_val == 0: continue
+                if data_col == 'Close' and base_val == 0: continue
                 df = df.iloc[1:]  # drop anchor row
-                vals = [(float(v) / base_val) - 1 for v in df[data_col]]
+                if data_col == 'RV_EMA':
+                    _rv_ann = np.sqrt(252) * 100
+                    vals = [(float(v) - base_val) * _rv_ann for v in df[data_col]]
+                elif data_col == 'Correlation_Pct':
+                    vals = [float(v) - base_val for v in df[data_col]]
+                else:
+                    if base_val == 0: continue
+                    vals = [(float(v) / base_val) - 1 for v in df[data_col]]
                 dates = [d.strftime('%Y-%m-%d') for d in df['Date']]
                 basket_series[slug] = {"name": slug, "group": cat, "dates": dates, "values": vals}
             except Exception:
@@ -1698,7 +1727,15 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
 
     metric_col_map_p = {"returns": "Close", "volatility": "RV_EMA", "correlation": "Correlation_Pct"}
     data_col_p = metric_col_map_p.get(metric, "Close")
-    read_cols_p = ['Date', data_col_p] if data_col_p != 'Close' else ['Date', 'Close']
+    if data_col_p == 'RV_EMA':
+        read_cols_p = ['Date', 'RV_EMA', 'Close']  # need Close to compute live RV
+    elif data_col_p != 'Close':
+        read_cols_p = ['Date', data_col_p]
+    else:
+        read_cols_p = ['Date', 'Close']
+
+    # Pre-compute live metrics from constituents for non-Close metrics
+    live_breadth_p = _compute_live_breadth_batch(list(all_slugs)) if live_closes and data_col_p == 'Correlation_Pct' else {}
 
     baskets = []
     for slug in sorted(all_slugs):
@@ -1717,11 +1754,25 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
             df = pd.read_parquet(pf, columns=read_cols_p)
             df['Date'] = pd.to_datetime(df['Date'])
             df = df.sort_values('Date').dropna(subset=[data_col_p])
-            if data_col_p == 'Close' and slug in live_closes:
+            if slug in live_closes:
                 live_date, live_close = live_closes[slug]
                 if live_date not in df['Date'].values:
-                    live_row = pd.DataFrame({'Date': [live_date], 'Close': [live_close]})
-                    df = pd.concat([df, live_row], ignore_index=True).sort_values('Date')
+                    if data_col_p == 'Close':
+                        live_row = pd.DataFrame({'Date': [live_date], 'Close': [live_close]})
+                        df = pd.concat([df, live_row], ignore_index=True).sort_values('Date')
+                    elif data_col_p == 'RV_EMA' and len(df) >= 1:
+                        prev_close = df['Close'].iloc[-1]
+                        prev_rv = df['RV_EMA'].iloc[-1]
+                        if pd.notna(prev_close) and prev_close != 0 and pd.notna(prev_rv):
+                            live_rv = 2.0/11.0 * abs(live_close / prev_close - 1) + (1 - 2.0/11.0) * prev_rv
+                            live_row = pd.DataFrame({'Date': [live_date], 'RV_EMA': [live_rv], 'Close': [live_close]})
+                            df = pd.concat([df, live_row], ignore_index=True).sort_values('Date')
+                    elif data_col_p == 'Correlation_Pct':
+                        lb = live_breadth_p.get(slug, {})
+                        live_corr = lb.get('Correlation_Pct')
+                        if live_corr is not None:
+                            live_row = pd.DataFrame({'Date': [live_date], 'Correlation_Pct': [live_corr]})
+                            df = pd.concat([df, live_row], ignore_index=True).sort_values('Date')
             if end:
                 df = df[df['Date'] <= pd.Timestamp(end)]
             # Grab anchor row before start for % change calculation
@@ -1737,9 +1788,14 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
                 continue
             first_val = float(df.iloc[0][data_col_p])
             last_val = float(df.iloc[-1][data_col_p])
-            if first_val == 0:
-                continue
-            ret = (last_val / first_val) - 1
+            if data_col_p == 'RV_EMA':
+                ret = (last_val - first_val) * np.sqrt(252) * 100
+            elif data_col_p == 'Correlation_Pct':
+                ret = last_val - first_val
+            else:
+                if first_val == 0:
+                    continue
+                ret = (last_val / first_val) - 1
             baskets.append({"name": slug, "group": cat, "return": round(ret, 6)})
         except Exception:
             continue

@@ -329,7 +329,7 @@ function CorrelationHeatmap({ data, basketName, apiBase, quarterDateRange }: { d
   )
 }
 
-function ReturnsChart({ data, quarterDateRange }: { data: CumulativeReturnsData; quarterDateRange?: { from: string; to: string } | null }) {
+function ReturnsChart({ data, quarterDateRange, exportTrigger, basketName }: { data: CumulativeReturnsData; quarterDateRange?: { from: string; to: string } | null; exportTrigger?: number; basketName?: string }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const [hoveredTicker, setHoveredTicker] = useState<string | null>(null)
@@ -548,6 +548,58 @@ function ReturnsChart({ data, quarterDateRange }: { data: CumulativeReturnsData;
     })
   }, [windowedData, dims, hoveredTicker, sortedSeries, logScale])
 
+  // Export when exportTrigger fires
+  const prevExportTrigger = useRef(exportTrigger || 0)
+  useEffect(() => {
+    if (!exportTrigger || exportTrigger === prevExportTrigger.current) {
+      prevExportTrigger.current = exportTrigger || 0; return
+    }
+    prevExportTrigger.current = exportTrigger
+    const canvas = canvasRef.current
+    if (!canvas) return
+
+    const bDisplay = (basketName || 'unknown').replace(/_/g, ' ')
+    const titleLeft = `${bDisplay} Cumulative Returns`
+    const dateRange = startDate && endDate ? `${startDate} to ${endDate}` : ''
+    const filename = `${basketName || 'basket'}_returns_${startDate}_${endDate}.png`
+
+    const dpr = window.devicePixelRatio || 1
+    const chartW = canvas.width / dpr
+    const rightW = 120
+    const chartH = canvas.height / dpr
+    const totalW = chartW + rightW
+    const composite = document.createElement('canvas')
+    composite.width = totalW * dpr; composite.height = canvas.height
+    const cCtx = composite.getContext('2d')
+    if (!cCtx) return
+    cCtx.scale(dpr, dpr)
+    cCtx.fillStyle = '#fdf6e3'; cCtx.fillRect(0, 0, totalW, chartH)
+    cCtx.drawImage(canvas, 0, 0, canvas.width, canvas.height, 0, 0, chartW, chartH)
+    // Right legend
+    const lineH = 14
+    cCtx.textBaseline = 'top'; cCtx.font = '10px monospace'
+    for (let i = 0; i < sortedSeries.length && i * lineH + 8 < chartH; i++) {
+      const s = sortedSeries[i]
+      cCtx.fillStyle = rankColor(i, sortedSeries.length)
+      cCtx.textAlign = 'left'; cCtx.fillText(s.ticker, chartW + 4, 8 + i * lineH)
+      cCtx.textAlign = 'right'; cCtx.fillText((s.lastVal * 100).toFixed(1) + '%', totalW - 4, 8 + i * lineH)
+    }
+    // Title labels
+    cCtx.fillStyle = '#586e75'; cCtx.textBaseline = 'top'
+    cCtx.font = '11px monospace'; cCtx.textAlign = 'left'
+    cCtx.fillText(titleLeft, 12, 8)
+    cCtx.font = 'bold 11px monospace'; cCtx.textAlign = 'right'
+    cCtx.fillText(dateRange, chartW - 60, 8)
+
+    composite.toBlob(blob => {
+      if (!blob) return
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url; a.download = filename; a.click()
+      URL.revokeObjectURL(url)
+    }, 'image/png')
+  }, [exportTrigger])
+
   return (
     <div className="returns-container">
       <div className="returns-legend-left contrib-sidebar">
@@ -610,7 +662,7 @@ interface ContributionData {
   date_range: { min: string; max: string }
 }
 
-function ContributionChart({ basketName, apiBase, quarterDateRange }: { basketName: string; apiBase: string; quarterDateRange?: { from: string; to: string } | null }) {
+function ContributionChart({ basketName, apiBase, quarterDateRange, exportTrigger }: { basketName: string; apiBase: string; quarterDateRange?: { from: string; to: string } | null; exportTrigger?: number }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const [dims, setDims] = useState({ w: 800, h: 400 })
@@ -932,6 +984,45 @@ function ContributionChart({ basketName, apiBase, quarterDateRange }: { basketNa
     currentWeight: contribData.current_weights?.[hoveredIdx] ?? null,
   } : null
 
+  // Export when exportTrigger fires
+  const prevExportTrigger = useRef(exportTrigger || 0)
+  useEffect(() => {
+    if (!exportTrigger || exportTrigger === prevExportTrigger.current) {
+      prevExportTrigger.current = exportTrigger || 0; return
+    }
+    prevExportTrigger.current = exportTrigger
+    const canvas = canvasRef.current
+    if (!canvas) return
+
+    const bDisplay = (basketName || 'unknown').replace(/_/g, ' ')
+    const titleLeft = `${bDisplay} Contribution`
+    const dateRange = startDate && endDate ? `${startDate} to ${endDate}` : ''
+    const filename = `${basketName || 'basket'}_contribution_${startDate}_${endDate}.png`
+
+    const dpr = window.devicePixelRatio || 1
+    const composite = document.createElement('canvas')
+    composite.width = canvas.width; composite.height = canvas.height
+    const cCtx = composite.getContext('2d')
+    if (!cCtx) return
+    cCtx.drawImage(canvas, 0, 0)
+    cCtx.scale(dpr, dpr)
+    const cW = canvas.width / dpr
+    // Title labels
+    cCtx.fillStyle = '#586e75'; cCtx.textBaseline = 'top'
+    cCtx.font = '11px monospace'; cCtx.textAlign = 'left'
+    cCtx.fillText(titleLeft, 12, 8)
+    cCtx.font = 'bold 11px monospace'; cCtx.textAlign = 'right'
+    cCtx.fillText(dateRange, cW - 50, 8)
+
+    composite.toBlob(blob => {
+      if (!blob) return
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url; a.download = filename; a.click()
+      URL.revokeObjectURL(url)
+    }, 'image/png')
+  }, [exportTrigger])
+
   return (
     <div className="returns-container">
       <div className="returns-legend-left contrib-sidebar">
@@ -1248,10 +1339,10 @@ export function BasketReturnsChart({ apiBase, exportTrigger, mode, initialBasket
     }, 'image/png')
   }, [exportTrigger])
 
-  // Value formatting: all metrics are now indexed % change (decimal, ×100 for display)
-  const isRawPct = false
-  const fmtVal = (v: number, decimals = 2) => (v * 100).toFixed(decimals) + '%'
-  const fmtLegend = (v: number) => (v * 100).toFixed(1) + '%'
+  // Value formatting: returns are % change (decimal ×100), vol/corr are absolute point change
+  const isPointMetric = metric === 'volatility' || metric === 'correlation'
+  const fmtVal = (v: number, decimals = 2) => isPointMetric ? v.toFixed(decimals) + ' pts' : (v * 100).toFixed(decimals) + '%'
+  const fmtLegend = (v: number) => isPointMetric ? v.toFixed(2) : (v * 100).toFixed(1) + '%'
   const metricLabel = metric === 'volatility' ? 'Vol Chg' : metric === 'correlation' ? 'Corr Chg' : 'Chg'
 
   // Canvas rendering
@@ -1483,7 +1574,7 @@ export function BasketReturnsChart({ apiBase, exportTrigger, mode, initialBasket
         }
       }
     }
-  }, [baskets, dailyReturns, dailyDates, dims, hoveredIdx, hoveredName, mode, chartView, cumDates, cumSeries, isRawPct])
+  }, [baskets, dailyReturns, dailyDates, dims, hoveredIdx, hoveredName, mode, chartView, cumDates, cumSeries, isPointMetric])
 
   // Sorted cumulative series for legend (memoized)
   const sortedCumSeries = useMemo(() => {
@@ -1937,8 +2028,8 @@ export function BasketSummary({ data, loading, basketName, apiBase, quarterDateR
         {activeTab === 'btfd' && <SignalsTable signals={btfdSignals} />}
         {activeTab === 'btfd_closed' && <SignalsTable signals={btfdClosed} showExitDate />}
         {activeTab === 'correlation' && <CorrelationHeatmap data={data.correlation} basketName={basketName} apiBase={apiBase} quarterDateRange={quarterDateRange} />}
-        {activeTab === 'returns' && <ReturnsChart data={data.cumulative_returns} quarterDateRange={quarterDateRange} />}
-        {activeTab === 'contribution' && <ContributionChart basketName={basketName} apiBase={apiBase} quarterDateRange={quarterDateRange} />}
+        {activeTab === 'returns' && <ReturnsChart data={data.cumulative_returns} quarterDateRange={quarterDateRange} exportTrigger={exportTrigger} basketName={basketName} />}
+        {activeTab === 'contribution' && <ContributionChart basketName={basketName} apiBase={apiBase} quarterDateRange={quarterDateRange} exportTrigger={exportTrigger} />}
       </div>
     </div>
   )

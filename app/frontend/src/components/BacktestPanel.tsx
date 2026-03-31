@@ -1085,16 +1085,8 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
     }
   }, [apiBase, legs, startDate, endDate, maxLeverage, allocValid, allTargetsSet, isSingleLeg, exitsValid])
 
-  // ── Export current tab when exportTrigger changes ──
-  const prevExportTrigger = useRef(exportTrigger || 0)
-  useEffect(() => {
-    if (!exportTrigger || exportTrigger === prevExportTrigger.current) {
-      prevExportTrigger.current = exportTrigger || 0
-      return
-    }
-    prevExportTrigger.current = exportTrigger
-
-    // Build common labels
+  // Common export labels (used by export effect and render)
+  const titleLeft = useMemo(() => {
     const legDescs = legs.map(l => {
       const target = l.target.replace(/_/g, ' ')
       const tickerFlag = l.targetType === 'basket_tickers' ? ' (Tickers)' : ''
@@ -1106,9 +1098,19 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
       const alloc = legs.length > 1 ? ` Alloc:${l.allocationPct}%` : ''
       return `${target}${tickerFlag} Entry:${entry} Exit:${exit} Pos:${l.positionSize}%${alloc}`
     })
-    const levLabel = `Lev:${maxLeverage}%`
+    return legDescs.join('  |  ') + `  Lev:${maxLeverage}%`
+  }, [legs, maxLeverage])
+
+  // ── Export current tab when exportTrigger changes ──
+  const prevExportTrigger = useRef(exportTrigger || 0)
+  useEffect(() => {
+    if (!exportTrigger || exportTrigger === prevExportTrigger.current) {
+      prevExportTrigger.current = exportTrigger || 0
+      return
+    }
+    prevExportTrigger.current = exportTrigger
+
     const dateRange = result?.date_range ? `${result.date_range.min} – ${result.date_range.max}` : `${startDate} – ${endDate}`
-    const titleLeft = legDescs.join('  |  ') + `  ${levLabel}`
     const filenameBase = legs.map(l => l.target).join('+')
 
     // CSV export helper
