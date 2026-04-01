@@ -96,10 +96,10 @@ def _needs_write_and_mirror(local_path):
 
 EQUITY_CACHE_SCHEMA_VERSION = 1
 EQUITY_SIGNAL_LOGIC_VERSION = '2026-03-13-btfd-stfr-prev-trend'
-EQUITY_UNIVERSE_LOGIC_VERSION = '2026-02-10-codex-1'
+EQUITY_UNIVERSE_LOGIC_VERSION = '2026-04-01-target-quarter-keying'
 FORCE_REBUILD_EQUITY_CACHE = False
 BASKET_SIGNALS_CACHE_SCHEMA_VERSION = 1
-FORCE_REBUILD_BASKET_SIGNALS = False
+FORCE_REBUILD_BASKET_SIGNALS = True
 CHART_SCHEMA_VERSION = 2  # Bump to force rebuild of basket chart PNGs (added 21d corr panel)
 BENCHMARK_BASKETS = 0      # If > 0, only process this many baskets then stop
 BENCHMARK_TIMING = True    # If True, print per-step timing breakdown for each basket
@@ -356,7 +356,10 @@ def build_quarter_universe():
     df = pd.DataFrame(all_data, columns=['Date', 'Ticker', 'Vol'])
     universe = {}
     for date, grp in df.groupby('Date'):
-        universe[f"{date.year} Q{date.quarter}"] = set(grp.nlargest(SIZE, 'Vol')['Ticker'])
+        # Key is the NEXT quarter — Q1 volume determines Q2 universe
+        next_q = date.quarter % 4 + 1
+        next_y = date.year + (1 if date.quarter == 4 else 0)
+        universe[f"{next_y} Q{next_q}"] = set(grp.nlargest(SIZE, 'Vol')['Ticker'])
 
     return universe
 
@@ -393,15 +396,6 @@ def load_or_build_universe():
     latest_key = max(universe.keys(), key=lambda k: (int(k.split()[0]), int(k.split()[1].replace('Q', ''))))
     print(f"Saved: {CACHE_FILE} ({len(universe.get(latest_key, set()))} tickers, {len(universe)} quarters)")
     return universe
-
-
-def get_universe(date):
-    year = date.year
-    quarter = (date.month - 1) // 3 + 1
-    # Use previous quarter's ranking to avoid look-ahead bias
-    if quarter == 1:
-        return QUARTER_UNIVERSE.get(f"{year - 1} Q4", set())
-    return QUARTER_UNIVERSE.get(f"{year} Q{quarter - 1}", set())
 
 
 QUARTER_UNIVERSE = load_or_build_universe()
@@ -443,7 +437,9 @@ def build_quarter_etf_universe():
     df = pd.DataFrame(all_data, columns=['Date', 'Ticker', 'Vol'])
     universe = {}
     for date, grp in df.groupby('Date'):
-        universe[f"{date.year} Q{date.quarter}"] = set(grp.nlargest(ETF_SIZE, 'Vol')['Ticker'])
+        next_q = date.quarter % 4 + 1
+        next_y = date.year + (1 if date.quarter == 4 else 0)
+        universe[f"{next_y} Q{next_q}"] = set(grp.nlargest(ETF_SIZE, 'Vol')['Ticker'])
 
     return universe
 
@@ -619,13 +615,11 @@ def build_quarter_beta_universes():
             prev_key = f"{year - 1} Q4"
         else:
             prev_key = f"{year} Q{quarter - 1}"
-        if prev_key not in QUARTER_UNIVERSE:
-            continue
-        prev_universe = QUARTER_UNIVERSE[prev_key]
         ranking_date = _quarter_end_from_key(prev_key)
+        current_universe = QUARTER_UNIVERSE[key]
 
         beta_vals = []
-        for t in prev_universe:
+        for t in current_universe:
             if t in beta_cache and ranking_date in beta_cache[t].index:
                 b = beta_cache[t].at[ranking_date]
                 if pd.notna(b):
@@ -752,11 +746,9 @@ def build_quarter_momentum_universes():
             prev_key = f"{year - 1} Q4"
         else:
             prev_key = f"{year} Q{quarter - 1}"
-        if prev_key not in QUARTER_UNIVERSE:
-            continue
         ranking_date = _quarter_end_from_key(prev_key)
-        prev_universe = QUARTER_UNIVERSE[prev_key]
-        grp = df[(df['Date'] == ranking_date) & (df['Ticker'].isin(prev_universe))]
+        current_universe = QUARTER_UNIVERSE[key]
+        grp = df[(df['Date'] == ranking_date) & (df['Ticker'].isin(current_universe))]
         if grp.empty:
             continue
         sorted_desc = grp.sort_values('Momentum', ascending=False)
@@ -877,11 +869,9 @@ def build_quarter_risk_adj_momentum():
             prev_key = f"{year - 1} Q4"
         else:
             prev_key = f"{year} Q{quarter - 1}"
-        if prev_key not in QUARTER_UNIVERSE:
-            continue
         ranking_date = _quarter_end_from_key(prev_key)
-        prev_universe = QUARTER_UNIVERSE[prev_key]
-        grp = df[(df['Date'] == ranking_date) & (df['Ticker'].isin(prev_universe))]
+        current_universe = QUARTER_UNIVERSE[key]
+        grp = df[(df['Date'] == ranking_date) & (df['Ticker'].isin(current_universe))]
         if grp.empty:
             continue
         sorted_desc = grp.sort_values('RiskAdjMom', ascending=False)
@@ -1076,27 +1066,25 @@ def build_quarter_dividend_universes():
             prev_key = f"{year - 1} Q4"
         else:
             prev_key = f"{year} Q{quarter - 1}"
-        if prev_key not in QUARTER_UNIVERSE:
-            continue
         ranking_date = _quarter_end_from_key(prev_key)
-        prev_universe = QUARTER_UNIVERSE[prev_key]
+        current_universe = QUARTER_UNIVERSE[key]
 
         # Basket 1: High Dividend Yield — top DIV_THEME_SIZE by trailing 12M yield %
-        grp_yield = df_yield[(df_yield['Date'] == ranking_date) & (df_yield['Ticker'].isin(prev_universe))]
+        grp_yield = df_yield[(df_yield['Date'] == ranking_date) & (df_yield['Ticker'].isin(current_universe))]
         if not grp_yield.empty:
             high_yield[key] = set(grp_yield.sort_values('Yield', ascending=False).head(DIV_THEME_SIZE)['Ticker'])
 
         # Basket 2 & 3: need dividend growth data
         if df_divs.empty:
             continue
-        current_divs = df_divs[(df_divs['Date'] == ranking_date) & (df_divs['Ticker'].isin(prev_universe))]
+        current_divs = df_divs[(df_divs['Date'] == ranking_date) & (df_divs['Ticker'].isin(current_universe))]
         if current_divs.empty:
             continue
         prev_year_date = ranking_date - pd.DateOffset(years=1)
         prior_divs = df_divs[
             df_divs['Date'].between(prev_year_date - pd.Timedelta(days=45),
                                      prev_year_date + pd.Timedelta(days=45))
-            & df_divs['Ticker'].isin(prev_universe)
+            & df_divs['Ticker'].isin(current_universe)
         ].copy()
         if prior_divs.empty:
             continue
@@ -1229,11 +1217,9 @@ def build_quarter_size_universes():
             prev_key = f"{year - 1} Q4"
         else:
             prev_key = f"{year} Q{quarter - 1}"
-        if prev_key not in QUARTER_UNIVERSE:
-            continue
         ranking_date = _quarter_end_from_key(prev_key)
-        prev_universe = QUARTER_UNIVERSE[prev_key]
-        grp = df[(df['Date'] == ranking_date) & (df['Ticker'].isin(prev_universe))]
+        current_universe = QUARTER_UNIVERSE[key]
+        grp = df[(df['Date'] == ranking_date) & (df['Ticker'].isin(current_universe))]
         if grp.empty:
             continue
         sorted_desc = grp.sort_values('DollarVol', ascending=False)
@@ -1340,8 +1326,6 @@ def build_quarter_volume_growth_universes():
             prev_key = f"{year - 1} Q4"
         else:
             prev_key = f"{year} Q{quarter - 1}"
-        if prev_key not in QUARTER_UNIVERSE:
-            continue
         # Need two prior quarters to compute growth
         prev_year = int(prev_key.split()[0])
         prev_q = int(prev_key.split()[1].replace("Q", ""))
@@ -1352,10 +1336,10 @@ def build_quarter_volume_growth_universes():
 
         ranking_date = _quarter_end_from_key(prev_key)
         prev_ranking_date = _quarter_end_from_key(prev_prev_key)
-        prev_universe = QUARTER_UNIVERSE[prev_key]
+        current_universe = QUARTER_UNIVERSE[key]
 
-        cur_grp = df[(df['Date'] == ranking_date) & (df['Ticker'].isin(prev_universe))].set_index('Ticker')
-        prev_grp = df[(df['Date'] == prev_ranking_date) & (df['Ticker'].isin(prev_universe))].set_index('Ticker')
+        cur_grp = df[(df['Date'] == ranking_date) & (df['Ticker'].isin(current_universe))].set_index('Ticker')
+        prev_grp = df[(df['Date'] == prev_ranking_date) & (df['Ticker'].isin(current_universe))].set_index('Ticker')
 
         if cur_grp.empty or prev_grp.empty:
             continue
@@ -1461,14 +1445,8 @@ def _build_sector_universes(ticker_sector):
         year_str, q_str = key.split()
         year = int(year_str)
         quarter = int(q_str.replace("Q", ""))
-        if quarter == 1:
-            prev_key = f"{year - 1} Q4"
-        else:
-            prev_key = f"{year} Q{quarter - 1}"
-        if prev_key not in QUARTER_UNIVERSE:
-            continue
-        prev_universe = QUARTER_UNIVERSE[prev_key]
-        for t in prev_universe:
+        current_universe = QUARTER_UNIVERSE[key]
+        for t in current_universe:
             sec = ticker_sector.get(t)
             if sec in sector_universes:
                 sector_universes[sec].setdefault(key, set()).add(t)
@@ -1501,14 +1479,8 @@ def _build_industry_universes(ticker_subindustry):
         year_str, q_str = key.split()
         year = int(year_str)
         quarter = int(q_str.replace("Q", ""))
-        if quarter == 1:
-            prev_key = f"{year - 1} Q4"
-        else:
-            prev_key = f"{year} Q{quarter - 1}"
-        if prev_key not in QUARTER_UNIVERSE:
-            continue
-        prev_universe = QUARTER_UNIVERSE[prev_key]
-        for t in prev_universe:
+        current_universe = QUARTER_UNIVERSE[key]
+        for t in current_universe:
             group = ticker_subindustry.get(t)
             if group in industry_universes:
                 industry_universes[group].setdefault(key, set()).add(t)
@@ -3919,6 +3891,29 @@ def compute_equity_ohlc(
         if return_contributions and contrib_parts:
             contrib_df = pd.concat(contrib_parts, ignore_index=True).drop_duplicates(subset=['Date', 'Ticker'], keep='last').sort_values(['Date', 'Ticker']).reset_index(drop=True)
 
+        # Transition to current calendar quarter if its universe exists
+        today = datetime.today()
+        today_key = f"{today.year} Q{(today.month - 1) // 3 + 1}"
+        if today_key in universe_by_date and today_key != last_state.get('current_quarter'):
+            w_dict = quarter_weights.get(today_key, {})
+            if w_dict:
+                last_state = {
+                    'current_quarter': today_key,
+                    'equity_prev_close': last_state['equity_prev_close'],
+                    'weights': {str(k): float(v) for k, v in w_dict.items()},
+                }
+                # Append rebalance rows to contributions: Q2 initial BOD weights
+                # on the quarter start date so the contributions reflect the new basket
+                if return_contributions and contrib_df is not None:
+                    q_start = _quarter_start_from_key(today_key)
+                    rebalance_rows = pd.DataFrame([
+                        {'Date': q_start, 'Ticker': t, 'Weight_BOD': float(w),
+                         'Daily_Return': 0.0, 'Contribution': 0.0}
+                        for t, w in w_dict.items()
+                    ])
+                    contrib_df = pd.concat([contrib_df, rebalance_rows], ignore_index=True)
+                    contrib_df = contrib_df.drop_duplicates(subset=['Date', 'Ticker'], keep='last').sort_values(['Date', 'Ticker']).reset_index(drop=True)
+
         if return_state and return_contributions:
             return out, last_state, contrib_df
         elif return_state:
@@ -4022,6 +4017,16 @@ def compute_equity_ohlc(
             current_weights_series = updated / total
         else:
             current_weights_series = updated
+
+    # Transition to the current calendar quarter if its universe exists but
+    # no trading dates for it appeared in the historical data yet (Q1 day 1).
+    today = datetime.today()
+    today_key = f"{today.year} Q{(today.month - 1) // 3 + 1}"
+    if today_key in universe_by_date and today_key != current_quarter:
+        w_dict = quarter_weights.get(today_key, {})
+        if w_dict:
+            current_quarter = today_key
+            current_weights_series = pd.Series(w_dict)
 
     state = {
         'current_quarter': current_quarter,
