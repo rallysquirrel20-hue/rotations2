@@ -602,27 +602,24 @@ def _build_gics(quarter_universe):
 #  Thematic cache wrappers (one-line each using _cached_build)
 # ===================================================================
 
-def _ser_pair(pair):
-    a, b = pair
-    return json.dumps({'a': {k: sorted(v) for k, v in a.items()},
-                       'b': {k: sorted(v) for k, v in b.items()}})
+def _make_ser(keys):
+    def ser(data):
+        return json.dumps({k: {qk: sorted(v) for qk, v in d.items()}
+                           for k, d in zip(keys, data)})
+    return ser
 
-def _deser_pair(text):
-    d = json.loads(text)
-    return ({k: set(v) for k, v in d['a'].items()},
-            {k: set(v) for k, v in d['b'].items()})
+def _make_deser(keys):
+    def deser(text):
+        raw = json.loads(text)
+        return tuple({k: set(v) for k, v in raw.get(key, {}).items()} for key in keys)
+    return deser
 
-def _ser_triple(triple):
-    a, b, c = triple
-    return json.dumps({'a': {k: sorted(v) for k, v in a.items()},
-                       'b': {k: sorted(v) for k, v in b.items()},
-                       'c': {k: sorted(v) for k, v in c.items()}})
-
-def _deser_triple(text):
-    d = json.loads(text)
-    return ({k: set(v) for k, v in d['a'].items()},
-            {k: set(v) for k, v in d['b'].items()},
-            {k: set(v) for k, v in d.get('c', {}).items()})
+_ser_beta = _make_ser(['high', 'low'])
+_deser_beta = _make_deser(['high', 'low'])
+_ser_momentum = _make_ser(['winners', 'losers'])
+_deser_momentum = _make_deser(['winners', 'losers'])
+_ser_dividend = _make_ser(['high_yield', 'growth', 'with_growth'])
+_deser_dividend = _make_deser(['high_yield', 'growth', 'with_growth'])
 
 
 # ===================================================================
@@ -648,13 +645,13 @@ def main():
 
     # 3. Thematic universes
     _cached_build(BETA_CACHE_FILE, lambda: _build_beta(qu),
-                  _ser_pair, _deser_pair, "Beta", force)
+                  _ser_beta, _deser_beta, "Beta", force)
     _cached_build(MOMENTUM_CACHE_FILE, lambda: _build_momentum(qu),
-                  _ser_pair, _deser_pair, "Momentum", force)
+                  _ser_momentum, _deser_momentum, "Momentum", force)
     _cached_build(RISK_ADJ_MOM_CACHE_FILE, lambda: _build_risk_adj_momentum(qu),
                   _universe_to_json, _json_to_universe, "Risk-adj momentum", force)
     _cached_build(DIVIDEND_CACHE_FILE, lambda: _build_dividends(qu),
-                  _ser_triple, _deser_triple, "Dividends", force)
+                  _ser_dividend, _deser_dividend, "Dividends", force)
     _cached_build(SIZE_CACHE_FILE, lambda: _build_size(qu),
                   _universe_to_json, _json_to_universe, "Size", force)
     _cached_build(VOLUME_GROWTH_CACHE_FILE, lambda: _build_volume_growth(qu),

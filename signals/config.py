@@ -462,16 +462,18 @@ def load_gics_from_disk() -> tuple | None:
         return None
 
 
-def load_thematic_universe_from_disk(cache_file: Path) -> dict | None:
-    """Load a simple thematic universe (flat ``{quarter_key: list}`` JSON).
+def load_thematic_universe_from_disk(cache_file: Path, subkey=None) -> dict | None:
+    """Load a thematic universe from JSON cache.
 
-    Works for risk-adjusted momentum, size, and volume-growth caches.
-    Returns ``{quarter_key: set_of_tickers}`` or ``None`` if the file is
-    missing or corrupt.
+    If *subkey* is provided (e.g. ``'high'``, ``'winners'``), extracts that
+    sub-dict first.  Returns ``{quarter_key: set_of_tickers}`` or ``None``.
     """
     if not cache_file.exists():
         return None
     try:
-        return _json_to_universe(cache_file.read_text(encoding='utf-8'))
+        raw = json.loads(cache_file.read_text(encoding='utf-8'))
+        if subkey is not None:
+            raw = raw[subkey]
+        return {k: set(v) for k, v in raw.items()}
     except Exception:
         return None
