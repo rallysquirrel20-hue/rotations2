@@ -32,7 +32,8 @@ DIV_THEME_SIZE = 25
 START_YEAR = 2000
 LOOKBACK_DAYS = 252
 MOMENTUM_LOOKBACK_DAYS = 252
-INDUSTRY_MIN_STOCKS = 10
+INDUSTRY_MIN_STOCKS = 3
+INDUSTRY_TOP_PCT = 0.25  # keep top 25% of industries by dollar volume each quarter
 INCREMENTAL_MAX_DAYS = 5  # calendar days of staleness before full rebuild
 MARKET_SYMBOL = 'SPY'
 
@@ -73,7 +74,7 @@ SECTOR_LIST = [
 # Force flags -- env-var-driven so notebooks / CI can override
 # ---------------------------------------------------------------------------
 FORCE_REBUILD_EQUITY_CACHE = os.getenv('FORCE_REBUILD_EQUITY_CACHE', '').lower() in ('1', 'true', 'yes')
-FORCE_REBUILD_BASKET_SIGNALS = os.getenv('FORCE_REBUILD_BASKET_SIGNALS', '1').lower() in ('1', 'true', 'yes')
+FORCE_REBUILD_BASKET_SIGNALS = os.getenv('FORCE_REBUILD_BASKET_SIGNALS', '').lower() in ('1', 'true', 'yes')
 
 # ---------------------------------------------------------------------------
 # Output folder resolution
@@ -211,7 +212,7 @@ MOMENTUM_CACHE_FILE      = paths.thematic_basket_cache / f'momentum_universes_{S
 RISK_ADJ_MOM_CACHE_FILE  = paths.thematic_basket_cache / f'risk_adj_momentum_{SIZE}.json'
 DIVIDEND_CACHE_FILE      = paths.thematic_basket_cache / f'dividend_universes_{SIZE}.json'
 SIZE_CACHE_FILE          = paths.thematic_basket_cache / f'size_universes_{SIZE}.json'
-VOLUME_GROWTH_CACHE_FILE = paths.thematic_basket_cache / f'volume_growth_universes_{SIZE}.json'
+VOLUME_CACHE_FILE        = paths.thematic_basket_cache / f'volume_universes_{SIZE}.json'
 GICS_CACHE_FILE          = DATA_FOLDER / f'gics_mappings_{SIZE}.json'
 SIGNALS_CACHE_FILE       = DATA_FOLDER / f'signals_{SIZE}.parquet'
 ETF_SIGNALS_CACHE_FILE   = DATA_FOLDER / 'signals_etf_50.parquet'

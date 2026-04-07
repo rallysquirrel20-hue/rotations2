@@ -15,7 +15,7 @@ from config import (
     SIGNALS_CACHE_FILE, ETF_SIGNALS_CACHE_FILE,
     CACHE_FILE, ETF_CACHE_FILE,
     BETA_CACHE_FILE, MOMENTUM_CACHE_FILE, RISK_ADJ_MOM_CACHE_FILE,
-    DIVIDEND_CACHE_FILE, SIZE_CACHE_FILE, VOLUME_GROWTH_CACHE_FILE,
+    DIVIDEND_CACHE_FILE, SIZE_CACHE_FILE, VOLUME_CACHE_FILE,
     GICS_CACHE_FILE,
     CHART_SCHEMA_VERSION,
     load_universe_from_disk, load_etf_universe_from_disk,
@@ -707,7 +707,7 @@ def export_today_signals(quarter_universe, all_signals_df,
                          ticker_sector=None, ticker_subindustry=None,
                          thematic_universes=None,
                          verbose=False, live_ctx=None):
-    """Export live intraday signals to Excel.
+    """Compute live signals for all tickers and save to parquet.
 
     Parameters
     ----------
@@ -760,16 +760,6 @@ def export_today_signals(quarter_universe, all_signals_df,
             return None
         tickers = sorted(t for t in current_universe if '-' not in t)
         live_ohlc_map = get_live_ohlc_bars(tickers)
-        if live_ohlc_map:
-            _today_str = pd.Timestamp(gate['spy_trade_date']).strftime('%Y-%m-%d')
-            _rows = [{'Date': _today_str, 'Ticker': t,
-                       'Open': v['Open'], 'High': v['High'],
-                       'Low': v['Low'], 'Close': v['Close']}
-                      for t, v in live_ohlc_map.items()]
-            _live_ohlc_df = pd.DataFrame(_rows)
-            _live_ohlc_path = paths.data / f'live_signals_{SIZE}.parquet'
-            _live_ohlc_df.to_parquet(_live_ohlc_path, index=False)
-            print(f"Saved live OHLC ({len(_live_ohlc_df)} tickers): {_live_ohlc_path}")
         price_map = {t: v['Close'] for t, v in live_ohlc_map.items() if v.get('Close') is not None}
         last_rows = _get_latest_norgate_rows_by_ticker(all_signals_df, before_date=gate['spy_trade_date'])
         live_ctx = {
@@ -784,7 +774,6 @@ def export_today_signals(quarter_universe, all_signals_df,
             'latest_norgate_date': pd.Timestamp(gate['latest_norgate_date']),
         }
     else:
-        # Always use fresh wall-clock ET time for intraday output timestamping.
         now = datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
         current_key = live_ctx['current_key']
         current_universe = quarter_universe.get(current_key, set())
@@ -794,18 +783,7 @@ def export_today_signals(quarter_universe, all_signals_df,
         tickers = sorted(t for t in current_universe if '-' not in t)
         price_map = live_ctx['live_price_map']
         live_ohlc_map = live_ctx.get('live_ohlc_map', {})
-        if live_ohlc_map:
-            _today_str = pd.Timestamp(live_ctx['today']).strftime('%Y-%m-%d')
-            _rows = [{'Date': _today_str, 'Ticker': t,
-                       'Open': v['Open'], 'High': v['High'],
-                       'Low': v['Low'], 'Close': v['Close']}
-                      for t, v in live_ohlc_map.items()]
-            _live_ohlc_df = pd.DataFrame(_rows)
-            _live_ohlc_path = paths.data / f'live_signals_{SIZE}.parquet'
-            _live_ohlc_df.to_parquet(_live_ohlc_path, index=False)
-            print(f"Saved live OHLC ({len(_live_ohlc_df)} tickers): {_live_ohlc_path}")
         last_rows = live_ctx['last_rows']
-        # Ensure we're using pre-today Norgate baseline (in case context was cached post-append)
         _today_cutoff = pd.Timestamp(live_ctx['today']).normalize()
         if not last_rows.empty and (pd.to_datetime(last_rows['Date']).dt.normalize() >= _today_cutoff).any():
             last_rows = _get_latest_norgate_rows_by_ticker(all_signals_df, before_date=live_ctx['today'])
@@ -817,15 +795,6 @@ def export_today_signals(quarter_universe, all_signals_df,
         return None
 
     current_universe = quarter_universe.get(current_key, set())
-
-    signal_flags = {
-        'Up_Rot': 'Is_Up_Rotation',
-        'Down_Rot': 'Is_Down_Rotation',
-        'Breakout': 'Is_Breakout',
-        'Breakdown': 'Is_Breakdown',
-        'BTFD': 'Is_BTFD',
-        'STFR': 'Is_STFR',
-    }
 
     rows = []
     total = len(tickers)
@@ -852,19 +821,10 @@ def export_today_signals(quarter_universe, all_signals_df,
             )
             if new_row is None:
                 continue
-            last_row = new_row
-            for sig_name, flag_col in signal_flags.items():
-                if bool(last_row.get(flag_col, False)):
-                    rows.append({
-                        'Date': now.date(),
-                        'Ticker': ticker,
-                        'Close': live_price,
-                        'Signal_Type': sig_name,
-                        'Theme': _get_ticker_theme(ticker, thematic_universes),
-                        'Sector': ticker_sector.get(ticker, ''),
-                        'Industry': ticker_subindustry.get(ticker, ''),
-                        'Entry_Price': last_row.get(f'{sig_name}_Entry_Price', np.nan),
-                    })
+            row_dict = new_row.to_dict()
+            row_dict['Ticker'] = ticker
+            row_dict['Source'] = 'live'
+            rows.append(row_dict)
         except Exception as exc:
             if verbose:
                 print(f"[{i}/{len(current_universe)}] {ticker} failed: {exc}")
@@ -878,34 +838,11 @@ def export_today_signals(quarter_universe, all_signals_df,
 
     out_df = pd.DataFrame(rows)
     if not out_df.empty:
-        col_order = [
-            'Date', 'Ticker', 'Close', 'Signal_Type',
-            'Theme', 'Sector', 'Industry', 'Entry_Price',
-        ]
-        out_df = out_df[[c for c in col_order if c in out_df.columns]]
-        for col in ['Close', 'Entry_Price']:
-            if col in out_df.columns:
-                out_df[col] = out_df[col].apply(_fmt_price)
-        out_df = _sort_signals_df(out_df)
-    today_str = now.strftime('%Y_%m_%d')
-    time_str = now.strftime('%H%M')
-    out_file = LIVE_ROTATIONS_FOLDER / f'{today_str}_{time_str}_Live_Signals_for_top_{SIZE}.xlsx'
-    _n_live = len(out_df)
-    try:
-        out_df.to_excel(out_file, index=False, engine='openpyxl')
-        WriteThroughPath(out_file).sync()
-        print(f"Saved live signals ({_n_live} rows): {out_file}")
-    except PermissionError:
-        # Common case: file already open/locked (e.g., Excel). Fallback to a unique name.
-        time_str_fallback = now.strftime('%H%M%S')
-        out_file = LIVE_ROTATIONS_FOLDER / f'{today_str}_{time_str_fallback}_Live_Signals_for_top_{SIZE}.xlsx'
-        suffix = 1
-        while out_file.exists():
-            out_file = LIVE_ROTATIONS_FOLDER / f'{today_str}_{time_str_fallback}_{suffix}_Live_Signals_for_top_{SIZE}.xlsx'
-            suffix += 1
-        out_df.to_excel(out_file, index=False, engine='openpyxl')
-        WriteThroughPath(out_file).sync()
-        print(f"Primary xlsx path was locked; saved fallback ({_n_live} rows): {out_file}")
+        out_df = out_df.sort_values('Ticker').reset_index(drop=True)
+    _live_path = paths.data / f'live_signals_{SIZE}.parquet'
+    out_df.to_parquet(_live_path, index=False)
+    WriteThroughPath(_live_path).sync()
+    print(f"Saved live signals ({len(out_df)} rows, {out_df.columns.size} cols): {_live_path}")
     return None
 
 
@@ -1056,7 +993,8 @@ def _get_all_basket_specs_for_reports(
     beta_universe, low_beta_universe,
     momentum_universe, momentum_losers_universe,
     high_yield_universe, div_growth_universe, div_with_growth_universe,
-    risk_adj_mom_universe, size_universe, volume_growth_universe,
+    risk_adj_mom_universe, risk_adj_mom_losers_universe,
+    size_universe, vol_leaders_universe, vol_losers_universe,
     sector_universes, industry_universes,
 ):
     """Build the full list of (label, universe_dict, cache_key) specs for reports.
@@ -1071,12 +1009,17 @@ def _get_all_basket_specs_for_reports(
         ('Theme: High Dividend Yield', high_yield_universe,      'High Dividend Yield'),
         ('Theme: Dividend Growth',     div_growth_universe,      'Dividend Growth'),
         ('Theme: Dividend with Growth', div_with_growth_universe, 'Dividend with Growth'),
-        ('Theme: Risk Adj Momentum',   risk_adj_mom_universe,    'Risk Adj Momentum'),
+        ('Theme: Risk Adjusted Momentum', risk_adj_mom_universe, 'Risk Adjusted Momentum'),
+        ('Theme: Risk Adjusted Momentum Losers', risk_adj_mom_losers_universe, 'Risk Adjusted Momentum Losers'),
         ('Theme: Size',                size_universe,            'Size'),
-        ('Theme: Volume Growth',       volume_growth_universe,   'Volume Growth'),
+        ('Theme: Volume Leaders',      vol_leaders_universe,     'Volume Leaders'),
+        ('Theme: Volume Losers',       vol_losers_universe,      'Volume Losers'),
     ]
     specs += [(f"Sector: {name}", sector_universes[name], name) for name in sorted(sector_universes.keys())]
-    specs += [(f"Industry: {name}", industry_universes[name], name) for name in sorted(industry_universes.keys())]
+    current_key = get_current_quarter_key()
+    specs += [(f"Industry: {name}", industry_universes[name], name)
+              for name in sorted(industry_universes.keys())
+              if current_key in industry_universes[name] and len(industry_universes[name][current_key]) > 0]
     return specs
 
 
@@ -1421,9 +1364,11 @@ def main():
     high_yield_universe = load_thematic_universe_from_disk(DIVIDEND_CACHE_FILE, 'high_yield') or {}
     div_growth_universe = load_thematic_universe_from_disk(DIVIDEND_CACHE_FILE, 'growth') or {}
     div_with_growth_universe = load_thematic_universe_from_disk(DIVIDEND_CACHE_FILE, 'with_growth') or {}
-    risk_adj_mom_universe = load_thematic_universe_from_disk(RISK_ADJ_MOM_CACHE_FILE) or {}
+    risk_adj_mom_universe = load_thematic_universe_from_disk(RISK_ADJ_MOM_CACHE_FILE, 'winners') or {}
+    risk_adj_mom_losers_universe = load_thematic_universe_from_disk(RISK_ADJ_MOM_CACHE_FILE, 'losers') or {}
     size_universe = load_thematic_universe_from_disk(SIZE_CACHE_FILE) or {}
-    volume_growth_universe = load_thematic_universe_from_disk(VOLUME_GROWTH_CACHE_FILE) or {}
+    vol_leaders_universe = load_thematic_universe_from_disk(VOLUME_CACHE_FILE, 'leaders') or {}
+    vol_losers_universe = load_thematic_universe_from_disk(VOLUME_CACHE_FILE, 'losers') or {}
 
     current_key = get_current_quarter_key()
     thematic_universes = [
@@ -1433,7 +1378,8 @@ def main():
         ('Momentum Losers',     momentum_losers_universe.get(current_key, set())),
         ('High Dividend Yield', high_yield_universe.get(current_key, set())),
         ('Dividend Growth',     div_growth_universe.get(current_key, set())),
-        ('Risk Adj Momentum',   risk_adj_mom_universe.get(current_key, set())),
+        ('Risk Adjusted Momentum', risk_adj_mom_universe.get(current_key, set())),
+        ('Risk Adjusted Momentum Losers', risk_adj_mom_losers_universe.get(current_key, set())),
     ]
 
     # Force reset caches
@@ -1460,7 +1406,8 @@ def main():
         beta_universe, low_beta_universe,
         momentum_universe, momentum_losers_universe,
         high_yield_universe, div_growth_universe, div_with_growth_universe,
-        risk_adj_mom_universe, size_universe, volume_growth_universe,
+        risk_adj_mom_universe, risk_adj_mom_losers_universe,
+        size_universe, vol_leaders_universe, vol_losers_universe,
         sector_universes, industry_universes,
     )
     _write_live_basket_ohlc(_live_ctx_for_reports, all_basket_specs)

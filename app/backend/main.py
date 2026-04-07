@@ -78,12 +78,46 @@ THEMATIC_CONFIG = {
     "Momentum_Leaders": ("momentum_universes_500.json", "winners"),
     "Momentum_Losers": ("momentum_universes_500.json", "losers"),
     "High_Dividend_Yield": ("dividend_universes_500.json", "high_yield"),
-    "Dividend_Growth": ("dividend_universes_500.json", "div_growth"),
-    "Dividend_with_Growth": ("dividend_universes_500.json", "div_with_growth"),
-    "Risk_Adj_Momentum": ("risk_adj_momentum_500.json", None),
+    "Dividend_Growth": ("dividend_universes_500.json", "growth"),
+    "Dividend_with_Growth": ("dividend_universes_500.json", "with_growth"),
+    "Risk_Adjusted_Momentum": ("risk_adj_momentum_500.json", "winners"),
+    "Risk_Adjusted_Momentum_Losers": ("risk_adj_momentum_500.json", "losers"),
     "Size": ("size_universes_500.json", None),
-    "Volume_Growth": ("volume_growth_universes_500.json", None),
+    "Volume_Leaders": ("volume_universes_500.json", "leaders"),
+    "Volume_Losers": ("volume_universes_500.json", "losers"),
 }
+
+_valid_industries_cache = None
+
+def _get_valid_industry_slugs():
+    """Return set of industry slugs in the GICS file for the current quarter.
+    Industries are pre-filtered by dollar volume (top 25%) during universe build."""
+    global _valid_industries_cache
+    if _valid_industries_cache is not None:
+        return _valid_industries_cache
+    result = set()
+    if GICS_MAPPINGS_FILE.exists():
+        from datetime import datetime
+        now = datetime.today()
+        current_key = f"{now.year} Q{(now.month - 1) // 3 + 1}"
+        with open(GICS_MAPPINGS_FILE, 'r') as f:
+            gics = json.load(f)
+        for name, qmap in gics.get('industry_u', {}).items():
+            if current_key in qmap and len(qmap[current_key]) > 0:
+                result.add(name.replace(" ", "_").replace("&", "and"))
+    _valid_industries_cache = result
+    return result
+
+def _is_valid_basket(slug):
+    """Return False for industry baskets not in the current quarter's dollar-volume universe."""
+    t_names = set(THEMATIC_CONFIG.keys())
+    s_names = {"Communication_Services", "Consumer_Discretionary", "Consumer_Staples", "Energy",
+               "Financials", "Health_Care", "Industrials", "Information_Technology",
+               "Materials", "Real_Estate", "Utilities"}
+    if slug in t_names or slug in s_names:
+        return True
+    return slug in _get_valid_industry_slugs()
+
 
 def _read_live_parquet(path):
     """Read a live parquet file. Returns None if missing, empty, or contains empty dict."""
@@ -110,7 +144,7 @@ def _live_is_current(live_df, norgate_max_date):
     if live_df is None or live_df.empty:
         return False
     try:
-        live_date = pd.to_datetime(live_df['Date'].iloc[0])
+        live_date = pd.to_datetime(live_df['Date'].iloc[0]).normalize()
         return live_date > pd.to_datetime(norgate_max_date)
     except Exception:
         return False
@@ -178,18 +212,32 @@ def _read_ticker_parquet(ticker, columns=None, filters=None):
 def clean_data_for_json(df):
     return json.loads(df.to_json(orient="records", date_format="iso"))
 
+def _current_quarter_key():
+    from datetime import datetime
+    now = datetime.today()
+    return f"{now.year} Q{(now.month - 1) // 3 + 1}"
+
+def _pick_quarter(quarter_dict):
+    """Return tickers for the current quarter, falling back to the most recent available."""
+    qs = sorted(quarter_dict.keys())
+    if not qs:
+        return []
+    current = _current_quarter_key()
+    if current in quarter_dict:
+        return list(quarter_dict[current])
+    # Fall back to most recent quarter at or before current
+    candidates = [q for q in qs if q <= current]
+    return list(quarter_dict[candidates[-1]]) if candidates else list(quarter_dict[qs[-1]])
+
 def get_latest_universe_tickers(basket_name):
     if GICS_MAPPINGS_FILE.exists():
         with open(GICS_MAPPINGS_FILE, 'r') as f:
             gics = json.load(f)
-            search_name = basket_name.replace("_", " ")
-            # Search in sector_u and industry_u sub-dicts
-            for group_key in ('sector_u', 'industry_u'):
-                group = gics.get(group_key, {})
-                if search_name in group:
-                    d = group[search_name]
-                    qs = sorted(d.keys())
-                    if qs: return list(d[qs[-1]])
+            for search_name in _slug_to_gics_name(basket_name):
+                for group_key in ('sector_u', 'industry_u'):
+                    group = gics.get(group_key, {})
+                    if search_name in group:
+                        return _pick_quarter(group[search_name])
     if basket_name in THEMATIC_CONFIG:
         fn, key = THEMATIC_CONFIG[basket_name]
         p_path = THEMATIC_BASKET_CACHE / fn
@@ -197,8 +245,7 @@ def get_latest_universe_tickers(basket_name):
             with open(p_path, 'r') as f:
                 data = json.load(f)
                 ud = data[key] if key is not None else data
-                qs = sorted(ud.keys())
-                if qs: return list(ud[qs[-1]])
+                return _pick_quarter(ud)
     return []
 
 
@@ -217,16 +264,22 @@ def get_meta_file_tickers(basket_name):
 
 
 
+def _slug_to_gics_name(slug):
+    """Convert a URL slug back to a GICS name, handling & vs and."""
+    name = slug.replace("_", " ")
+    # Also try the & variant since GICS uses & but slugs use 'and'
+    return [name, name.replace(" and ", " & ")]
+
 def _get_universe_history(basket_name):
     """Return the quarterly universe dict for a basket: {'2025 Q4': ['AAPL', ...], ...}"""
     if GICS_MAPPINGS_FILE.exists():
         with open(GICS_MAPPINGS_FILE, 'r') as f:
             gics = json.load(f)
-        search_name = basket_name.replace("_", " ")
-        for group_key in ('sector_u', 'industry_u'):
-            group = gics.get(group_key, {})
-            if search_name in group:
-                return group[search_name]
+        for search_name in _slug_to_gics_name(basket_name):
+            for group_key in ('sector_u', 'industry_u'):
+                group = gics.get(group_key, {})
+                if search_name in group:
+                    return group[search_name]
     if basket_name in THEMATIC_CONFIG:
         fn, key = THEMATIC_CONFIG[basket_name]
         p_path = THEMATIC_BASKET_CACHE / fn
@@ -408,7 +461,7 @@ def _compute_live_breadth_batch(slugs):
         close_df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=['Ticker', 'Date', 'Close'],
                                     filters=[('Ticker', 'in', list(all_tickers))])
         close_pivot = close_df.pivot_table(index='Date', columns='Ticker', values='Close').sort_index()
-        live_date = pd.to_datetime(live_df['Date'].iloc[0])
+        live_date = pd.to_datetime(live_df['Date'].iloc[0]).normalize().normalize()
         live_series = pd.Series(live_close_all, name=live_date)
         close_pivot = pd.concat([close_pivot, live_series.to_frame().T]).sort_index()
         returns_pivot = close_pivot.pct_change()
@@ -481,7 +534,7 @@ def _compute_live_breadth(basket_name):
         pivot = close_df.pivot_table(index='Date', columns='Ticker', values='Close').sort_index()
 
         # Add live prices as new row
-        live_date = pd.to_datetime(live_df['Date'].iloc[0])
+        live_date = pd.to_datetime(live_df['Date'].iloc[0]).normalize()
         live_series = pd.Series(live_close, name=live_date)
         pivot = pd.concat([pivot, live_series.to_frame().T]).sort_index()
 
@@ -518,7 +571,7 @@ def list_baskets():
             slug = re.sub(r'(_\d+)?_of_\d+$', '', name)
             if slug in t_names: cats["Themes"].append(slug)
             elif slug in s_names: cats["Sectors"].append(slug)
-            else: cats["Industries"].append(slug)
+            elif _is_valid_basket(slug): cats["Industries"].append(slug)
     for k in cats: cats[k] = sorted(set(cats[k]))
     return cats
 
@@ -557,7 +610,7 @@ def get_basket_breadth():
             continue
         for f in folder.glob("*_of_*_signals.parquet"):
             slug = re.sub(r'(_\d+)?_of_\d+_signals$', '', f.stem)
-            if slug in result:
+            if slug in result or not _is_valid_basket(slug):
                 continue
             try:
                 sig_cols = ['Date', 'Close', 'Uptrend_Pct', 'Breakout_Pct', 'Correlation_Pct',
@@ -574,8 +627,12 @@ def get_basket_breadth():
                     entry['uptrend_pct'] = round(float(last['Uptrend_Pct']), 1)
                 if pd.notna(last.get('Breakout_Pct')):
                     entry['breakout_pct'] = round(float(last['Breakout_Pct']), 1)
-                if pd.notna(last.get('Correlation_Pct')):
-                    entry['corr_pct'] = round(float(last['Correlation_Pct']), 1)
+                _corr_val = last.get('Correlation_Pct')
+                if pd.isna(_corr_val):
+                    _corr_series = df['Correlation_Pct'].dropna()
+                    _corr_val = _corr_series.iloc[-1] if not _corr_series.empty else None
+                if pd.notna(_corr_val):
+                    entry['corr_pct'] = round(float(_corr_val), 1)
                 entry['st_trend'] = 'UP' if last.get('Trend') else 'DN'
                 entry['lt_trend'] = 'BO' if last.get('Is_Breakout_Sequence') else 'BD'
                 # Mean reversion
@@ -610,35 +667,32 @@ def get_basket_breadth():
             except Exception:
                 continue
 
-    # Overlay live breadth values (single batch read of signals parquet)
+    # Overlay live breadth + correlation values (single batch read of signals parquet)
     try:
-        live_df = _read_live_parquet(LIVE_SIGNALS_FILE)
-        if live_df is not None:
-            needed_cols = ['Ticker', 'Date', 'Trend', 'Resistance_Pivot', 'Support_Pivot',
-                           'Upper_Target', 'Lower_Target', 'Is_Breakout_Sequence']
-            hist = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=needed_cols,
-                                   filters=[('Ticker', 'in', list(live_df['Ticker'].unique()))])
-            norgate_max_date = hist['Date'].max()
-
-            if _live_is_current(live_df, norgate_max_date):
-                live_close = live_df.set_index('Ticker')['Close'].to_dict()
-                last_hist = hist.sort_values('Date').groupby('Ticker').tail(1).set_index('Ticker')
-
-                for slug in list(result.keys()):
-                    tickers = get_latest_universe_tickers(slug)
-                    if not tickers:
-                        continue
-                    breadth = _tally_breadth(tickers, live_close, last_hist)
-                    if breadth:
-                        result[slug]['uptrend_pct'] = breadth['Uptrend_Pct']
-                        result[slug]['breakout_pct'] = breadth['Breakout_Pct']
+        live_batch = _compute_live_breadth_batch(list(result.keys()))
+        for slug, lb in live_batch.items():
+            if slug in result:
+                if 'Uptrend_Pct' in lb:
+                    result[slug]['uptrend_pct'] = lb['Uptrend_Pct']
+                if 'Breakout_Pct' in lb:
+                    result[slug]['breakout_pct'] = lb['Breakout_Pct']
+                if 'Correlation_Pct' in lb:
+                    result[slug]['corr_pct'] = lb['Correlation_Pct']
     except Exception:
         pass
 
     # Overlay live basket equity curve signals using live basket OHLC + cached pivots
     try:
         live_basket_df = _read_live_parquet(LIVE_BASKET_SIGNALS_FILE)
-        if live_basket_df is not None and _live_is_current(live_basket_df, norgate_max_date if 'norgate_max_date' in dir() else pd.Timestamp.min):
+        # Approximate norgate max date from the basket signals (already loaded)
+        _first_slug = next(iter(result), None)
+        norgate_max_date = pd.Timestamp.min
+        if _first_slug:
+            pf = _find_basket_parquet(_first_slug)
+            if pf:
+                _bdf = pd.read_parquet(pf, columns=['Date'])
+                norgate_max_date = pd.to_datetime(_bdf['Date']).max()
+        if live_basket_df is not None and _live_is_current(live_basket_df, norgate_max_date):
             name_col = 'BasketName' if 'BasketName' in live_basket_df.columns else 'Basket'
             for slug, entry in result.items():
                 pivots = entry.get('_pivots')
@@ -695,14 +749,21 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
     t_names = list(THEMATIC_CONFIG.keys())
     s_names = ["Communication_Services", "Consumer_Discretionary", "Consumer_Staples", "Energy", "Financials", "Health_Care", "Industrials", "Information_Technology", "Materials", "Real_Estate", "Utilities"]
 
-    # Discover all basket slugs
+    # Discover all basket slugs — only include industries that are in the GICS file
+    # (pre-filtered by dollar volume during universe build)
+    _gics_industry_slugs = set()
+    if GICS_MAPPINGS_FILE.exists():
+        with open(GICS_MAPPINGS_FILE, 'r') as f:
+            _gi = json.load(f)
+        _gics_industry_slugs = {n.replace(" ", "_").replace("&", "and") for n in _gi.get('industry_u', {})}
     all_slugs = set()
     for folder in BASKET_CACHE_FOLDERS:
         if not folder.exists():
             continue
         for f in folder.glob("*_of_*_signals.parquet"):
             slug = re.sub(r'(_\d+)?_of_\d+_signals$', '', f.stem)
-            all_slugs.add(slug)
+            if slug in t_names or slug in s_names or slug in _gics_industry_slugs:
+                all_slugs.add(slug)
 
     def _categorize(slug):
         if slug in t_names:
@@ -2391,6 +2452,10 @@ def get_basket_summary(basket_name: str, start: str = None, end: str = None):
             cols_needed.append(SIGNAL_IS_COL[st])
             for suf in STAT_SUFFIXES:
                 cols_needed.append(f'{st}_{suf}')
+        # Only request columns that exist in the parquet (rolling stats may not be present)
+        import pyarrow.parquet as pq
+        available_cols = set(pq.read_schema(INDIVIDUAL_SIGNALS_FILE).names)
+        cols_needed = [c for c in cols_needed if c in available_cols]
         df = pd.read_parquet(
             INDIVIDUAL_SIGNALS_FILE,
             columns=cols_needed,
@@ -4977,7 +5042,10 @@ def get_signals_log(universe: str = "stocks", period: str = "1m"):
         files = []
         for folder in BASKET_CACHE_FOLDERS:
             if folder.exists():
-                files.extend(folder.glob("*_of_*_signals.parquet"))
+                for f in folder.glob("*_of_*_signals.parquet"):
+                    slug = re.sub(r'(_\d+)?_of_\d+_signals$', '', f.stem)
+                    if _is_valid_basket(slug):
+                        files.append(f)
     else:  # stocks
         files = [INDIVIDUAL_SIGNALS_FILE] if INDIVIDUAL_SIGNALS_FILE.exists() else []
 

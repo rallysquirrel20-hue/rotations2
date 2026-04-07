@@ -27,7 +27,7 @@ from config import (
     MARKET_SYMBOL, SECTOR_LIST,
     CACHE_FILE, ETF_CACHE_FILE, TICKER_NAMES_FILE,
     BETA_CACHE_FILE, MOMENTUM_CACHE_FILE, RISK_ADJ_MOM_CACHE_FILE,
-    DIVIDEND_CACHE_FILE, SIZE_CACHE_FILE, VOLUME_GROWTH_CACHE_FILE,
+    DIVIDEND_CACHE_FILE, SIZE_CACHE_FILE, VOLUME_CACHE_FILE,
     GICS_CACHE_FILE,
     _universe_to_json, _json_to_universe,
     _gics_to_json, _json_to_gics,
@@ -421,7 +421,9 @@ def _build_risk_adj_momentum(quarter_universe):
 
     df = _collect_metric(symbols, calc, 'RiskAdjMom',
                          extra_filter=lambda v: np.isfinite(v))
-    return _rank_per_quarter(df, quarter_universe, 'RiskAdjMom', THEME_SIZE)
+    winners = _rank_per_quarter(df, quarter_universe, 'RiskAdjMom', THEME_SIZE, ascending=False)
+    losers = _rank_per_quarter(df, quarter_universe, 'RiskAdjMom', THEME_SIZE, ascending=True)
+    return winners, losers
 
 
 def _build_dividends(quarter_universe):
@@ -517,9 +519,9 @@ def _build_size(quarter_universe):
     return _rank_per_quarter(df, quarter_universe, 'DollarVolume', THEME_SIZE)
 
 
-def _build_volume_growth(quarter_universe):
+def _build_volume(quarter_universe):
     symbols = _all_symbols(quarter_universe)
-    print(f"Volume growth: {len(symbols)} stocks")
+    print(f"Volume leaders/losers (YoY): {len(symbols)} stocks")
 
     def calc(ticker):
         df = _fetch_prices(ticker)
@@ -528,12 +530,16 @@ def _build_volume_growth(quarter_universe):
         return (df['Close'] * df['Volume']).resample('QE-DEC').mean()
 
     df = _collect_metric(symbols, calc, 'DollarVolume', extra_filter=lambda v: v > 0)
-    universe = {}
+    leaders = {}
+    losers = {}
     for key in sorted(quarter_universe.keys()):
+        # YoY: compare prior quarter to same quarter one year ago
         pk = _prev_qtr(key)
-        ppk = _prev_qtr(pk)
+        yoy_key = pk  # step back 4 quarters from pk
+        for _ in range(4):
+            yoy_key = _prev_qtr(yoy_key)
         rd = _quarter_end_from_key(pk)
-        prd = _quarter_end_from_key(ppk)
+        prd = _quarter_end_from_key(yoy_key)
         tickers = quarter_universe[key]
         cur = df[(df['Date'] == rd) & (df['Ticker'].isin(tickers))].set_index('Ticker')
         prev = df[(df['Date'] == prd) & (df['Ticker'].isin(tickers))].set_index('Ticker')
@@ -542,8 +548,9 @@ def _build_volume_growth(quarter_universe):
         mg = cur[['DollarVolume']].join(prev[['DollarVolume']], lsuffix='_c', rsuffix='_p', how='inner')
         mg = mg[mg['DollarVolume_p'] > 0]
         mg['G'] = (mg['DollarVolume_c'] - mg['DollarVolume_p']) / mg['DollarVolume_p']
-        universe[key] = set(mg.sort_values('G', ascending=False).head(THEME_SIZE).index)
-    return universe
+        leaders[key] = set(mg.sort_values('G', ascending=False).head(THEME_SIZE).index)
+        losers[key] = set(mg.sort_values('G', ascending=True).head(THEME_SIZE).index)
+    return leaders, losers
 
 
 # ===================================================================
@@ -551,6 +558,8 @@ def _build_volume_growth(quarter_universe):
 # ===================================================================
 
 def _build_gics(quarter_universe):
+    from config import INDUSTRY_MIN_STOCKS, INDUSTRY_TOP_PCT
+
     all_tickers = _all_symbols(quarter_universe)
     print(f"GICS: mapping {len(all_tickers)} stocks")
 
@@ -581,19 +590,51 @@ def _build_gics(quarter_universe):
             if s in sector_u:
                 sector_u[s].setdefault(key, set()).add(t)
 
-    # Industry universes (only those with enough stocks in latest quarter)
-    latest_key = max(quarter_universe.keys())
-    from collections import Counter
-    counts = Counter(ticker_subindustry.get(t) for t in quarter_universe[latest_key])
-    selected = sorted(k for k, c in counts.items() if k)
-    print(f"  {len(selected)} industries")
-
-    industry_u = {ind: {} for ind in selected}
+    # Build raw industry -> quarter -> tickers mapping (all industries)
+    raw_industry_u = {}
     for key, tickers in quarter_universe.items():
         for t in tickers:
             g = ticker_subindustry.get(t)
-            if g in industry_u:
-                industry_u[g].setdefault(key, set()).add(t)
+            if g:
+                raw_industry_u.setdefault(g, {}).setdefault(key, set()).add(t)
+
+    # Compute dollar volume per ticker (quarterly average)
+    print("  Computing industry dollar volumes...")
+    all_rows = []
+    for rows in _parallel_fetch(list(all_tickers), _get_quarterly_volume):
+        all_rows.extend(rows)
+    vol_df = pd.DataFrame(all_rows, columns=['Date', 'Ticker', 'Volume'])
+
+    # For each quarter, sum dollar volume per industry and select top 25%
+    industry_u = {}
+    for key in sorted(quarter_universe.keys()):
+        q_end = _quarter_end_from_key(_prev_qtr(key))
+        q_vol = vol_df[vol_df['Date'] == q_end].set_index('Ticker')['Volume']
+
+        industry_dvol = {}
+        for ind, qmap in raw_industry_u.items():
+            tickers = qmap.get(key, set())
+            if len(tickers) < INDUSTRY_MIN_STOCKS:
+                continue
+            total_dvol = sum(q_vol.get(t, 0) for t in tickers)
+            industry_dvol[ind] = total_dvol
+
+        if not industry_dvol:
+            continue
+
+        # Select top 25% by dollar volume
+        n_select = max(1, int(len(industry_dvol) * INDUSTRY_TOP_PCT))
+        ranked = sorted(industry_dvol.items(), key=lambda x: x[1], reverse=True)
+        selected = {ind for ind, _ in ranked[:n_select]}
+
+        for ind in selected:
+            industry_u.setdefault(ind, {})[key] = raw_industry_u[ind].get(key, set())
+
+    all_industries = sorted(industry_u.keys())
+    # Show current quarter stats
+    current_key = max(quarter_universe.keys())
+    current_industries = [ind for ind in all_industries if current_key in industry_u.get(ind, {})]
+    print(f"  {len(all_industries)} industries total, {len(current_industries)} in {current_key} (top {int(INDUSTRY_TOP_PCT*100)}%)")
 
     return ticker_sector, ticker_subindustry, sector_u, industry_u
 
@@ -618,8 +659,12 @@ _ser_beta = _make_ser(['high', 'low'])
 _deser_beta = _make_deser(['high', 'low'])
 _ser_momentum = _make_ser(['winners', 'losers'])
 _deser_momentum = _make_deser(['winners', 'losers'])
+_ser_risk_adj_mom = _make_ser(['winners', 'losers'])
+_deser_risk_adj_mom = _make_deser(['winners', 'losers'])
 _ser_dividend = _make_ser(['high_yield', 'growth', 'with_growth'])
 _deser_dividend = _make_deser(['high_yield', 'growth', 'with_growth'])
+_ser_volume = _make_ser(['leaders', 'losers'])
+_deser_volume = _make_deser(['leaders', 'losers'])
 
 
 # ===================================================================
@@ -649,13 +694,13 @@ def main():
     _cached_build(MOMENTUM_CACHE_FILE, lambda: _build_momentum(qu),
                   _ser_momentum, _deser_momentum, "Momentum", force)
     _cached_build(RISK_ADJ_MOM_CACHE_FILE, lambda: _build_risk_adj_momentum(qu),
-                  _universe_to_json, _json_to_universe, "Risk-adj momentum", force)
+                  _ser_risk_adj_mom, _deser_risk_adj_mom, "Risk-adj momentum", force)
     _cached_build(DIVIDEND_CACHE_FILE, lambda: _build_dividends(qu),
                   _ser_dividend, _deser_dividend, "Dividends", force)
     _cached_build(SIZE_CACHE_FILE, lambda: _build_size(qu),
                   _universe_to_json, _json_to_universe, "Size", force)
-    _cached_build(VOLUME_GROWTH_CACHE_FILE, lambda: _build_volume_growth(qu),
-                  _universe_to_json, _json_to_universe, "Volume growth", force)
+    _cached_build(VOLUME_CACHE_FILE, lambda: _build_volume(qu),
+                  _ser_volume, _deser_volume, "Volume leaders/losers", force)
 
     # 4. GICS
     _cached_build(GICS_CACHE_FILE, lambda: _build_gics(qu),

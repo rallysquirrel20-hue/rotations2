@@ -1,30 +1,6 @@
 import { useState, useMemo, useRef, useEffect } from 'react'
 import axios from 'axios'
 
-interface OpenSignal {
-  Ticker: string
-  Signal_Type: string
-  Entry_Date: string | null
-  Exit_Date?: string | null
-  Close: number | null
-  Entry_Price: number | null
-  Current_Performance: number | null
-  Win_Rate: number | null
-  Avg_Winner: number | null
-  Avg_Loser: number | null
-  Avg_Winner_Bars: number | null
-  Avg_Loser_Bars: number | null
-  Avg_MFE: number | null
-  Avg_MAE: number | null
-  Std_Dev: number | null
-  Historical_EV: number | null
-  EV_Last_3: number | null
-  Risk_Adj_EV: number | null
-  Risk_Adj_EV_Last_3: number | null
-  Count: number
-  Is_Live?: boolean
-}
-
 interface CorrelationData {
   labels: string[]
   matrix: (number | null)[][]
@@ -45,8 +21,6 @@ interface BasketsData {
 
 interface BasketSummaryProps {
   data: {
-    open_signals: OpenSignal[]
-    closed_signals?: OpenSignal[]
     correlation: CorrelationData
     cumulative_returns: CumulativeReturnsData
   } | null
@@ -60,15 +34,7 @@ interface BasketSummaryProps {
   onBasketSelect?: (basket: string) => void
 }
 
-type SortKey = keyof OpenSignal
-type TabType = 'breakout' | 'rotation' | 'btfd' | 'breakout_closed' | 'rotation_closed' | 'btfd_closed' | 'correlation' | 'returns' | 'contribution' | 'cross_returns' | 'single_returns'
-
-const SIGNAL_FILTERS: Record<'breakout' | 'rotation' | 'btfd', string[]> = {
-  breakout: ['Breakout', 'Breakdown'],
-  rotation: ['Up_Rot', 'Down_Rot'],
-  btfd: ['BTFD', 'STFR'],
-}
-type CellValue = string | number | null
+type TabType = 'correlation' | 'returns' | 'contribution' | 'cross_returns' | 'single_returns'
 
 // Blue (best) → Grey (mid) → Pink (worst) gradient based on rank
 function rankColor(rank: number, total: number): string {
@@ -84,30 +50,6 @@ function rankColor(rank: number, total: number): string {
   }
 }
 
-function pctFmt(v: number | null): string {
-  if (v === null) return '--'
-  return (v * 100).toFixed(2) + '%'
-}
-
-function pctFmtCell(v: CellValue): string {
-  return typeof v === 'number' ? pctFmt(v) : '--'
-}
-
-function colorForPerf(v: number | null): string {
-  if (v === null) return '#6c757d'
-  if (v > 0) return 'rgb(50, 50, 255)'
-  if (v < 0) return 'rgb(255, 50, 150)'
-  return '#6c757d'
-}
-
-function colorForPerfCell(v: CellValue): string {
-  return typeof v === 'number' ? colorForPerf(v) : '#6c757d'
-}
-
-function dollarFmtCell(v: CellValue): string {
-  return typeof v === 'number' ? '$' + v.toFixed(2) : '--'
-}
-
 function corrColor(v: number | null): string {
   if (v === null) return '#fdf6e3'
   // Blue (50,50,255) for positive, pink (255,50,150) for negative, white at 0
@@ -118,95 +60,6 @@ function corrColor(v: number | null): string {
   } else {
     return `rgb(255, ${Math.round(255 - t * 205)}, ${Math.round(255 - t * 105)})`
   }
-}
-
-const LIVE_ROW_COLORS: Record<string, string> = {
-  Down_Rot: 'rgba(255, 50, 150, 0.12)',
-  Up_Rot: 'rgba(50, 50, 255, 0.12)',
-  BTFD: 'rgba(255, 50, 150, 0.12)',
-  STFR: 'rgba(50, 50, 255, 0.12)',
-  Breakdown: 'rgba(255, 50, 150, 0.12)',
-  Breakout: 'rgba(50, 50, 255, 0.12)',
-}
-
-function SignalsTable({ signals, showExitDate }: { signals: OpenSignal[]; showExitDate?: boolean }) {
-  const [sortKey, setSortKey] = useState<SortKey>('Ticker')
-  const [sortAsc, setSortAsc] = useState(true)
-
-  const sorted = useMemo(() => {
-    const arr = [...signals]
-    arr.sort((a, b) => {
-      const av = a[sortKey], bv = b[sortKey]
-      if (typeof av === 'string' && typeof bv === 'string') return sortAsc ? av.localeCompare(bv) : bv.localeCompare(av)
-      const an = av === null || av === undefined ? Number.NEGATIVE_INFINITY : Number(av)
-      const bn = bv === null || bv === undefined ? Number.NEGATIVE_INFINITY : Number(bv)
-      return sortAsc ? an - bn : bn - an
-    })
-    return arr
-  }, [signals, sortKey, sortAsc])
-
-  const handleSort = (key: SortKey) => {
-    if (sortKey === key) setSortAsc(!sortAsc)
-    else { setSortKey(key); setSortAsc(key === 'Ticker' || key === 'Signal_Type') }
-  }
-
-  const columns: { key: SortKey; label: string; fmt?: (v: CellValue) => string; color?: (v: CellValue) => string }[] = [
-    { key: 'Ticker', label: 'Ticker' },
-    { key: 'Signal_Type', label: 'Signal' },
-    { key: 'Entry_Date', label: 'Entry Date' },
-    ...(showExitDate ? [{ key: 'Exit_Date' as SortKey, label: 'Exit Date' }] : []),
-    { key: 'Close', label: showExitDate ? 'Exit Price' : 'Close', fmt: dollarFmtCell },
-    { key: 'Entry_Price', label: 'Entry', fmt: dollarFmtCell },
-    { key: 'Current_Performance', label: 'Perf', fmt: pctFmtCell, color: colorForPerfCell },
-    { key: 'Win_Rate', label: 'Win%', fmt: pctFmtCell },
-    { key: 'Avg_Winner', label: 'Avg W', fmt: pctFmtCell },
-    { key: 'Avg_Loser', label: 'Avg L', fmt: pctFmtCell },
-    { key: 'Avg_Winner_Bars', label: 'W Bars' },
-    { key: 'Avg_Loser_Bars', label: 'L Bars' },
-    { key: 'Avg_MFE', label: 'MFE', fmt: pctFmtCell },
-    { key: 'Avg_MAE', label: 'MAE', fmt: pctFmtCell },
-    { key: 'Historical_EV', label: 'EV', fmt: pctFmtCell, color: colorForPerfCell },
-    { key: 'EV_Last_3', label: 'EV L3', fmt: pctFmtCell, color: colorForPerfCell },
-    { key: 'Risk_Adj_EV', label: 'R/A EV', fmt: pctFmtCell, color: colorForPerfCell },
-    { key: 'Risk_Adj_EV_Last_3', label: 'R/A L3', fmt: pctFmtCell, color: colorForPerfCell },
-    { key: 'Std_Dev', label: 'StdDev', fmt: pctFmtCell },
-    { key: 'Count', label: 'Cnt' },
-  ]
-
-  return (
-    <div className="summary-table-wrapper">
-      <table className="summary-table">
-        <thead>
-          <tr>
-            {columns.map(col => (
-              <th key={col.key} onClick={() => handleSort(col.key)} className="summary-th">
-                {col.label} {sortKey === col.key ? (sortAsc ? '\u25B2' : '\u25BC') : ''}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {sorted.map((row, i) => (
-            <tr key={i} className="summary-tr"
-                style={row.Is_Live ? { backgroundColor: LIVE_ROW_COLORS[row.Signal_Type] || 'transparent' } : undefined}>
-              {columns.map(col => {
-                const val = row[col.key]
-                const display = col.fmt ? col.fmt(val) : String(val)
-                const color = col.color ? col.color(val) : undefined
-                return (
-                  <td key={col.key} className="summary-td" style={{ color }}>
-                    {display}
-                    {col.key === 'Signal_Type' && row.Is_Live && <span className="live-tag">LIVE</span>}
-                  </td>
-                )
-              })}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      {sorted.length === 0 && <div className="summary-empty">No open signals for this basket</div>}
-    </div>
-  )
 }
 
 function CorrelationHeatmap({ data, basketName, apiBase, quarterDateRange }: { data: CorrelationData; basketName: string; apiBase: string; quarterDateRange?: { from: string; to: string } | null }) {
@@ -1840,7 +1693,7 @@ export function BasketReturnsChart({ apiBase, exportTrigger, mode, initialBasket
 }
 
 export function BasketSummary({ data, loading, basketName, apiBase, quarterDateRange, exportTrigger, analysisMode = 'intra', allBaskets, onBasketSelect }: BasketSummaryProps) {
-  const [tab, setTab] = useState<TabType>(analysisMode === 'cross' ? 'cross_returns' : 'breakout')
+  const [tab, setTab] = useState<TabType>(analysisMode === 'cross' ? 'cross_returns' : 'correlation')
   const [intraSearch, setIntraSearch] = useState('')
   const [intraSearchOpen, setIntraSearchOpen] = useState(false)
   const [intraSearchHighlight, setIntraSearchHighlight] = useState(0)
@@ -1864,7 +1717,7 @@ export function BasketSummary({ data, loading, basketName, apiBase, quarterDateR
     if (analysisMode === 'cross' && tab !== 'cross_returns' && tab !== 'single_returns') {
       setTab('cross_returns')
     } else if (analysisMode === 'intra' && (tab === 'cross_returns' || tab === 'single_returns')) {
-      setTab('breakout')
+      setTab('correlation')
     }
   }
 
@@ -1966,70 +1819,24 @@ export function BasketSummary({ data, loading, basketName, apiBase, quarterDateR
   if (loading) return <div className="summary-panel">{basketPickerBar}<div className="summary-loading">Loading basket analysis...</div></div>
   if (!data) return <div className="summary-panel">{basketPickerBar}<div className="summary-empty">No summary data</div></div>
 
-  const filterSignals = (key: 'breakout' | 'rotation' | 'btfd') =>
-    data.open_signals.filter(s => SIGNAL_FILTERS[key].includes(s.Signal_Type))
-  const filterClosed = (key: 'breakout' | 'rotation' | 'btfd') =>
-    (data.closed_signals || []).filter(s => SIGNAL_FILTERS[key].includes(s.Signal_Type))
-
-  const breakoutSignals = filterSignals('breakout')
-  const rotationSignals = filterSignals('rotation')
-  const btfdSignals = filterSignals('btfd')
-  const breakoutClosed = filterClosed('breakout')
-  const rotationClosed = filterClosed('rotation')
-  const btfdClosed = filterClosed('btfd')
-  const hasClosed = breakoutClosed.length > 0 || rotationClosed.length > 0 || btfdClosed.length > 0
-
-  const closedTabs: TabType[] = ['breakout_closed', 'rotation_closed', 'btfd_closed']
-  const activeTab = (!hasClosed && closedTabs.includes(tab)) ? 'breakout' : tab
-
   return (
     <div className="summary-panel">
       {basketPickerBar}
       <div className="summary-tabs">
-        <button className={`summary-tab ${activeTab === 'breakout' ? 'active' : ''}`} onClick={() => setTab('breakout')}>
-          LT Trend{hasClosed ? ' Open' : ''} ({breakoutSignals.length})
-        </button>
-        {hasClosed && (
-          <button className={`summary-tab ${activeTab === 'breakout_closed' ? 'active' : ''}`} onClick={() => setTab('breakout_closed')}>
-            LT Trend Closed ({breakoutClosed.length})
-          </button>
-        )}
-        <button className={`summary-tab ${activeTab === 'rotation' ? 'active' : ''}`} onClick={() => setTab('rotation')}>
-          ST Trend{hasClosed ? ' Open' : ''} ({rotationSignals.length})
-        </button>
-        {hasClosed && (
-          <button className={`summary-tab ${activeTab === 'rotation_closed' ? 'active' : ''}`} onClick={() => setTab('rotation_closed')}>
-            ST Trend Closed ({rotationClosed.length})
-          </button>
-        )}
-        <button className={`summary-tab ${activeTab === 'btfd' ? 'active' : ''}`} onClick={() => setTab('btfd')}>
-          BTFD/STFR{hasClosed ? ' Open' : ''} ({btfdSignals.length})
-        </button>
-        {hasClosed && (
-          <button className={`summary-tab ${activeTab === 'btfd_closed' ? 'active' : ''}`} onClick={() => setTab('btfd_closed')}>
-            BTFD/STFR Closed ({btfdClosed.length})
-          </button>
-        )}
-        <button className={`summary-tab ${activeTab === 'correlation' ? 'active' : ''}`} onClick={() => setTab('correlation')}>
+        <button className={`summary-tab ${tab === 'correlation' ? 'active' : ''}`} onClick={() => setTab('correlation')}>
           Correlation
         </button>
-        <button className={`summary-tab ${activeTab === 'returns' ? 'active' : ''}`} onClick={() => setTab('returns')}>
+        <button className={`summary-tab ${tab === 'returns' ? 'active' : ''}`} onClick={() => setTab('returns')}>
           Returns
         </button>
-        <button className={`summary-tab ${activeTab === 'contribution' ? 'active' : ''}`} onClick={() => setTab('contribution')}>
+        <button className={`summary-tab ${tab === 'contribution' ? 'active' : ''}`} onClick={() => setTab('contribution')}>
           Contribution
         </button>
       </div>
       <div className="summary-content">
-        {activeTab === 'breakout' && <SignalsTable signals={breakoutSignals} />}
-        {activeTab === 'breakout_closed' && <SignalsTable signals={breakoutClosed} showExitDate />}
-        {activeTab === 'rotation' && <SignalsTable signals={rotationSignals} />}
-        {activeTab === 'rotation_closed' && <SignalsTable signals={rotationClosed} showExitDate />}
-        {activeTab === 'btfd' && <SignalsTable signals={btfdSignals} />}
-        {activeTab === 'btfd_closed' && <SignalsTable signals={btfdClosed} showExitDate />}
-        {activeTab === 'correlation' && <CorrelationHeatmap data={data.correlation} basketName={basketName} apiBase={apiBase} quarterDateRange={quarterDateRange} />}
-        {activeTab === 'returns' && <ReturnsChart data={data.cumulative_returns} quarterDateRange={quarterDateRange} exportTrigger={exportTrigger} basketName={basketName} />}
-        {activeTab === 'contribution' && <ContributionChart basketName={basketName} apiBase={apiBase} quarterDateRange={quarterDateRange} exportTrigger={exportTrigger} />}
+        {tab === 'correlation' && <CorrelationHeatmap data={data.correlation} basketName={basketName} apiBase={apiBase} quarterDateRange={quarterDateRange} />}
+        {tab === 'returns' && <ReturnsChart data={data.cumulative_returns} quarterDateRange={quarterDateRange} exportTrigger={exportTrigger} basketName={basketName} />}
+        {tab === 'contribution' && <ContributionChart basketName={basketName} apiBase={apiBase} quarterDateRange={quarterDateRange} exportTrigger={exportTrigger} />}
       </div>
     </div>
   )

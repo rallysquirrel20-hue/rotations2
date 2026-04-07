@@ -136,11 +136,20 @@ const METRIC_DISPLAY: Record<string, string> = {
   Is_Breakout_Sequence: 'Long Term Uptrend', Uptrend_Pct: 'Breadth %',
   Breakout_Pct: 'Breakout %', Correlation_Pct: 'Correlation %',
   RV_EMA: 'Realized Vol', Volume: 'Volume', Return: 'Return',
+  // Basket-prefixed versions for constituents mode
+  'basket:Uptrend_Pct': 'Basket Breadth %', 'basket:Breakout_Pct': 'Basket Breakout %',
+  'basket:Correlation_Pct': 'Basket Correlation %', 'basket:RV_EMA': 'Basket Realized Vol',
+  'basket:Return': 'Basket Return', 'basket:Is_Breakout_Sequence': 'Basket LT Uptrend',
 }
 const BASKET_STAT_METRICS = ['Uptrend_Pct', 'Breakout_Pct', 'Correlation_Pct', 'RV_EMA', 'Return']
 const BASKET_BOOL_METRICS = ['Is_Breakout_Sequence']
 const TICKER_STAT_METRICS = ['Volume', 'RV_EMA', 'Return']
 const TICKER_BOOL_METRICS = ['Is_Breakout_Sequence']
+// Prefixed versions for the Basket optgroup in constituents mode
+const CONSTITUENTS_BASKET_STAT = BASKET_STAT_METRICS.map(m => `basket:${m}`)
+const CONSTITUENTS_BASKET_BOOL = BASKET_BOOL_METRICS.map(m => `basket:${m}`)
+function isBasketPrefixed(metric: string) { return metric.startsWith('basket:') }
+function stripBasketPrefix(metric: string) { return metric.replace(/^basket:/, '') }
 const LOOKBACK_PRESETS = [
   { label: '1M', value: 21 },
   { label: '3M', value: 63 },
@@ -1026,7 +1035,7 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
           trailing_stop_rv_multiple: l.stopSignal?.startsWith('trv_') ? parseFloat(l.stopSignal.slice(4)) : undefined,
           allocation_pct: isSingleLeg ? 1.0 : l.allocationPct / 100,
           position_size: l.positionSize / 100,
-          filters: l.filters.map(f => ({ ...f, lookback: f.lookback || 21 })),
+          filters: l.filters.map(f => ({ ...f, metric: stripBasketPrefix(f.metric), lookback: f.lookback || 21 })),
         })),
         start_date: startDate || null,
         end_date: endDate || null,
@@ -1244,6 +1253,7 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
       rows.push(['Leg', 'Ticker', 'Entry Date', 'Exit Date', 'Entry Price', 'Exit Price', 'Return', 'Bars Held', 'MFE', 'MAE'].join(','))
       for (const leg of result.legs) {
         for (const t of leg.trades) {
+          if (!t.regime_pass) continue
           rows.push([
             leg.target, t.ticker ?? '', t.entry_date, t.exit_date,
             t.entry_price?.toFixed(2) ?? '', t.exit_price?.toFixed(2) ?? '',
@@ -1935,6 +1945,7 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
   const [sortCol, setSortCol] = useState('entry_date')
   const [sortAsc, setSortAsc] = useState(true)
   const [tradesLegFilter, setTradesLegFilter] = useState(-1)
+  const [showAllTrades, setShowAllTrades] = useState(false)
 
   const allTrades = useMemo(() => {
     if (!result) return []
@@ -1945,8 +1956,12 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
     return trades
   }, [result])
 
+  const takenTrades = useMemo(() => allTrades.filter(t => t.regime_pass), [allTrades])
+  const hasFilters = result ? result.legs.some(l => l.trades.some(t => !t.regime_pass)) : false
+
   const filteredTrades = useMemo(() => {
-    const t = tradesLegFilter < 0 ? allTrades : allTrades.filter(x => x.legIdx === tradesLegFilter)
+    const base = showAllTrades ? allTrades : takenTrades
+    const t = tradesLegFilter < 0 ? base : base.filter(x => x.legIdx === tradesLegFilter)
     const col = sortCol
     const dir = sortAsc ? 1 : -1
     return [...t].sort((a: any, b: any) => {
@@ -1961,14 +1976,16 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
 
   // ── Filter helpers ──
   const addFilter = (legIdx: number) => {
-    const defaultMetric = legs[legIdx].targetType === 'basket' ? BASKET_STAT_METRICS[0] : TICKER_STAT_METRICS[0]
-    updateLeg(legIdx, { filters: [...legs[legIdx].filters, { metric: defaultMetric, condition: 'above', value: 50, source: 'self', lookback: 21 }] })
+    const leg = legs[legIdx]
+    const defaultMetric = leg.targetType === 'basket' ? BASKET_STAT_METRICS[0] : TICKER_STAT_METRICS[0]
+    updateLeg(legIdx, { filters: [...leg.filters, { metric: defaultMetric, condition: 'above', value: 50, source: 'self', lookback: 21 }] })
   }
   const removeFilter = (legIdx: number, fIdx: number) => {
     updateLeg(legIdx, { filters: legs[legIdx].filters.filter((_, i) => i !== fIdx) })
   }
-  const updateFilterField = (legIdx: number, fIdx: number, field: string, val: any) => {
-    const updated = legs[legIdx].filters.map((f, i) => i === fIdx ? { ...f, [field]: val } : f)
+  const updateFilterField = (legIdx: number, fIdx: number, field: string | Record<string, any>, val?: any) => {
+    const patch = typeof field === 'string' ? { [field]: val } : field
+    const updated = legs[legIdx].filters.map((f, i) => i === fIdx ? { ...f, ...patch } : f)
     updateLeg(legIdx, { filters: updated })
   }
 
@@ -2442,21 +2459,32 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
               {/* ── Trades tab ── */}
               {resultTab === 'trades' && (
                 <div style={{ padding: '8px 12px', overflowY: 'auto', flex: 1, minHeight: 0 }}>
-                  {resultIsMultiLeg && (
-                    <div style={{ display: 'flex', gap: 8, marginBottom: 8, alignItems: 'center' }}>
-                      <span style={{ fontSize: 12, fontWeight: 600 }}>Filter:</span>
-                      <button className={`summary-tab ${tradesLegFilter === -1 ? 'active' : ''}`}
-                        onClick={() => setTradesLegFilter(-1)}>All ({allTrades.length})</button>
-                      {result.legs.map((leg, i) => (
-                        <button key={i}
-                          className={`summary-tab ${tradesLegFilter === i ? 'active' : ''}`}
-                          style={{ borderBottomColor: tradesLegFilter === i ? LEG_COLORS[i] : undefined }}
-                          onClick={() => setTradesLegFilter(i)}>
-                          {leg.target} ({leg.trades.length})
-                        </button>
-                      ))}
-                    </div>
-                  )}
+                  <div style={{ display: 'flex', gap: 8, marginBottom: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                    {resultIsMultiLeg && (
+                      <>
+                        <span style={{ fontSize: 12, fontWeight: 600 }}>Leg:</span>
+                        <button className={`summary-tab ${tradesLegFilter === -1 ? 'active' : ''}`}
+                          onClick={() => setTradesLegFilter(-1)}>All</button>
+                        {result.legs.map((leg, i) => (
+                          <button key={i}
+                            className={`summary-tab ${tradesLegFilter === i ? 'active' : ''}`}
+                            style={{ borderBottomColor: tradesLegFilter === i ? LEG_COLORS[i] : undefined }}
+                            onClick={() => setTradesLegFilter(i)}>
+                            {leg.target}
+                          </button>
+                        ))}
+                      </>
+                    )}
+                    {hasFilters && (
+                      <>
+                        <span style={{ fontSize: 12, fontWeight: 600, marginLeft: resultIsMultiLeg ? 12 : 0 }}>Show:</span>
+                        <button className={`summary-tab ${!showAllTrades ? 'active' : ''}`}
+                          onClick={() => setShowAllTrades(false)}>Taken ({takenTrades.length})</button>
+                        <button className={`summary-tab ${showAllTrades ? 'active' : ''}`}
+                          onClick={() => setShowAllTrades(true)}>All ({allTrades.length})</button>
+                      </>
+                    )}
+                  </div>
                   <div className="summary-table-wrapper">
                     <table className="summary-table">
                       <thead>
@@ -2721,10 +2749,12 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
         <label className="backtest-label">Filters</label>
         {leg.filters.map((f, fi) => {
           const isBasket = leg.targetType === 'basket'
+          const isConstituents = leg.targetType === 'basket_tickers'
           const statMetrics = isBasket ? BASKET_STAT_METRICS : TICKER_STAT_METRICS
           const boolMetrics = isBasket ? BASKET_BOOL_METRICS : TICKER_BOOL_METRICS
-          const isBool = boolMetrics.includes(f.metric)
-          const isReturn = f.metric === 'Return'
+          const rawMetric = stripBasketPrefix(f.metric)
+          const isBool = [...BASKET_BOOL_METRICS, ...TICKER_BOOL_METRICS].includes(rawMetric)
+          const isReturn = rawMetric === 'Return'
           const showLookback = f.condition === 'increasing' || f.condition === 'decreasing' || isReturn
           return (
             <div key={fi} style={{ marginBottom: 6 }}>
@@ -2732,9 +2762,12 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
                 <select className="backtest-select" value={f.metric}
                   onChange={e => {
                     const m = e.target.value
-                    updateFilterField(i, fi, 'metric', m)
-                    if (boolMetrics.includes(m)) updateFilterField(i, fi, 'condition', 'equals_true')
-                    if (m === 'Return') updateFilterField(i, fi, 'lookback', 252)
+                    const raw = stripBasketPrefix(m)
+                    const patch: Record<string, any> = { metric: m }
+                    if (BASKET_BOOL_METRICS.includes(raw) || TICKER_BOOL_METRICS.includes(raw)) patch.condition = 'equals_true'
+                    if (raw === 'Return') patch.lookback = 252
+                    patch.source = isBasketPrefixed(m) ? leg.target : 'self'
+                    updateFilterField(i, fi, patch)
                   }}>
                   <optgroup label="Stat">
                     {statMetrics.map(m => <option key={m} value={m}>{METRIC_DISPLAY[m] || m}</option>)}
@@ -2742,6 +2775,16 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
                   <optgroup label="Boolean">
                     {boolMetrics.map(m => <option key={m} value={m}>{METRIC_DISPLAY[m] || m}</option>)}
                   </optgroup>
+                  {isConstituents && (
+                    <>
+                      <optgroup label="Basket">
+                        {CONSTITUENTS_BASKET_STAT.map(m => <option key={m} value={m}>{METRIC_DISPLAY[m] || m}</option>)}
+                      </optgroup>
+                      <optgroup label="Basket Boolean">
+                        {CONSTITUENTS_BASKET_BOOL.map(m => <option key={m} value={m}>{METRIC_DISPLAY[m] || m}</option>)}
+                      </optgroup>
+                    </>
+                  )}
                 </select>
                 <select className="backtest-select" value={f.condition}
                   onChange={e => updateFilterField(i, fi, 'condition', e.target.value)}>

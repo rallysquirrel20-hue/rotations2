@@ -48,19 +48,6 @@ class ErrorBoundary extends Component<{children: ReactNode}, {hasError: boolean,
 interface BasketsData { Themes: string[]; Sectors: string[]; Industries: string[]; }
 interface TickerWeight { symbol: string; weight: number; }
 interface LiveSignalTicker { symbol: string; signals: string[]; }
-interface OpenSignal {
-  Ticker: string
-  Signal_Type: string
-  Close: number | null
-  Current_Performance: number | null
-  Entry_Price: number | null
-  Win_Rate: number | null
-  Historical_EV: number | null
-  Risk_Adj_EV: number | null
-  Avg_Winner: number | null
-  Avg_Loser: number | null
-  Count: number
-}
 interface CorrelationData {
   labels: string[]
   matrix: (number | null)[][]
@@ -70,7 +57,6 @@ interface CumulativeReturnsData {
   series: { ticker: string; values: (number | null)[] }[]
 }
 interface BasketSummaryData {
-  open_signals: OpenSignal[]
   correlation: CorrelationData
   cumulative_returns: CumulativeReturnsData
 }

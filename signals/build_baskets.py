@@ -23,7 +23,7 @@ from config import (
     RISK_ADJ_MOM_CACHE_FILE,
     DIVIDEND_CACHE_FILE,
     SIZE_CACHE_FILE,
-    VOLUME_GROWTH_CACHE_FILE,
+    VOLUME_CACHE_FILE,
     SIGNALS_CACHE_FILE,
     WriteThroughPath,
     _quarter_end_from_key,
@@ -49,7 +49,7 @@ EQUITY_SIGNAL_LOGIC_VERSION = '2026-03-13-btfd-stfr-prev-trend'
 EQUITY_UNIVERSE_LOGIC_VERSION = '2026-04-01-target-quarter-keying'
 FORCE_REBUILD_EQUITY_CACHE = False
 BASKET_SIGNALS_CACHE_SCHEMA_VERSION = 1
-FORCE_REBUILD_BASKET_SIGNALS = True
+FORCE_REBUILD_BASKET_SIGNALS = False
 CHART_SCHEMA_VERSION = 2
 BENCHMARK_BASKETS = 0
 BENCHMARK_TIMING = True
@@ -1772,12 +1772,14 @@ def main():
     low_beta_universe = load_thematic_universe_from_disk(BETA_CACHE_FILE, 'low')
     momentum_universe = load_thematic_universe_from_disk(MOMENTUM_CACHE_FILE, 'winners')
     momentum_losers = load_thematic_universe_from_disk(MOMENTUM_CACHE_FILE, 'losers')
-    risk_adj_mom = load_thematic_universe_from_disk(RISK_ADJ_MOM_CACHE_FILE)
+    risk_adj_mom = load_thematic_universe_from_disk(RISK_ADJ_MOM_CACHE_FILE, 'winners')
+    risk_adj_mom_losers = load_thematic_universe_from_disk(RISK_ADJ_MOM_CACHE_FILE, 'losers')
     high_yield = load_thematic_universe_from_disk(DIVIDEND_CACHE_FILE, 'high_yield')
     div_growth = load_thematic_universe_from_disk(DIVIDEND_CACHE_FILE, 'growth')
     div_with_growth = load_thematic_universe_from_disk(DIVIDEND_CACHE_FILE, 'with_growth')
     size_universe = load_thematic_universe_from_disk(SIZE_CACHE_FILE)
-    vol_growth = load_thematic_universe_from_disk(VOLUME_GROWTH_CACHE_FILE)
+    vol_leaders = load_thematic_universe_from_disk(VOLUME_CACHE_FILE, 'leaders')
+    vol_losers = load_thematic_universe_from_disk(VOLUME_CACHE_FILE, 'losers')
     _, _, sector_universes, industry_universes = load_gics_from_disk()
 
     returns_matrix, ohlc_ret_matrices = _build_or_load_returns_matrix(all_signals_df)
@@ -1790,14 +1792,22 @@ def main():
         ('High Dividend Yield', high_yield, paths.thematic_charts, 'thematic'),
         ('Dividend Growth', div_growth, paths.thematic_charts, 'thematic'),
         ('Dividend with Growth', div_with_growth, paths.thematic_charts, 'thematic'),
-        ('Risk Adj Momentum', risk_adj_mom, paths.thematic_charts, 'thematic'),
+        ('Risk Adjusted Momentum', risk_adj_mom, paths.thematic_charts, 'thematic'),
+        ('Risk Adjusted Momentum Losers', risk_adj_mom_losers, paths.thematic_charts, 'thematic'),
         ('Size', size_universe, paths.thematic_charts, 'thematic'),
-        ('Volume Growth', vol_growth, paths.thematic_charts, 'thematic'),
+        ('Volume Leaders', vol_leaders, paths.thematic_charts, 'thematic'),
+        ('Volume Losers', vol_losers, paths.thematic_charts, 'thematic'),
     ]
     all_baskets += [(s, u, paths.sector_charts, 'sector') for s, u in sector_universes.items()]
-    all_baskets += [(ind, u, paths.industry_charts, 'industry') for ind, u in industry_universes.items()]
-
     override_force = args.force or FORCE_REBUILD_BASKET_SIGNALS
+    # On force rebuild: process all industries (full history). Otherwise: only current quarter.
+    current_key = get_current_quarter_key()
+    if override_force:
+        all_baskets += [(ind, u, paths.industry_charts, 'industry') for ind, u in industry_universes.items()]
+    else:
+        all_baskets += [(ind, u, paths.industry_charts, 'industry')
+                        for ind, u in industry_universes.items()
+                        if current_key in u and len(u[current_key]) > 0]
     total = len(all_baskets)
     limit = args.benchmark if args.benchmark > 0 else total
 
