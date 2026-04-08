@@ -1,6 +1,6 @@
 # Dependency Tree
 
-Updated: 2026-04-07 (volume YoY, risk-adj momentum losers, industry dollar volume filter)
+Updated: 2026-04-08 (Q2 correlation fix in _compute_within_basket_correlation)
 
 ## File Dependency Graph
 
@@ -155,7 +155,7 @@ Builds basket signals (OHLC + signals + breadth + correlation) for all baskets.
 | 274 | `compute_breadth_pivots(ema_values)` | Signal detection on breadth EMA |
 | 444 | `compute_equity_ohlc(...)` | Equal-weight basket OHLC with quarterly rebalance |
 | 940 | `compute_equity_ohlc_cached(...)` | Cached wrapper |
-| 1047 | `_compute_within_basket_correlation(...)` | 21-day rolling pairwise correlation |
+| 1047 | `_compute_within_basket_correlation(...)` | 21-day rolling pairwise correlation. Sparsity gate checks `sub_ret` (warmup + current quarter), not current-quarter slice — otherwise new quarters produce 0 rows until ~14 trading days elapse. |
 | 1196 | `_finalize_basket_signals_output(...)` | Merge OHLC + breadth + corr + contributions |
 | 1332 | `_compute_and_save_contributions(...)` | Per-constituent return contributions |
 | 1472 | `process_basket_signals(...)` | Main per-basket processor |

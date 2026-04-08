@@ -1,6 +1,6 @@
 # Monorepo Integration Map
 
-Updated: 2026-04-07 (industry dollar volume filter, thematic additions)
+Updated: 2026-04-08 (slug transform sync, /api/baskets/returns universe filtering, Q2 correlation fix)
 
 ## Data Flow
 
@@ -78,6 +78,9 @@ All files in `~/Documents/Python_Outputs/Data_Storage/` (configurable via `PYTHO
 | `{slug}_*_meta.json` | `build_baskets.py` | `/api/baskets/{name}` (weights) | state.weights, schema_version, data_sig |
 | `live_basket_signals_500.parquet` | `live_updates.py` | `/api/baskets/breadth` (live overlay), `/api/baskets/returns` | BasketName, Date, OHLCV |
 
+**BasketName → slug transform contract** (commit 97eb02c):
+`main.py` uses `_basket_name_to_slug()` to convert `BasketName` values (e.g. `"Industry: Aerospace & Defense"`) to cache file slugs (e.g. `Aerospace_and_Defense`). This helper mirrors `signals/build_baskets.py:_cache_slugify_label` exactly: strips the `"Industry: "` / `"Sector: "` / `"Theme: "` prefix, then applies `/→space`, `&→and`, `-→space`, `space→_`. **If either implementation changes its substitution rules, the other must be updated in lockstep** or the live overlay silently fails for any basket whose name contains `&`, `-`, or `/`. Three call sites in `main.py` use this helper: the `list_baskets` live overlay loop, the `get_basket_returns` `live_closes` loop, and the `get_basket_data` single-basket live row match.
+
 ### Other Files
 
 | File | Producer | Consumer | Purpose |
@@ -122,11 +125,17 @@ The GICS file (`gics_mappings_500.json`) only contains qualifying industries. Th
 | `/api/baskets` (sidebar) | Current quarter only (`_is_valid_basket`) |
 | `/api/baskets/breadth` (sidebar metrics) | Current quarter only (`_is_valid_basket`) |
 | `/api/baskets/compositions` | Full quarterly history (no filter — GICS file is the gate) |
-| `/api/baskets/returns`, analogs | All industries in GICS file (any quarter) |
+| `/api/baskets/returns` | **Default**: current-quarter active industries only (~17) via `_industries_for_quarter_range(None, None)`. **With `universe_start`/`universe_end` params** (quarter keys like `'2026 Q1'`): industries active in any quarter within the supplied range. Frontend `BasketReturnsChart` passes these params when `isQuarterMode` is active. **Behavior change (97eb02c)**: previously returned all ~50 historical industries regardless of params; now defaults to current quarter only. |
+| `/api/baskets/returns` (analogs) | All industries in GICS file (any quarter) — unchanged |
 | `/api/signals/log` | Current quarter only (`_is_valid_basket`) |
 
 Helper: `_is_valid_basket(slug)` — True for themes, sectors, and industries in current quarter's GICS.
+Helper: `_industries_for_quarter_range(start_qkey, end_qkey)` — reads `industry_u` and returns slugs active in any quarter within the range; falls back to `_get_valid_industry_slugs()` when both bounds are None.
 Helper: `_slug_to_gics_name(slug)` — handles `&` vs `and` mismatch (GICS uses `&`, slugs use `and`).
+Helper: `_basket_name_to_slug(bname)` — mirrors `signals/build_baskets.py:_cache_slugify_label`; see the "BasketName → slug transform contract" note above.
+
+**`Correlation_Pct` data-quality note** (commit 97eb02c):
+Before this commit, `{slug}_*_signals.parquet` contained `NaN` for `Correlation_Pct` during the first ~14 days of a new quarter because `_compute_within_basket_correlation` checked ticker sparsity against the current-quarter slice (needed ≥14 non-NA rows). The fix checks against `sub_ret` (warmup + current quarter) so Q2+ dates now populate correctly. No schema change — the column existed before. Existing parquets are back-filled on the next `build_baskets.py` incremental run, which re-runs `_finalize_basket_signals_output` on the full merged history.
 
 ### Build filtering
 - **Daily incremental** (`build_baskets.py`): only processes current-quarter industries (~17) + themes + sectors = ~38 baskets
