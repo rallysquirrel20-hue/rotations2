@@ -28,6 +28,7 @@ interface BasketSummaryProps {
   basketName: string
   apiBase: string
   quarterDateRange?: { from: string; to: string } | null
+  universeQuarters?: { start: string; end: string } | null
   exportTrigger?: number
   analysisMode?: 'intra' | 'cross'
   allBaskets?: BasketsData
@@ -1001,7 +1002,7 @@ function applyPreset(preset: typeof BASKET_RETURN_PRESETS[number], maxDate: stri
   return { start: start < minDate ? minDate : start, end }
 }
 
-export function BasketReturnsChart({ apiBase, exportTrigger, mode, initialBasket }: { apiBase: string; exportTrigger?: number; mode: BasketReturnMode; initialBasket?: string }) {
+export function BasketReturnsChart({ apiBase, exportTrigger, mode, initialBasket, universeQuarters }: { apiBase: string; exportTrigger?: number; mode: BasketReturnMode; initialBasket?: string; universeQuarters?: { start: string; end: string } | null }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const barGeoRef = useRef<{ padLeft: number; padRight: number; barW: number; gap: number; n: number } | null>(null)
@@ -1046,10 +1047,17 @@ export function BasketReturnsChart({ apiBase, exportTrigger, mode, initialBasket
     return availableBaskets.filter(b => b.toLowerCase().replace(/_/g, ' ').includes(q) || b.toLowerCase().includes(q))
   }, [basketSearch, availableBaskets])
 
-  // Fetch date bounds on mount
+  // Fetch date bounds on mount (and whenever the universe window changes,
+  // since the available-baskets list and date range may shift)
   useEffect(() => {
     if (!apiBase) return
-    axios.get(`${apiBase}/baskets/returns`)
+    const params = new URLSearchParams()
+    if (universeQuarters) {
+      params.set('universe_start', universeQuarters.start)
+      params.set('universe_end', universeQuarters.end)
+    }
+    const qs = params.toString()
+    axios.get(`${apiBase}/baskets/returns${qs ? '?' + qs : ''}`)
       .then(res => {
         const dr = res.data.date_range
         if (dr) {
@@ -1067,7 +1075,7 @@ export function BasketReturnsChart({ apiBase, exportTrigger, mode, initialBasket
         }
       })
       .catch(() => {})
-  }, [apiBase])
+  }, [apiBase, universeQuarters?.start, universeQuarters?.end])
 
   // Fetch data when params change
   useEffect(() => {
@@ -1076,6 +1084,10 @@ export function BasketReturnsChart({ apiBase, exportTrigger, mode, initialBasket
     if (mode === 'cross') {
       if (chartView === 'line') {
         const params = new URLSearchParams({ start: startDate, end: endDate, mode: 'cumulative', group, metric })
+        if (universeQuarters) {
+          params.set('universe_start', universeQuarters.start)
+          params.set('universe_end', universeQuarters.end)
+        }
         axios.get(`${apiBase}/baskets/returns?${params}`)
           .then(res => {
             setCumDates(res.data.dates || [])
@@ -1088,6 +1100,10 @@ export function BasketReturnsChart({ apiBase, exportTrigger, mode, initialBasket
           .finally(() => setLoading(false))
       } else {
         const params = new URLSearchParams({ start: startDate, end: endDate, mode: 'period', group, metric })
+        if (universeQuarters) {
+          params.set('universe_start', universeQuarters.start)
+          params.set('universe_end', universeQuarters.end)
+        }
         axios.get(`${apiBase}/baskets/returns?${params}`)
           .then(res => {
             const sorted = (res.data.baskets || []).sort((a: BasketReturnItem, b: BasketReturnItem) => a.return - b.return)
@@ -1110,7 +1126,7 @@ export function BasketReturnsChart({ apiBase, exportTrigger, mode, initialBasket
         .catch(() => { setDailyDates([]); setDailyReturns([]) })
         .finally(() => setLoading(false))
     }
-  }, [apiBase, startDate, endDate, mode, group, dailyBasket, chartView, barPeriod, metric])
+  }, [apiBase, startDate, endDate, mode, group, dailyBasket, chartView, barPeriod, metric, universeQuarters?.start, universeQuarters?.end])
 
   // ResizeObserver
   useEffect(() => {
@@ -1692,7 +1708,7 @@ export function BasketReturnsChart({ apiBase, exportTrigger, mode, initialBasket
   )
 }
 
-export function BasketSummary({ data, loading, basketName, apiBase, quarterDateRange, exportTrigger, analysisMode = 'intra', allBaskets, onBasketSelect }: BasketSummaryProps) {
+export function BasketSummary({ data, loading, basketName, apiBase, quarterDateRange, universeQuarters, exportTrigger, analysisMode = 'intra', allBaskets, onBasketSelect }: BasketSummaryProps) {
   const [tab, setTab] = useState<TabType>(analysisMode === 'cross' ? 'cross_returns' : 'correlation')
   const [intraSearch, setIntraSearch] = useState('')
   const [intraSearchOpen, setIntraSearchOpen] = useState(false)
@@ -1735,7 +1751,7 @@ export function BasketSummary({ data, loading, basketName, apiBase, quarterDateR
           </button>
         </div>
         <div className="summary-content">
-          <BasketReturnsChart apiBase={apiBase} exportTrigger={exportTrigger} mode={crossTab === 'cross_returns' ? 'cross' : 'daily'} />
+          <BasketReturnsChart apiBase={apiBase} exportTrigger={exportTrigger} mode={crossTab === 'cross_returns' ? 'cross' : 'daily'} universeQuarters={universeQuarters ?? null} />
         </div>
       </div>
     )

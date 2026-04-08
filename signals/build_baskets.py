@@ -1078,8 +1078,11 @@ def _compute_within_basket_correlation(universe_by_qtr, returns_matrix, window=2
         if len(sub_ret) < window:
             continue
 
-        q_data = sub_ret.loc[q_start:]
-        valid_tickers = [t for t in tickers if q_data[t].notna().sum() >= min_obs]
+        # Check against the full sub_ret (warmup + current quarter). Checking
+        # only current-quarter data breaks at the start of a new quarter before
+        # min_obs trading days have elapsed — the per-window col_valid check
+        # below already handles sparse rolling windows correctly.
+        valid_tickers = [t for t in tickers if sub_ret[t].notna().sum() >= min_obs]
         if len(valid_tickers) < 2:
             continue
         sub_ret = sub_ret[valid_tickers]

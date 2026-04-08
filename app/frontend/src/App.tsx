@@ -1391,7 +1391,7 @@ function App() {
                 exportTrigger={exportTrigger}
               />
             ) : showSummary ? (
-              <BasketSummary data={summaryData} loading={summaryLoading} basketName={intraBasketTarget} apiBase={API_BASE} quarterDateRange={isQuarterMode ? quarterToDateRange(quarterStart, quarterEnd) : null} exportTrigger={exportTrigger} analysisMode={showSummary as 'intra' | 'cross'} allBaskets={baskets} onBasketSelect={setIntraBasketTarget} />
+              <BasketSummary data={summaryData} loading={summaryLoading} basketName={intraBasketTarget} apiBase={API_BASE} quarterDateRange={isQuarterMode ? quarterToDateRange(quarterStart, quarterEnd) : null} universeQuarters={isQuarterMode ? { start: quarterStart, end: quarterEnd } : null} exportTrigger={exportTrigger} analysisMode={showSummary as 'intra' | 'cross'} allBaskets={baskets} onBasketSelect={setIntraBasketTarget} />
             ) : (
             <div className="chart-container">
             {chartData && chartData.length > 0 ? (

@@ -119,6 +119,38 @@ def _is_valid_basket(slug):
     return slug in _get_valid_industry_slugs()
 
 
+def _industries_for_quarter_range(start_qkey=None, end_qkey=None):
+    """Return industry slugs that were in the top-dollar-volume universe for
+    any quarter within [start_qkey, end_qkey].
+
+    When neither bound is provided, falls back to the current-quarter cache.
+    Quarter keys are strings like '2026 Q1' (same format as industry_u keys).
+    String comparison works since the format is lexicographically ordered.
+    """
+    if not start_qkey and not end_qkey:
+        return _get_valid_industry_slugs()
+    if not GICS_MAPPINGS_FILE.exists():
+        return set()
+    try:
+        with open(GICS_MAPPINGS_FILE, 'r') as f:
+            gics = json.load(f)
+    except Exception:
+        return set()
+    result = set()
+    for name, qmap in gics.get('industry_u', {}).items():
+        slug = name.replace(" ", "_").replace("&", "and")
+        for q, tickers in qmap.items():
+            if not tickers:
+                continue
+            if start_qkey and q < start_qkey:
+                continue
+            if end_qkey and q > end_qkey:
+                continue
+            result.add(slug)
+            break
+    return result
+
+
 def _read_live_parquet(path):
     """Read a live parquet file. Returns None if missing, empty, or contains empty dict."""
     if not path.exists():
@@ -130,6 +162,15 @@ def _read_live_parquet(path):
         return df
     except Exception:
         return None
+
+
+def _basket_name_to_slug(bname):
+    """Convert a live BasketName (e.g. 'Industry: Aerospace & Defense') to the
+    cache file slug (e.g. 'Aerospace_and_Defense'). Must mirror
+    signals/build_baskets.py:_cache_slugify_label exactly.
+    """
+    raw = bname.split(': ', 1)[-1] if ': ' in bname else bname
+    return raw.replace('/', ' ').replace('&', 'and').replace('-', ' ').replace(' ', '_')
 
 
 def _live_is_current(live_df, norgate_max_date):
@@ -694,15 +735,20 @@ def get_basket_breadth():
                 norgate_max_date = pd.to_datetime(_bdf['Date']).max()
         if live_basket_df is not None and _live_is_current(live_basket_df, norgate_max_date):
             name_col = 'BasketName' if 'BasketName' in live_basket_df.columns else 'Basket'
+            # Build {file_slug: row} lookup once to avoid per-entry scans and to
+            # handle '&'/'-'/'/' name normalization consistently with the cache.
+            live_slug_map = {
+                _basket_name_to_slug(r[name_col]): r
+                for _, r in live_basket_df.iterrows()
+            }
             for slug, entry in result.items():
                 pivots = entry.get('_pivots')
                 if not pivots:
                     continue
-                basket_name_spaced = slug.replace('_', ' ')
-                live_row = live_basket_df[live_basket_df[name_col].str.endswith(basket_name_spaced)]
-                if live_row.empty:
+                live_row_data = live_slug_map.get(slug)
+                if live_row_data is None:
                     continue
-                lc = float(live_row.iloc[0]['Close'])
+                lc = float(live_row_data['Close'])
 
                 prev_res = pivots['Resistance_Pivot']
                 prev_sup = pivots['Support_Pivot']
@@ -744,25 +790,27 @@ logger.info(f"DATA_STORAGE: {DATA_STORAGE} (exists={DATA_STORAGE.exists()})")
 logger.info(f"INDIVIDUAL_SIGNALS_FILE: {INDIVIDUAL_SIGNALS_FILE} (exists={INDIVIDUAL_SIGNALS_FILE.exists()})")
 
 @app.get("/api/baskets/returns")
-def get_basket_returns(start: str = None, end: str = None, mode: str = "period", basket: str = None, group: str = "all", top_n: int = 10, threshold: float = 0.0, conditions: str = None, bar_period: str = "1D", metric: str = "returns"):
-    """Cross-basket period returns or single-basket daily returns time series."""
+def get_basket_returns(start: str = None, end: str = None, mode: str = "period", basket: str = None, group: str = "all", top_n: int = 10, threshold: float = 0.0, conditions: str = None, bar_period: str = "1D", metric: str = "returns", universe_start: str = None, universe_end: str = None):
+    """Cross-basket period returns or single-basket daily returns time series.
+
+    Industries are filtered to the current-quarter dollar-volume universe by
+    default. Pass ``universe_start``/``universe_end`` (quarter keys like
+    ``'2026 Q1'``) to include industries that were active in any quarter
+    within that range — used when the frontend's universe filter is active.
+    """
     t_names = list(THEMATIC_CONFIG.keys())
     s_names = ["Communication_Services", "Consumer_Discretionary", "Consumer_Staples", "Energy", "Financials", "Health_Care", "Industrials", "Information_Technology", "Materials", "Real_Estate", "Utilities"]
 
-    # Discover all basket slugs — only include industries that are in the GICS file
-    # (pre-filtered by dollar volume during universe build)
-    _gics_industry_slugs = set()
-    if GICS_MAPPINGS_FILE.exists():
-        with open(GICS_MAPPINGS_FILE, 'r') as f:
-            _gi = json.load(f)
-        _gics_industry_slugs = {n.replace(" ", "_").replace("&", "and") for n in _gi.get('industry_u', {})}
+    # Resolve the valid industry set for the requested universe window. Themes
+    # and sectors are always included (not filtered by dollar volume).
+    _valid_industry_slugs = _industries_for_quarter_range(universe_start, universe_end)
     all_slugs = set()
     for folder in BASKET_CACHE_FOLDERS:
         if not folder.exists():
             continue
         for f in folder.glob("*_of_*_signals.parquet"):
             slug = re.sub(r'(_\d+)?_of_\d+_signals$', '', f.stem)
-            if slug in t_names or slug in s_names or slug in _gics_industry_slugs:
+            if slug in t_names or slug in s_names or slug in _valid_industry_slugs:
                 all_slugs.add(slug)
 
     def _categorize(slug):
@@ -800,8 +848,8 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
             name_col = 'BasketName' if 'BasketName' in live_basket_df.columns else 'Basket'
             for _, row in live_basket_df.iterrows():
                 bname = row[name_col]
-                # "Theme: High Beta" -> "High_Beta", "Sector: Financials" -> "Financials"
-                slug_candidate = bname.split(': ', 1)[-1].replace(' ', '_') if ': ' in bname else bname.replace(' ', '_')
+                # "Theme: High Beta" -> "High_Beta", "Industry: Aerospace & Defense" -> "Aerospace_and_Defense"
+                slug_candidate = _basket_name_to_slug(bname)
                 live_closes[slug_candidate] = (pd.to_datetime(row['Date']), float(row['Close']))
     except Exception:
         pass
@@ -1880,8 +1928,10 @@ def get_basket_data(basket_name: str):
         live_basket_df = _read_live_parquet(LIVE_BASKET_SIGNALS_FILE)
         if live_basket_df is not None and _live_is_current(live_basket_df, df['Date'].max()):
             name_col = 'BasketName' if 'BasketName' in live_basket_df.columns else 'Basket'
-            basket_name_spaced = basket_name.replace('_', ' ')
-            live_row = live_basket_df[live_basket_df[name_col].str.endswith(basket_name_spaced)]
+            # Match by forward-normalized slug (handles '&'/'-'/'/' the same way
+            # signals/build_baskets.py:_cache_slugify_label does).
+            _slug_mask = live_basket_df[name_col].apply(_basket_name_to_slug) == basket_name
+            live_row = live_basket_df[_slug_mask]
             if not live_row.empty:
                 live_row = live_row.copy()
                 live_row['Date'] = pd.to_datetime(live_row['Date'])
