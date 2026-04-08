@@ -105,6 +105,18 @@ Completed sub-goals:
 - Signals: CSV with full filter description (universe, period, signal types, status, count)
 - Remaining: Intrabasket tab exports (signals tables, correlation heatmap, returns chart, contribution chart) need implementation
 
+### 20. Sidebar universe filter parity (2026-04-08)
+`list_baskets` (`/api/baskets`) always shows current-quarter industries via `_is_valid_basket()`. When the top-right universe filter is active, the sidebar should show industries that qualified in any quarter of the selected window — matching the behavior now implemented in `/api/baskets/returns` via `universe_start`/`universe_end` params. Add the same param pattern to `list_baskets` and thread `universeQuarters` into the sidebar fetch.
+
+### 21. `_valid_industries_cache` invalidation (2026-04-08)
+`main.py:_get_valid_industry_slugs` caches the current-quarter set to a process-lifetime global. This won't auto-refresh across quarter boundaries without a backend restart. Add mtime-based invalidation keyed to `gics_mappings_500.json` so the cache rebuilds when `build_universes.py` writes a new file.
+
+### 22. Biotechnology Q3 2026 anomaly in industry_u (2026-04-08)
+Noticed `gics_mappings_500.json` has odd gaps in `industry_u['Biotechnology']`: `[..., '2025 Q3', '2026 Q1', '2026 Q3']` — Q3 2026 is a future quarter that shouldn't exist yet. Several other industries have similar patterns (missing Q2 but having Q1 and Q3, or having future-quarter entries). Looks like an off-by-one or stale entry in `build_universes.py` — possibly in `_offset_key`, `_next_qtr`, or `_build_gics` quarterization. Worth investigating since it's the data source for the universe filter.
+
+### 23. PM2 Python requirements file (2026-04-08)
+The PM2 loop processes use the system Python 3.14 at `%LOCALAPPDATA%\Python\pythoncore-3.14-64\python.exe`, not the backend venv. `exchange_calendars` wasn't installed there, causing rot-live, rot-signals, and rot-universes to crash-loop silently. Add a `requirements-pm2.txt` (or document the PM2 Python env separately) listing at minimum `exchange_calendars`, `databento`, `pyarrow`, `numba`, `python-dotenv`. The current packaging split between backend venv and system Python is easy to miss.
+
 ### ~~19. Analogs Tab (Cross-Basket Analysis)~~ — COMPLETED (2026-03-18)
 ~~Add an "Analogs" tab to the cross-basket analysis panel.~~
 - **19a.** ~~Add all relevant factors (same list as backtesting filters)~~ — Multi-timeframe return fingerprints (1D/1W/1M/1Q/1Y/3Y/5Y) with cross-basket rolling correlation
