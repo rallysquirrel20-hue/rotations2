@@ -454,7 +454,9 @@ def _build_dividends(quarter_universe):
         df = _fetch_prices(ticker, norgatedata.StockPriceAdjustmentType.CAPITALSPECIAL)
         if df is None or 'Dividend' not in df.columns:
             return None
-        t12 = df['Dividend'].fillna(0.0).rolling(252, min_periods=1).sum()
+        # Time-based rolling: 365 calendar days. Matches build_dividend_metrics.py
+        # so universe selection and displayed metrics use the same TTM definition.
+        t12 = df['Dividend'].fillna(0.0).rolling('365D').sum()
         q = t12.resample('QE-DEC').last()
         q = q[q > 0]
         return q if not q.empty else None

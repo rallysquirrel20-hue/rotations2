@@ -25,6 +25,7 @@ from config import (
     SIZE_CACHE_FILE,
     VOLUME_CACHE_FILE,
     SIGNALS_CACHE_FILE,
+    DIVIDEND_METRICS_CACHE_FILE,
     WriteThroughPath,
     _quarter_end_from_key,
     _quarter_start_from_key,
@@ -1751,6 +1752,134 @@ def _print_timing_summary():
 
 
 # ---------------------------------------------------------------------------
+# Per-basket dividend series (post-pass after basket processing)
+# ---------------------------------------------------------------------------
+
+def _compute_basket_dividend_series(contrib_df, div_metrics_by_ticker):
+    """Compute per-date basket-level yield, growth, and payer coverage.
+
+    contrib_df: long-form [Date, Ticker, Weight_BOD, ...]
+    div_metrics_by_ticker: DataFrame [Date, Ticker, Dividend_Yield, Div_Growth_1Y]
+                          pre-filtered to the basket's ticker set.
+
+    Aggregation convention (per project memory): non-payers contribute 0 to both
+    yield and growth. No coverage threshold -- headline values are always the
+    honest weighted sum including zeros.
+
+    Returns DataFrame [Date, Basket_Yield, Basket_Div_Growth, Payer_Coverage].
+    """
+    if contrib_df is None or contrib_df.empty:
+        return pd.DataFrame(columns=['Date', 'Basket_Yield', 'Basket_Div_Growth', 'Payer_Coverage'])
+
+    cols = ['Date', 'Ticker', 'Weight_BOD']
+    left = contrib_df[[c for c in cols if c in contrib_df.columns]].copy()
+    left['Date'] = pd.to_datetime(left['Date']).dt.normalize()
+
+    if div_metrics_by_ticker is None or div_metrics_by_ticker.empty:
+        merged = left.copy()
+        merged['Dividend_Yield'] = 0.0
+        merged['Div_Growth_1Y'] = 0.0
+    else:
+        right = div_metrics_by_ticker[['Date', 'Ticker', 'Dividend_Yield', 'Div_Growth_1Y']].copy()
+        right['Date'] = pd.to_datetime(right['Date']).dt.normalize()
+        merged = left.merge(right, on=['Date', 'Ticker'], how='left')
+        merged['Dividend_Yield'] = merged['Dividend_Yield'].fillna(0.0)
+        merged['Div_Growth_1Y'] = merged['Div_Growth_1Y'].fillna(0.0)
+
+    w = merged['Weight_BOD'].astype('float64')
+    merged['_w_yld']    = w * merged['Dividend_Yield'].astype('float64')
+    merged['_w_growth'] = w * merged['Div_Growth_1Y'].astype('float64')
+    merged['_w_payer']  = w * (merged['Dividend_Yield'] > 0).astype('float64')
+
+    series = merged.groupby('Date', as_index=False).agg(
+        Basket_Yield=('_w_yld', 'sum'),
+        Basket_Div_Growth=('_w_growth', 'sum'),
+        Payer_Coverage=('_w_payer', 'sum'),
+    )
+    for col in ('Basket_Yield', 'Basket_Div_Growth', 'Payer_Coverage'):
+        series[col] = series[col].astype('float32')
+    return series.sort_values('Date').reset_index(drop=True)
+
+
+def _build_all_basket_dividend_series(verbose=True):
+    """Post-pass: for every {slug}*_contributions.parquet across all basket cache
+    folders, produce a matching {slug}*_dividend_series.parquet by joining with
+    per-ticker dividend metrics and weighted-summing using Weight_BOD.
+
+    Idempotent. Missing dividend_metrics_500.parquet is a no-op with a warning.
+    """
+    t0 = time.perf_counter()
+    if not DIVIDEND_METRICS_CACHE_FILE.exists():
+        print(f"[dividends] SKIP: {DIVIDEND_METRICS_CACHE_FILE.name} not found "
+              f"-- run build_dividend_metrics.py first")
+        return
+    div_all = pd.read_parquet(DIVIDEND_METRICS_CACHE_FILE)
+    if 'Source' in div_all.columns:
+        div_all = div_all[div_all['Source'] != 'live']
+    keep = [c for c in ['Date', 'Ticker', 'Dividend_Yield', 'Div_Growth_1Y'] if c in div_all.columns]
+    div_all = div_all[keep].copy()
+    div_all['Date'] = pd.to_datetime(div_all['Date']).dt.normalize()
+
+    # Ticker-indexed lookup for fast per-basket filtering
+    div_by_ticker = dict(tuple(div_all.groupby('Ticker', sort=False)))
+
+    folders = [paths.thematic_basket_cache, paths.sector_basket_cache, paths.industry_basket_cache]
+    total_ok = 0
+    total_skipped = 0
+    total_failed = 0
+    for folder in folders:
+        if not folder.exists():
+            continue
+        for contrib_path in folder.glob('*_contributions.parquet'):
+            out_path = contrib_path.with_name(
+                contrib_path.name.replace('_contributions.parquet', '_dividend_series.parquet')
+            )
+            try:
+                contrib_df = pd.read_parquet(contrib_path, columns=['Date', 'Ticker', 'Weight_BOD'])
+            except Exception as exc:
+                total_failed += 1
+                if verbose:
+                    print(f"[dividends] FAIL read {contrib_path.name}: {exc}")
+                continue
+            if contrib_df.empty:
+                total_skipped += 1
+                continue
+
+            tickers = contrib_df['Ticker'].unique()
+            frames = [div_by_ticker[t] for t in tickers if t in div_by_ticker]
+            sub = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
+                columns=['Date', 'Ticker', 'Dividend_Yield', 'Div_Growth_1Y']
+            )
+
+            try:
+                series = _compute_basket_dividend_series(contrib_df, sub)
+            except Exception as exc:
+                total_failed += 1
+                if verbose:
+                    print(f"[dividends] FAIL compute {contrib_path.name}: {exc}")
+                continue
+            if series.empty:
+                total_skipped += 1
+                continue
+
+            series['Source'] = 'norgate'
+            tmp = out_path.with_suffix('.parquet.tmp')
+            try:
+                series.to_parquet(tmp, index=False, compression='snappy')
+                tmp.replace(out_path)
+                WriteThroughPath(out_path).sync()
+                total_ok += 1
+            except Exception as exc:
+                total_failed += 1
+                if verbose:
+                    print(f"[dividends] FAIL write {out_path.name}: {exc}")
+
+    elapsed = time.perf_counter() - t0
+    print(f"[dividends] Post-pass: {total_ok} written, {total_skipped} empty, "
+          f"{total_failed} failed ({elapsed:.1f}s)")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1825,6 +1954,10 @@ def main():
         )
 
     print(f"\nAll {min(limit, total)} baskets processed.")
+
+    # Post-pass: basket-level dividend yield + growth series, derived from
+    # {slug}_*_contributions.parquet + dividend_metrics_500.parquet
+    _build_all_basket_dividend_series()
 
     if (BENCHMARK_TIMING or args.benchmark > 0) and _basket_timing_names:
         _print_timing_summary()

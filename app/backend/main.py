@@ -71,6 +71,8 @@ ETF_UNIVERSES_FILE = DATA_STORAGE / "etf_universes_50.json"
 ETF_SIGNALS_FILE = DATA_STORAGE / "signals_etf_50.parquet"
 ETF_LIVE_SIGNALS_FILE = DATA_STORAGE / "live_signals_etf_50.parquet"
 TICKER_NAMES_FILE = DATA_STORAGE / "ticker_names.json"
+DIVIDEND_METRICS_FILE = DATA_STORAGE / "dividend_metrics_500.parquet"
+DIVIDEND_METRICS_ETF_FILE = DATA_STORAGE / "dividend_metrics_etf_50.parquet"
 
 THEMATIC_CONFIG = {
     "High_Beta": ("beta_universes_500.json", "high"),
@@ -1964,6 +1966,29 @@ def get_basket_data(basket_name: str):
                     df = pd.concat([df, live_row], ignore_index=True)
                     df = df.drop_duplicates(subset=['Date'], keep='last')
 
+        # --- Merge basket dividend series (Basket_Yield -> Dividend_Yield, etc.) ---
+        # Uses same column names as the ticker endpoint so TVChart reads both uniformly.
+        div_series_file = _find_basket_dividend_series(basket_name)
+        if div_series_file and div_series_file.exists():
+            try:
+                div_df = pd.read_parquet(div_series_file)
+                div_df['Date'] = pd.to_datetime(div_df['Date'])
+                rename_map = {'Basket_Yield': 'Dividend_Yield', 'Basket_Div_Growth': 'Div_Growth_1Y'}
+                keep_cols = [c for c in ['Date'] + list(rename_map.keys()) + ['Payer_Coverage']
+                             if c in div_df.columns]
+                div_df = div_df[keep_cols].rename(columns=rename_map)
+                df = df.merge(div_df, on='Date', how='left')
+                # Live basket bar (past latest series date) lacks dividend data -- step 4
+                # will recompute live yield from weighted TTM/live_close. For now, forward-fill
+                # so the chart doesn't end with a NaN dip on the live bar. The series is
+                # dense across historical dates, so ffill only fires on the trailing edge.
+                df = df.sort_values('Date').reset_index(drop=True)
+                for col in ('Dividend_Yield', 'Div_Growth_1Y', 'Payer_Coverage'):
+                    if col in df.columns:
+                        df[col] = df[col].ffill()
+            except Exception:
+                pass  # non-fatal: chart works without dividend columns
+
         current_weights = get_basket_weights_from_contributions(basket_name)
         if current_weights:
             tickers = sorted([{"symbol": s, "weight": float(w)} for s, w in current_weights.items()], key=lambda x: x['weight'], reverse=True)
@@ -2408,6 +2433,36 @@ def get_ticker_data(ticker: str):
                             live_bar = pd.DataFrame([new_row])
                             live_bar['Source'] = 'live'
                             df = pd.concat([df, live_bar], ignore_index=True)
+
+        # --- Merge dividend metrics (Dividend_Yield, TTM_Dividends, Div_Growth_1Y) ---
+        div_file = DIVIDEND_METRICS_ETF_FILE if signals_file == ETF_SIGNALS_FILE else DIVIDEND_METRICS_FILE
+        if div_file.exists():
+            try:
+                div_df = pd.read_parquet(div_file, filters=[('Ticker', '==', ticker)])
+                if not div_df.empty:
+                    div_df['Date'] = pd.to_datetime(div_df['Date'])
+                    div_cols = [c for c in ['Date', 'Dividend_Yield', 'TTM_Dividends', 'Div_Growth_1Y']
+                                if c in div_df.columns]
+                    df = df.merge(div_df[div_cols], on='Date', how='left')
+                    # Live bar (past latest Norgate date) lacks dividend columns from merge:
+                    # forward-fill TTM + growth, recompute yield from live close.
+                    if 'Source' in df.columns and (df['Source'] == 'live').any():
+                        df = df.sort_values('Date').reset_index(drop=True)
+                        for col in ('TTM_Dividends', 'Div_Growth_1Y'):
+                            if col in df.columns:
+                                df[col] = df[col].ffill()
+                        if 'TTM_Dividends' in df.columns and 'Close' in df.columns:
+                            if 'Dividend_Yield' not in df.columns:
+                                df['Dividend_Yield'] = np.nan
+                            for idx in df.index[df['Source'] == 'live']:
+                                close_v = df.at[idx, 'Close']
+                                ttm_v = df.at[idx, 'TTM_Dividends']
+                                if pd.notna(close_v) and pd.notna(ttm_v) and float(close_v) > 0:
+                                    df.at[idx, 'Dividend_Yield'] = float(ttm_v) / float(close_v)
+                                else:
+                                    df.at[idx, 'Dividend_Yield'] = 0.0
+            except Exception:
+                pass  # non-fatal: chart still works without dividend columns
 
         df['Date'] = df['Date'].dt.strftime('%Y-%m-%d')
         return {"chart_data": clean_data_for_json(df.sort_values('Date')), "tickers": []}
@@ -2969,6 +3024,19 @@ def _find_basket_contributions(slug):
         matches = list(folder.glob(f'{slug}_*_of_*_contributions.parquet'))
         if not matches:
             matches = list(folder.glob(f'{slug}_of_*_contributions.parquet'))
+        if matches:
+            return matches[0]
+    return None
+
+
+def _find_basket_dividend_series(slug):
+    """Glob for a basket dividend series parquet by slug prefix across basket cache folders."""
+    for folder in BASKET_CACHE_FOLDERS:
+        if not folder.exists():
+            continue
+        matches = list(folder.glob(f'{slug}_*_of_*_dividend_series.parquet'))
+        if not matches:
+            matches = list(folder.glob(f'{slug}_of_*_dividend_series.parquet'))
         if matches:
             return matches[0]
     return None

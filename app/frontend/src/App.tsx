@@ -122,6 +122,8 @@ function App() {
   const [showBreakout, setShowBreakout] = useState(true)
   const [showCorrelation, setShowCorrelation] = useState(true)
   const [showRV, setShowRV] = useState(true)
+  const [showYield, setShowYield] = useState(false)
+  const [showDivGrowth, setShowDivGrowth] = useState(false)
   const [showCandleDetail, setShowCandleDetail] = useState(true)
   const [indicatorMenuOpen, setIndicatorMenuOpen] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(460)
@@ -1263,6 +1265,8 @@ function App() {
                       {!isBasketView && (
                         <>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showRV} onChange={e => setShowRV(e.target.checked)} /> RV%</label>
+                          <label className="overlay-checkbox"><input type="checkbox" checked={showYield} onChange={e => setShowYield(e.target.checked)} /> Yield%</label>
+                          <label className="overlay-checkbox"><input type="checkbox" checked={showDivGrowth} onChange={e => setShowDivGrowth(e.target.checked)} /> Div Growth%</label>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showVolume} onChange={e => setShowVolume(e.target.checked)} /> Volume</label>
                         </>
                       )}
@@ -1272,6 +1276,8 @@ function App() {
                           <label className="overlay-checkbox"><input type="checkbox" checked={showBreakout} onChange={e => setShowBreakout(e.target.checked)} /> Breakout%</label>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showCorrelation} onChange={e => setShowCorrelation(e.target.checked)} /> Correlation%</label>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showRV} onChange={e => setShowRV(e.target.checked)} /> RV%</label>
+                          <label className="overlay-checkbox"><input type="checkbox" checked={showYield} onChange={e => setShowYield(e.target.checked)} /> Yield%</label>
+                          <label className="overlay-checkbox"><input type="checkbox" checked={showDivGrowth} onChange={e => setShowDivGrowth(e.target.checked)} /> Div Growth%</label>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showCandleDetail} onChange={e => setShowCandleDetail(e.target.checked)} /> Constituents</label>
                         </>
                       )}
@@ -1406,6 +1412,8 @@ function App() {
                 showBreakout={showBreakout && isBasketView}
                 showCorrelation={showCorrelation && isBasketView}
                 showRV={showRV}
+                showYield={showYield}
+                showDivGrowth={showDivGrowth}
                 rangeUpdateTrigger={rangeUpdateTrigger}
                 exportTrigger={exportTrigger}
                 symbolName={activeTicker || selectedItem}

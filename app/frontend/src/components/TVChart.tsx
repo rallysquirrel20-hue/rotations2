@@ -19,6 +19,8 @@ interface TVChartProps {
   showBreakout?: boolean;
   showCorrelation?: boolean;
   showRV?: boolean;
+  showYield?: boolean;
+  showDivGrowth?: boolean;
   rangeUpdateTrigger?: RangeTrigger | null;
   exportTrigger?: number;
   symbolName?: string;
@@ -44,7 +46,7 @@ const SOLAR_BASE3 = '#fdf6e3';
 const SOLAR_BASE01 = '#586e75';
 const SOLAR_BASE1 = '#93a1a1';
 
-type PaneId = 'volume' | 'breadth' | 'breakout' | 'correlation' | 'rv';
+type PaneId = 'volume' | 'breadth' | 'breakout' | 'correlation' | 'rv' | 'yield' | 'divgrowth';
 
 const DEFAULT_PANE_HEIGHT = 80;
 const MIN_PANE_HEIGHT = 40;
@@ -65,7 +67,7 @@ interface CandleDetail {
 }
 
 export const TVChart: React.FC<TVChartProps> = (props) => {
-  const { data, showPivots, showTargets, showVolume, showBreadth, showBreakout, showCorrelation, showRV } = props;
+  const { data, showPivots, showTargets, showVolume, showBreadth, showBreakout, showCorrelation, showRV, showYield, showDivGrowth } = props;
 
   const pRef  = useRef<HTMLDivElement>(null);
   const vRef  = useRef<HTMLDivElement>(null);
@@ -73,6 +75,8 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
   const boRef = useRef<HTMLDivElement>(null);
   const cRef  = useRef<HTMLDivElement>(null);
   const rvRef = useRef<HTMLDivElement>(null);
+  const yRef  = useRef<HTMLDivElement>(null);
+  const dgRef = useRef<HTMLDivElement>(null);
 
   const charts = useRef<Record<string, IChartApi | null>>({});
   const seriesRefs = useRef<Record<string, ISeriesApi<any> | null>>({});
@@ -90,6 +94,8 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     breakout:    DEFAULT_PANE_HEIGHT,
     correlation: DEFAULT_PANE_HEIGHT,
     rv:          DEFAULT_PANE_HEIGHT,
+    yield:       DEFAULT_PANE_HEIGHT,
+    divgrowth:   DEFAULT_PANE_HEIGHT,
   });
 
   const wrapperRef = useRef<HTMLDivElement>(null);
@@ -254,7 +260,9 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     const boc = createChart(boRef.current!, chartOptions);
     const cc  = createChart(cRef.current!,  chartOptions);
     const rvc = createChart(rvRef.current!, chartOptions);
-    charts.current = { price: pc, volume: vc, breadth: bc, breakout: boc, correlation: cc, rv: rvc };
+    const yc  = createChart(yRef.current!,  chartOptions);
+    const dgc = createChart(dgRef.current!, chartOptions);
+    charts.current = { price: pc, volume: vc, breadth: bc, breakout: boc, correlation: cc, rv: rvc, yield: yc, divgrowth: dgc };
 
     // Price pane
     const candleS = pc.addCandlestickSeries({
@@ -311,10 +319,18 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     rvSeries.setData(sortedData.filter(d => d.RV_EMA != null).map(d => ({ time: parseTime(d.Date), value: Number(d.RV_EMA) * ANNUALIZE * 100 })));
     seriesRefs.current.rv = rvSeries;
 
+    const yieldSeries = yc.addLineSeries({ color: '#2aa198', lineWidth: 2, title: 'Yield %', priceFormat: { type: 'custom', formatter: (v: number) => v.toFixed(2) + '%' } });
+    yieldSeries.setData(sortedData.filter(d => d.Dividend_Yield != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Dividend_Yield) * 100 })));
+    seriesRefs.current.yield = yieldSeries;
+
+    const divGrowthSeries = dgc.addLineSeries({ color: '#d33682', lineWidth: 2, title: 'Div Growth %', priceFormat: { type: 'custom', formatter: (v: number) => v.toFixed(1) + '%' } });
+    divGrowthSeries.setData(sortedData.filter(d => d.Div_Growth_1Y != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Div_Growth_1Y) * 100 })));
+    seriesRefs.current.divgrowth = divGrowthSeries;
+
     // Invisible alignment series: gives every indicator chart the full price-chart time scale
     // so setVisibleRange works even when the indicator has no (or fewer) data points.
     const alignData = ohlc.map(d => ({ time: d.time, value: d.close }));
-    [vc, bc, boc, cc, rvc].forEach(ic => {
+    [vc, bc, boc, cc, rvc, yc, dgc].forEach(ic => {
       ic.addLineSeries({ color: 'rgba(0,0,0,0)', priceLineVisible: false, crosshairMarkerVisible: false, lastValueVisible: false, priceScaleId: '__align__' })
         .setData(alignData);
       ic.priceScale('__align__').applyOptions({ visible: false });
@@ -346,10 +362,18 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     const rvMap = new Map<any, number>();
     sortedData.forEach((d, i) => { if (d.RV_EMA != null) rvMap.set(times[i], Number(d.RV_EMA) * ANNUALIZE * 100); });
     seriesDataMaps['rv'] = rvMap;
+    // Yield
+    const yieldMap = new Map<any, number>();
+    sortedData.forEach((d, i) => { if (d.Dividend_Yield != null) yieldMap.set(times[i], Number(d.Dividend_Yield) * 100); });
+    seriesDataMaps['yield'] = yieldMap;
+    // Div Growth
+    const divGrowthMap = new Map<any, number>();
+    sortedData.forEach((d, i) => { if (d.Div_Growth_1Y != null) divGrowthMap.set(times[i], Number(d.Div_Growth_1Y) * 100); });
+    seriesDataMaps['divgrowth'] = divGrowthMap;
 
     // Sync time scales and crosshairs across all charts
     const chartEntries: [string, IChartApi][] = [
-      ['price', pc], ['volume', vc], ['breadth', bc], ['breakout', boc], ['correlation', cc], ['rv', rvc],
+      ['price', pc], ['volume', vc], ['breadth', bc], ['breakout', boc], ['correlation', cc], ['rv', rvc], ['yield', yc], ['divgrowth', dgc],
     ];
     let rangeSyncing = false;
     let crosshairSyncing = false;
@@ -373,7 +397,7 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
           chartEntries.forEach(([otherId, target]) => {
             if (target === source) return;
             // Skip charts whose container is hidden (e.g. volume in basket view)
-            const container = { price: pRef, volume: vRef, breadth: bRef, breakout: boRef, correlation: cRef, rv: rvRef }[otherId];
+            const container = { price: pRef, volume: vRef, breadth: bRef, breakout: boRef, correlation: cRef, rv: rvRef, yield: yRef, divgrowth: dgRef }[otherId];
             if (container?.current && container.current.clientHeight === 0) return;
             const s = seriesRefs.current[otherId];
             if (!s) return;
@@ -459,10 +483,10 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
   // Resize charts whenever pane heights or visibility changes
   useEffect(() => {
     const refMap: Record<string, React.RefObject<HTMLDivElement>> = {
-      price: pRef, volume: vRef, breadth: bRef, breakout: boRef, correlation: cRef, rv: rvRef,
+      price: pRef, volume: vRef, breadth: bRef, breakout: boRef, correlation: cRef, rv: rvRef, yield: yRef, divgrowth: dgRef,
     };
     const visMap: Record<string, boolean> = {
-      price: true, volume: !!showVolume, breadth: !!showBreadth, breakout: !!showBreakout, correlation: !!showCorrelation, rv: !!showRV,
+      price: true, volume: !!showVolume, breadth: !!showBreadth, breakout: !!showBreakout, correlation: !!showCorrelation, rv: !!showRV, yield: !!showYield, divgrowth: !!showDivGrowth,
     };
 
     const resize = () => {
@@ -492,7 +516,7 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
       window.removeEventListener('resize', resize);
       ro?.disconnect();
     };
-  }, [paneHeights, showVolume, showBreadth, showBreakout, showCorrelation, showRV, props.layoutHeight]);
+  }, [paneHeights, showVolume, showBreadth, showBreakout, showCorrelation, showRV, showYield, showDivGrowth, props.layoutHeight]);
 
   // Handle rangeUpdateTrigger (Reset 1Y button and date range picker)
   useEffect(() => {
@@ -543,12 +567,16 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
       { id: 'correlation', visible: !!showCorrelation },
       { id: 'volume',      visible: !!showVolume },
       { id: 'rv',          visible: !!showRV },
+      { id: 'yield',       visible: !!showYield },
+      { id: 'divgrowth',   visible: !!showDivGrowth },
     ] : [
       { id: 'price',       visible: true },
       { id: 'breadth',     visible: !!showBreadth },
       { id: 'breakout',    visible: !!showBreakout },
       { id: 'correlation', visible: !!showCorrelation },
       { id: 'rv',          visible: !!showRV },
+      { id: 'yield',       visible: !!showYield },
+      { id: 'divgrowth',   visible: !!showDivGrowth },
       { id: 'volume',      visible: !!showVolume },
     ];
 
@@ -658,11 +686,15 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     { id: 'correlation', ref: cRef,  visible: !!showCorrelation },
     { id: 'volume',      ref: vRef,  visible: !!showVolume },
     { id: 'rv',          ref: rvRef, visible: !!showRV },
+    { id: 'yield',       ref: yRef,  visible: !!showYield },
+    { id: 'divgrowth',   ref: dgRef, visible: !!showDivGrowth },
   ] : [
     { id: 'breadth',     ref: bRef,  visible: !!showBreadth },
     { id: 'breakout',    ref: boRef, visible: !!showBreakout },
     { id: 'correlation', ref: cRef,  visible: !!showCorrelation },
     { id: 'rv',          ref: rvRef, visible: !!showRV },
+    { id: 'yield',       ref: yRef,  visible: !!showYield },
+    { id: 'divgrowth',   ref: dgRef, visible: !!showDivGrowth },
     { id: 'volume',      ref: vRef,  visible: !!showVolume },
   ];
   const activePanes = allPanes.filter(p => p.visible);

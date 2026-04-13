@@ -49,6 +49,9 @@ EQUITY_CACHE_SCHEMA_VERSION = 1
 EQUITY_SIGNAL_LOGIC_VERSION = '2026-03-13-btfd-stfr-prev-trend'
 EQUITY_UNIVERSE_LOGIC_VERSION = '2026-04-01-target-quarter-keying'
 BASKET_SIGNALS_CACHE_SCHEMA_VERSION = 1
+DIVIDEND_METRICS_SCHEMA_VERSION = 2  # bumped 2026-04-13: switched TTM/YoY from trading days to calendar days
+DIVIDEND_TTM_WINDOW = 365  # trailing CALENDAR days for TTM dividend sum (time-based rolling)
+DIVIDEND_YOY_LAG = 365     # CALENDAR-day lag for YoY growth comparison (asof-based)
 CHART_SCHEMA_VERSION = 2  # Bump to force rebuild of basket chart PNGs (added 21d corr panel)
 BENCHMARK_BASKETS = 0      # If > 0, only process this many baskets then stop
 BENCHMARK_TIMING = True    # If True, print per-step timing breakdown for each basket
@@ -216,6 +219,8 @@ VOLUME_CACHE_FILE        = paths.thematic_basket_cache / f'volume_universes_{SIZ
 GICS_CACHE_FILE          = DATA_FOLDER / f'gics_mappings_{SIZE}.json'
 SIGNALS_CACHE_FILE       = DATA_FOLDER / f'signals_{SIZE}.parquet'
 ETF_SIGNALS_CACHE_FILE   = DATA_FOLDER / 'signals_etf_50.parquet'
+DIVIDEND_METRICS_CACHE_FILE     = DATA_FOLDER / f'dividend_metrics_{SIZE}.parquet'
+DIVIDEND_METRICS_ETF_CACHE_FILE = DATA_FOLDER / 'dividend_metrics_etf_50.parquet'
 
 
 # ---------------------------------------------------------------------------

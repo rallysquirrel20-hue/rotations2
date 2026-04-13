@@ -1,19 +1,20 @@
 # Dependency Tree
 
-Updated: 2026-04-08 (Q2 correlation fix in _compute_within_basket_correlation)
+Updated: 2026-04-13 (added build_dividend_metrics.py, switched TTM/YoY to 365 calendar days)
 
 ## File Dependency Graph
 
 ```
-config.py                    (foundation — imported by all others)
-  ├── build_universes.py     (depends on config)
-  ├── build_signals.py       (depends on config)
-  ├── build_baskets.py       (depends on config + build_signals)
-  └── live_updates.py        (depends on config + build_signals)
+config.py                       (foundation — imported by all others)
+  ├── build_universes.py        (depends on config)
+  ├── build_signals.py          (depends on config)
+  ├── build_dividend_metrics.py (depends on config)
+  ├── build_baskets.py          (depends on config + build_signals)
+  └── live_updates.py           (depends on config + build_signals)
 
 Loop schedulers (subprocess calls, no Python imports):
   ├── loop_universes.py  → build_universes.py
-  ├── loop_signals.py    → build_signals.py + build_baskets.py
+  ├── loop_signals.py    → build_signals.py + build_dividend_metrics.py + build_baskets.py
   └── loop_live.py       → live_updates.py
 ```
 
@@ -28,6 +29,9 @@ Shared configuration, constants, paths, and utility functions. Zero side effects
 - `SIGNALS = ['Up_Rot', 'Down_Rot', 'Breakout', 'Breakdown', 'BTFD', 'STFR']`
 - `RV_MULT`, `EMA_MULT`, `RV_EMA_ALPHA` — signal math constants
 - `FORCE_REBUILD_EQUITY_CACHE`, `FORCE_REBUILD_BASKET_SIGNALS` — env-var flags
+- `DIVIDEND_METRICS_CACHE_FILE`, `DIVIDEND_METRICS_ETF_CACHE_FILE` — parquet paths for per-ticker dividend metrics
+- `DIVIDEND_METRICS_SCHEMA_VERSION = 2` (bumped 2026-04-13 for trading→calendar TTM switch)
+- `DIVIDEND_TTM_WINDOW = 365`, `DIVIDEND_YOY_LAG = 365` — **calendar** days for TTM rolling + YoY lag
 
 ### Classes
 | Line | Class | Purpose |
@@ -137,6 +141,33 @@ Builds stock and ETF signal DataFrames from universe tickers using Numba-acceler
 
 ---
 
+## signals/build_dividend_metrics.py
+
+Builds per-ticker dividend yield, TTM dividends, and YoY growth. Runs daily between `build_signals.py` and `build_baskets.py`. Single Norgate call per ticker (CAPITALSPECIAL price series exposes the raw `Dividend` column alongside split-adjusted Close — yield computed locally as `TTM / Close`).
+
+### Imports from config
+`SIZE`, `ETF_SIZE`, `MARKET_SYMBOL`, `INCREMENTAL_MAX_DAYS`, `DIVIDEND_TTM_WINDOW`, `DIVIDEND_YOY_LAG`, `DIVIDEND_METRICS_CACHE_FILE`, `DIVIDEND_METRICS_ETF_CACHE_FILE`, `load_universe_from_disk`, `load_etf_universe_from_disk`, `WriteThroughPath`, `_install_timed_print`, `reset_cell_timer`
+
+### Functions
+| Line | Function | Purpose |
+|------|----------|---------|
+| 45  | `_fetch_ticker_dividend_metrics(ticker)` | Fetch CAPITALSPECIAL prices + dividends; compute TTM (time-based 365D rolling), yield (TTM/Close), YoY growth via `ttm.asof(t-365D)`. Non-payers: yield=0, growth=0. |
+| 99  | `_get_latest_norgate_date()` | Probe latest Norgate date via MARKET_SYMBOL |
+| 114 | `_cache_is_current(df)` | Same staleness logic as build_signals.py |
+| 140 | `_save(df, cache_file)` | Atomic write, Source='norgate', float32 downcast |
+| 160 | `_load_or_build(universe, cache_file, force, label)` | Full rebuild only (incremental not implemented — 252-day TTM + 252-day YoY lag means partial updates would recompute a full year anyway) |
+| 216 | `load_or_build_dividend_metrics(quarter_universe, force)` | Public: equity metrics |
+| 220 | `load_or_build_dividend_metrics_etf(etf_universe, force)` | Public: ETF metrics |
+| 227 | `main()` | Entry point: builds both equity + ETF metrics |
+
+### Writes
+`dividend_metrics_500.parquet`, `dividend_metrics_etf_50.parquet`. Schema: `Date | Ticker | Dividend_Yield | TTM_Dividends | Div_Growth_1Y | Source`. Yield is decimal (0.025 = 2.5%).
+
+### Non-payer convention
+`Div_Growth_1Y = 0` whenever current TTM or prior TTM is zero — never NaN/Inf. Applies to pure non-payers (TSLA), new initiators (prior = 0), and dividend cutters (current = 0). Matches the `Basket_Yield`/`Basket_Div_Growth` aggregation convention in `build_baskets.py`.
+
+---
+
 ## signals/build_baskets.py
 
 Builds basket signals (OHLC + signals + breadth + correlation) for all baskets.
@@ -160,7 +191,9 @@ Builds basket signals (OHLC + signals + breadth + correlation) for all baskets.
 | 1332 | `_compute_and_save_contributions(...)` | Per-constituent return contributions |
 | 1472 | `process_basket_signals(...)` | Main per-basket processor |
 | 1641 | `_build_or_load_returns_matrix(all_signals_df)` | Date×Ticker return pivot |
-| 1754 | `main()` | Entry point |
+| 1756 | `_compute_basket_dividend_series(contrib_df, div_metrics_by_ticker)` | Weighted yield + growth + coverage per date. Non-payers contribute 0 per convention. |
+| 1800 | `_build_all_basket_dividend_series()` | Post-pass: for every `*_contributions.parquet`, join with `dividend_metrics_500.parquet` and write matching `*_dividend_series.parquet`. Called from `main()` after basket loop. |
+| 1870 | `main()` | Entry point |
 
 ### Industry Filtering
 - Daily incremental: only processes current-quarter industries (top 25% by dollar volume)
@@ -168,7 +201,7 @@ Builds basket signals (OHLC + signals + breadth + correlation) for all baskets.
 - `FORCE_REBUILD_BASKET_SIGNALS` defaults to `False`
 
 ### Writes
-`{cache}/*_signals.parquet`, `{cache}/*_ohlc.parquet`, `{cache}/*_contributions.parquet`, `{cache}/*_meta.json`, `returns_matrix_500.parquet`
+`{cache}/*_signals.parquet`, `{cache}/*_ohlc.parquet`, `{cache}/*_contributions.parquet`, `{cache}/*_dividend_series.parquet`, `{cache}/*_meta.json`, `returns_matrix_500.parquet`
 
 ---
 
@@ -208,5 +241,5 @@ All use `exchange_calendars` (NYSE) for trading day schedule. Run scripts via `s
 | File | Script Called | Schedule |
 |------|-------------|----------|
 | `loop_universes.py` | `build_universes.py` | 5pm ET, last trading day of quarter |
-| `loop_signals.py` | `build_signals.py` then `build_baskets.py` | 5pm ET, every trading day |
+| `loop_signals.py` | `build_signals.py` → `build_dividend_metrics.py` → `build_baskets.py` | 5pm ET, every trading day |
 | `loop_live.py` | `live_updates.py` | Every 5 min, 9:30–4:00 ET, trading days |

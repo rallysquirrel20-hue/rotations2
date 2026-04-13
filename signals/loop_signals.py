@@ -1,4 +1,5 @@
-"""Daily signals + baskets loop — runs build_signals.py then build_baskets.py at 5pm ET on trading days."""
+"""Daily signals + baskets loop — runs build_signals.py, build_dividend_metrics.py,
+then build_baskets.py at 5pm ET on trading days."""
 
 import sys
 import time
@@ -12,6 +13,7 @@ import exchange_calendars as xcals
 
 ET = ZoneInfo("America/New_York")
 SIGNALS_SCRIPT = str(Path(__file__).with_name("build_signals.py"))
+DIVIDEND_METRICS_SCRIPT = str(Path(__file__).with_name("build_dividend_metrics.py"))
 BASKETS_SCRIPT = str(Path(__file__).with_name("build_baskets.py"))
 CHECK_INTERVAL = 300  # check every 5 minutes
 RUN_HOUR = 17  # 5pm ET
@@ -45,6 +47,8 @@ def main():
             try:
                 log("[loop_signals] Running build_signals.py ...")
                 subprocess.run([sys.executable, SIGNALS_SCRIPT], check=True)
+                log("[loop_signals] Running build_dividend_metrics.py ...")
+                subprocess.run([sys.executable, DIVIDEND_METRICS_SCRIPT], check=True)
                 log("[loop_signals] Running build_baskets.py ...")
                 subprocess.run([sys.executable, BASKETS_SCRIPT], check=True)
             except subprocess.CalledProcessError as exc:
