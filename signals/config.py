@@ -42,6 +42,13 @@ RV_MULT = np.sqrt(252) / np.sqrt(21)
 EMA_MULT = 2.0 / 11.0   # For range EMAs
 RV_EMA_ALPHA = 2.0 / 11.0  # span=10 EMA for RV
 
+# H/L Reaction oscillator: EMA of close-vs-previous-H/L % change on new-H/L bars,
+# then rescaled to [-1, +1] over a rolling window. Raw EMA_High / EMA_Low are
+# stored on signal rows; the normalized variants are computed on-demand at
+# read time (matches the virtual 'Return' metric pattern).
+HL_EMA_LEN = 21    # span for EMA_High / EMA_Low (alpha = 2/22)
+HL_NORM_LEN = 150  # rolling-window length used when rescaling to [-1, +1]
+
 # ---------------------------------------------------------------------------
 # Version stamps -- bump to invalidate caches
 # ---------------------------------------------------------------------------

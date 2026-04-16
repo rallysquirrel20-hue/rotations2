@@ -21,6 +21,8 @@ interface TVChartProps {
   showRV?: boolean;
   showYield?: boolean;
   showDivGrowth?: boolean;
+  showHReaction?: boolean;
+  showLReaction?: boolean;
   rangeUpdateTrigger?: RangeTrigger | null;
   exportTrigger?: number;
   symbolName?: string;
@@ -46,7 +48,7 @@ const SOLAR_BASE3 = '#fdf6e3';
 const SOLAR_BASE01 = '#586e75';
 const SOLAR_BASE1 = '#93a1a1';
 
-type PaneId = 'volume' | 'breadth' | 'breakout' | 'correlation' | 'rv' | 'yield' | 'divgrowth';
+type PaneId = 'volume' | 'breadth' | 'breakout' | 'correlation' | 'rv' | 'yield' | 'divgrowth' | 'hreact' | 'lreact';
 
 const DEFAULT_PANE_HEIGHT = 80;
 const MIN_PANE_HEIGHT = 40;
@@ -67,7 +69,7 @@ interface CandleDetail {
 }
 
 export const TVChart: React.FC<TVChartProps> = (props) => {
-  const { data, showPivots, showTargets, showVolume, showBreadth, showBreakout, showCorrelation, showRV, showYield, showDivGrowth } = props;
+  const { data, showPivots, showTargets, showVolume, showBreadth, showBreakout, showCorrelation, showRV, showYield, showDivGrowth, showHReaction, showLReaction } = props;
 
   const pRef  = useRef<HTMLDivElement>(null);
   const vRef  = useRef<HTMLDivElement>(null);
@@ -77,6 +79,8 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
   const rvRef = useRef<HTMLDivElement>(null);
   const yRef  = useRef<HTMLDivElement>(null);
   const dgRef = useRef<HTMLDivElement>(null);
+  const hhRef = useRef<HTMLDivElement>(null);
+  const hlRef = useRef<HTMLDivElement>(null);
 
   const charts = useRef<Record<string, IChartApi | null>>({});
   const seriesRefs = useRef<Record<string, ISeriesApi<any> | null>>({});
@@ -96,6 +100,8 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     rv:          DEFAULT_PANE_HEIGHT,
     yield:       DEFAULT_PANE_HEIGHT,
     divgrowth:   DEFAULT_PANE_HEIGHT,
+    hreact:      DEFAULT_PANE_HEIGHT,
+    lreact:      DEFAULT_PANE_HEIGHT,
   });
 
   const wrapperRef = useRef<HTMLDivElement>(null);
@@ -262,7 +268,9 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     const rvc = createChart(rvRef.current!, chartOptions);
     const yc  = createChart(yRef.current!,  chartOptions);
     const dgc = createChart(dgRef.current!, chartOptions);
-    charts.current = { price: pc, volume: vc, breadth: bc, breakout: boc, correlation: cc, rv: rvc, yield: yc, divgrowth: dgc };
+    const hhc = createChart(hhRef.current!, chartOptions);
+    const hlc = createChart(hlRef.current!, chartOptions);
+    charts.current = { price: pc, volume: vc, breadth: bc, breakout: boc, correlation: cc, rv: rvc, yield: yc, divgrowth: dgc, hreact: hhc, lreact: hlc };
 
     // Price pane
     const candleS = pc.addCandlestickSeries({
@@ -327,10 +335,36 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     divGrowthSeries.setData(sortedData.filter(d => d.Div_Growth_1Y != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Div_Growth_1Y) * 100 })));
     seriesRefs.current.divgrowth = divGrowthSeries;
 
+    // H/L Reaction panes — each is its own histogram with per-bar coloring: blue when
+    // the normalized reaction is positive, pink when negative. Dashed zero reference.
+    const hReactFmt = { type: 'custom' as const, formatter: (v: number) => v.toFixed(2) };
+    const hReactBars = sortedData
+      .filter(d => d.EMA_High_Norm != null)
+      .map(d => {
+        const v = Number(d.EMA_High_Norm);
+        return { time: parseTime(d.Date), value: v, color: v >= 0 ? COLOR_BLUE : COLOR_PINK };
+      });
+    const lReactBars = sortedData
+      .filter(d => d.EMA_Low_Norm != null)
+      .map(d => {
+        const v = Number(d.EMA_Low_Norm);
+        return { time: parseTime(d.Date), value: v, color: v >= 0 ? COLOR_BLUE : COLOR_PINK };
+      });
+
+    const hReactSeries = hhc.addHistogramSeries({ title: 'H React', priceFormat: hReactFmt, base: 0 });
+    hReactSeries.setData(hReactBars);
+    hReactSeries.createPriceLine({ price: 0, color: SOLAR_BASE1, lineWidth: 1, lineStyle: 2, axisLabelVisible: false } as any);
+    seriesRefs.current.hreact = hReactSeries;
+
+    const lReactSeries = hlc.addHistogramSeries({ title: 'L React', priceFormat: hReactFmt, base: 0 });
+    lReactSeries.setData(lReactBars);
+    lReactSeries.createPriceLine({ price: 0, color: SOLAR_BASE1, lineWidth: 1, lineStyle: 2, axisLabelVisible: false } as any);
+    seriesRefs.current.lreact = lReactSeries;
+
     // Invisible alignment series: gives every indicator chart the full price-chart time scale
     // so setVisibleRange works even when the indicator has no (or fewer) data points.
     const alignData = ohlc.map(d => ({ time: d.time, value: d.close }));
-    [vc, bc, boc, cc, rvc, yc, dgc].forEach(ic => {
+    [vc, bc, boc, cc, rvc, yc, dgc, hhc, hlc].forEach(ic => {
       ic.addLineSeries({ color: 'rgba(0,0,0,0)', priceLineVisible: false, crosshairMarkerVisible: false, lastValueVisible: false, priceScaleId: '__align__' })
         .setData(alignData);
       ic.priceScale('__align__').applyOptions({ visible: false });
@@ -370,10 +404,19 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     const divGrowthMap = new Map<any, number>();
     sortedData.forEach((d, i) => { if (d.Div_Growth_1Y != null) divGrowthMap.set(times[i], Number(d.Div_Growth_1Y) * 100); });
     seriesDataMaps['divgrowth'] = divGrowthMap;
+    // H/L Reaction crosshair maps — one per pane
+    const hMap = new Map<any, number>();
+    const lMap = new Map<any, number>();
+    sortedData.forEach((d, i) => {
+      if (d.EMA_High_Norm != null) hMap.set(times[i], Number(d.EMA_High_Norm));
+      if (d.EMA_Low_Norm  != null) lMap.set(times[i], Number(d.EMA_Low_Norm));
+    });
+    seriesDataMaps['hreact'] = hMap;
+    seriesDataMaps['lreact'] = lMap;
 
     // Sync time scales and crosshairs across all charts
     const chartEntries: [string, IChartApi][] = [
-      ['price', pc], ['volume', vc], ['breadth', bc], ['breakout', boc], ['correlation', cc], ['rv', rvc], ['yield', yc], ['divgrowth', dgc],
+      ['price', pc], ['volume', vc], ['breadth', bc], ['breakout', boc], ['correlation', cc], ['rv', rvc], ['yield', yc], ['divgrowth', dgc], ['hreact', hhc], ['lreact', hlc],
     ];
     let rangeSyncing = false;
     let crosshairSyncing = false;
@@ -397,7 +440,7 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
           chartEntries.forEach(([otherId, target]) => {
             if (target === source) return;
             // Skip charts whose container is hidden (e.g. volume in basket view)
-            const container = { price: pRef, volume: vRef, breadth: bRef, breakout: boRef, correlation: cRef, rv: rvRef, yield: yRef, divgrowth: dgRef }[otherId];
+            const container = { price: pRef, volume: vRef, breadth: bRef, breakout: boRef, correlation: cRef, rv: rvRef, yield: yRef, divgrowth: dgRef, hreact: hhRef, lreact: hlRef }[otherId];
             if (container?.current && container.current.clientHeight === 0) return;
             const s = seriesRefs.current[otherId];
             if (!s) return;
@@ -483,10 +526,10 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
   // Resize charts whenever pane heights or visibility changes
   useEffect(() => {
     const refMap: Record<string, React.RefObject<HTMLDivElement>> = {
-      price: pRef, volume: vRef, breadth: bRef, breakout: boRef, correlation: cRef, rv: rvRef, yield: yRef, divgrowth: dgRef,
+      price: pRef, volume: vRef, breadth: bRef, breakout: boRef, correlation: cRef, rv: rvRef, yield: yRef, divgrowth: dgRef, hreact: hhRef, lreact: hlRef,
     };
     const visMap: Record<string, boolean> = {
-      price: true, volume: !!showVolume, breadth: !!showBreadth, breakout: !!showBreakout, correlation: !!showCorrelation, rv: !!showRV, yield: !!showYield, divgrowth: !!showDivGrowth,
+      price: true, volume: !!showVolume, breadth: !!showBreadth, breakout: !!showBreakout, correlation: !!showCorrelation, rv: !!showRV, yield: !!showYield, divgrowth: !!showDivGrowth, hreact: !!showHReaction, lreact: !!showLReaction,
     };
 
     const resize = () => {
@@ -516,7 +559,7 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
       window.removeEventListener('resize', resize);
       ro?.disconnect();
     };
-  }, [paneHeights, showVolume, showBreadth, showBreakout, showCorrelation, showRV, showYield, showDivGrowth, props.layoutHeight]);
+  }, [paneHeights, showVolume, showBreadth, showBreakout, showCorrelation, showRV, showYield, showDivGrowth, showHReaction, showLReaction, props.layoutHeight]);
 
   // Handle rangeUpdateTrigger (Reset 1Y button and date range picker)
   useEffect(() => {
@@ -567,6 +610,8 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
       { id: 'correlation', visible: !!showCorrelation },
       { id: 'volume',      visible: !!showVolume },
       { id: 'rv',          visible: !!showRV },
+      { id: 'hreact',      visible: !!showHReaction },
+      { id: 'lreact',      visible: !!showLReaction },
       { id: 'yield',       visible: !!showYield },
       { id: 'divgrowth',   visible: !!showDivGrowth },
     ] : [
@@ -575,6 +620,8 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
       { id: 'breakout',    visible: !!showBreakout },
       { id: 'correlation', visible: !!showCorrelation },
       { id: 'rv',          visible: !!showRV },
+      { id: 'hreact',      visible: !!showHReaction },
+      { id: 'lreact',      visible: !!showLReaction },
       { id: 'yield',       visible: !!showYield },
       { id: 'divgrowth',   visible: !!showDivGrowth },
       { id: 'volume',      visible: !!showVolume },
@@ -686,6 +733,8 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     { id: 'correlation', ref: cRef,  visible: !!showCorrelation },
     { id: 'volume',      ref: vRef,  visible: !!showVolume },
     { id: 'rv',          ref: rvRef, visible: !!showRV },
+    { id: 'hreact',      ref: hhRef, visible: !!showHReaction },
+    { id: 'lreact',      ref: hlRef, visible: !!showLReaction },
     { id: 'yield',       ref: yRef,  visible: !!showYield },
     { id: 'divgrowth',   ref: dgRef, visible: !!showDivGrowth },
   ] : [
@@ -693,6 +742,8 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     { id: 'breakout',    ref: boRef, visible: !!showBreakout },
     { id: 'correlation', ref: cRef,  visible: !!showCorrelation },
     { id: 'rv',          ref: rvRef, visible: !!showRV },
+    { id: 'hreact',      ref: hhRef, visible: !!showHReaction },
+    { id: 'lreact',      ref: hlRef, visible: !!showLReaction },
     { id: 'yield',       ref: yRef,  visible: !!showYield },
     { id: 'divgrowth',   ref: dgRef, visible: !!showDivGrowth },
     { id: 'volume',      ref: vRef,  visible: !!showVolume },

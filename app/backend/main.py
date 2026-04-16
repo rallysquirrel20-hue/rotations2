@@ -2464,9 +2464,127 @@ def get_ticker_data(ticker: str):
             except Exception:
                 pass  # non-fatal: chart still works without dividend columns
 
+        # H/L Reaction normalized EMAs — derived on the fly from stored EMA_High/Low
+        if 'EMA_High' in df.columns and 'EMA_Low' in df.columns:
+            df = df.sort_values('Date').reset_index(drop=True)
+            df = signals_engine.add_hl_reaction_norm(df)
+
         df['Date'] = df['Date'].dt.strftime('%Y-%m-%d')
         return {"chart_data": clean_data_for_json(df.sort_values('Date')), "tickers": []}
     except Exception: raise HTTPException(status_code=500)
+
+
+@app.get("/api/distribution/next-bar")
+def get_next_bar_distribution(
+    ticker: str,
+    breakout_state: Optional[str] = None,   # 'breakout' | 'breakdown' — LT regime (Is_Breakout_Sequence)
+    rotation_state: Optional[str] = None,   # 'up' | 'down' — current trend state (Trend)
+    h_sign: Optional[str] = None,           # 'above' | 'below' — EMA_High_Norm vs 0
+    l_sign: Optional[str] = None,           # 'above' | 'below' — EMA_Low_Norm vs 0
+    h_trend: Optional[str] = None,          # 'increasing' | 'decreasing'
+    l_trend: Optional[str] = None,          # 'increasing' | 'decreasing'
+    lookback: int = 21,
+):
+    """Conditional next-bar (close→close) return distribution for one ticker.
+
+    Condition semantics are REGIME-based, not point-in-time signal events:
+    - breakout_state = 'breakout' → currently in the breakout sequence (LT uptrend)
+    - breakout_state = 'breakdown' → currently in the breakdown sequence (LT downtrend)
+    - rotation_state = 'up' → currently in an uptrend (Trend == True)
+    - rotation_state = 'down' → currently in a downtrend (Trend == False)
+
+    Any combination of the 6 condition knobs can be set; omitted knobs mean
+    "any state" for that condition. Returns both the filtered sample and the
+    ticker's unfiltered baseline so the caller can overlay them."""
+    cols = ['Date', 'Close', 'Trend', 'Is_Breakout_Sequence',
+            'EMA_High', 'EMA_Low']
+    df = pd.DataFrame()
+    if INDIVIDUAL_SIGNALS_FILE.exists():
+        try:
+            df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=cols,
+                                 filters=[('Ticker', '==', ticker)])
+        except Exception:
+            df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
+                                 filters=[('Ticker', '==', ticker)])
+    if df.empty and ETF_SIGNALS_FILE.exists():
+        try:
+            df = pd.read_parquet(ETF_SIGNALS_FILE, columns=cols,
+                                 filters=[('Ticker', '==', ticker)])
+        except Exception:
+            df = pd.read_parquet(ETF_SIGNALS_FILE,
+                                 filters=[('Ticker', '==', ticker)])
+    if df.empty:
+        raise HTTPException(status_code=404, detail=f"No data for ticker {ticker}")
+
+    df = df.sort_values('Date').reset_index(drop=True)
+
+    # Derived series for reaction conditions
+    df['EMA_High_Norm'] = signals_engine.hl_normalize(df['EMA_High'], signals_engine.HL_NORM_LEN)
+    df['EMA_Low_Norm']  = signals_engine.hl_normalize(df['EMA_Low'],  signals_engine.HL_NORM_LEN)
+    lookback = max(1, int(lookback or 21))
+    df['EMA_High_Prev'] = df['EMA_High'].shift(lookback)
+    df['EMA_Low_Prev']  = df['EMA_Low'].shift(lookback)
+
+    # Next-bar close-to-close return is the target distribution
+    df['NextReturn'] = df['Close'].shift(-1) / df['Close'] - 1
+
+    mask = df['NextReturn'].notna()
+    # Regime — which long-term sequence is the ticker currently in?
+    if breakout_state == 'breakout':
+        mask &= df['Is_Breakout_Sequence'].fillna(False).astype(bool)
+    elif breakout_state == 'breakdown':
+        mask &= ~df['Is_Breakout_Sequence'].fillna(False).astype(bool)
+    # Current trend direction — Trend is stored as float32 {1.0 uptrend, 0.0 downtrend, NaN pre-init}
+    if rotation_state == 'up':
+        mask &= (df['Trend'] == 1.0)
+    elif rotation_state == 'down':
+        mask &= (df['Trend'] == 0.0)
+    if h_sign == 'above':
+        mask &= (df['EMA_High_Norm'] > 0)
+    elif h_sign == 'below':
+        mask &= (df['EMA_High_Norm'] < 0)
+    if l_sign == 'above':
+        mask &= (df['EMA_Low_Norm'] > 0)
+    elif l_sign == 'below':
+        mask &= (df['EMA_Low_Norm'] < 0)
+    if h_trend == 'increasing':
+        mask &= (df['EMA_High'] > df['EMA_High_Prev'])
+    elif h_trend == 'decreasing':
+        mask &= (df['EMA_High'] < df['EMA_High_Prev'])
+    if l_trend == 'increasing':
+        mask &= (df['EMA_Low'] > df['EMA_Low_Prev'])
+    elif l_trend == 'decreasing':
+        mask &= (df['EMA_Low'] < df['EMA_Low_Prev'])
+
+    def _summarize(returns):
+        arr = np.asarray(returns, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        n = int(arr.size)
+        if n == 0:
+            return {'n': 0, 'returns': [], 'mean': None, 'median': None,
+                    'stddev': None, 'win_rate': None,
+                    'p5': None, 'p25': None, 'p75': None, 'p95': None}
+        return {
+            'n': n,
+            'returns': [round(float(v), 6) for v in arr.tolist()],
+            'mean':    round(float(np.mean(arr)), 6),
+            'median':  round(float(np.median(arr)), 6),
+            'stddev':  round(float(np.std(arr, ddof=1)) if n > 1 else 0.0, 6),
+            'win_rate': round(float((arr > 0).mean()), 6),
+            'p5':  round(float(np.percentile(arr, 5)),  6),
+            'p25': round(float(np.percentile(arr, 25)), 6),
+            'p75': round(float(np.percentile(arr, 75)), 6),
+            'p95': round(float(np.percentile(arr, 95)), 6),
+        }
+
+    baseline_returns = df.loc[df['NextReturn'].notna(), 'NextReturn']
+    filtered_returns = df.loc[mask, 'NextReturn']
+    return {
+        'ticker': ticker,
+        'lookback': lookback,
+        'filtered': _summarize(filtered_returns),
+        'baseline': _summarize(baseline_returns),
+    }
 
 
 SIGNAL_TYPES = ['Breakout', 'Breakdown', 'Up_Rot', 'Down_Rot', 'BTFD', 'STFR', 'Long', 'Short']
@@ -2493,6 +2611,15 @@ EXIT_IS_COL = {
     'Breakout': 'Is_Breakout', 'Breakdown': 'Is_Breakdown',
     'Up_Rot': 'Is_Up_Rotation', 'Down_Rot': 'Is_Down_Rotation',
     'BTFD': 'Is_BTFD', 'STFR': 'Is_STFR',
+}
+
+# Virtual backtest-filter metrics — not stored in the parquet. Keys are the
+# metric names the frontend sends; values are the underlying parquet columns
+# that must be loaded to compute them. `Return` is handled separately
+# (needs only Close, which is always present).
+_VIRTUAL_FILTER_COLS = {
+    'EMA_High_Norm': 'EMA_High',
+    'EMA_Low_Norm':  'EMA_Low',
 }
 
 
@@ -3396,8 +3523,10 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
             if exit_rv_multiple is not None or stop_rv_multiple is not None or trailing_stop_rv_multiple is not None:
                 base_cols.append('RV_EMA')
         for flt in filters:
-            if flt.source == 'self' and flt.metric not in base_cols:
-                base_cols.append(flt.metric)
+            if flt.source == 'self':
+                under = _VIRTUAL_FILTER_COLS.get(flt.metric, flt.metric)
+                if under not in base_cols:
+                    base_cols.append(under)
         base_cols = list(dict.fromkeys(base_cols))  # dedupe
         try:
             df = pd.read_parquet(basket_file, columns=[c for c in base_cols if c])
@@ -3435,8 +3564,10 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
             if exit_rv_multiple is not None or stop_rv_multiple is not None or trailing_stop_rv_multiple is not None:
                 base_cols.append('RV_EMA')
         for flt in filters:
-            if flt.source == 'self' and flt.metric not in base_cols:
-                base_cols.append(flt.metric)
+            if flt.source == 'self':
+                under = _VIRTUAL_FILTER_COLS.get(flt.metric, flt.metric)
+                if under not in base_cols:
+                    base_cols.append(under)
         base_cols = list(dict.fromkeys(base_cols))
         try:
             df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
@@ -3459,8 +3590,10 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
             if exit_rv_multiple is not None or stop_rv_multiple is not None or trailing_stop_rv_multiple is not None:
                 base_cols.append('RV_EMA')
         for flt in filters:
-            if flt.source == 'self' and flt.metric not in base_cols:
-                base_cols.append(flt.metric)
+            if flt.source == 'self':
+                under = _VIRTUAL_FILTER_COLS.get(flt.metric, flt.metric)
+                if under not in base_cols:
+                    base_cols.append(under)
         base_cols = list(dict.fromkeys(base_cols))
         try:
             df = pd.read_parquet(_sig_file,
@@ -3498,6 +3631,19 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
                 else:
                     df[return_col] = df['Close'] / df['Close'].shift(lookback) - 1
 
+    # Compute H/L reaction normalized columns on demand (derived from EMA_High/EMA_Low)
+    _needs_hl_norm = {flt.metric for flt in filters
+                     if flt.source == 'self' and flt.metric in ('EMA_High_Norm', 'EMA_Low_Norm')}
+    for virt in _needs_hl_norm:
+        src = _VIRTUAL_FILTER_COLS[virt]
+        if virt in df.columns or src not in df.columns:
+            continue
+        if is_multi_ticker:
+            df[virt] = df.groupby('Ticker')[src].transform(
+                lambda s: signals_engine.hl_normalize(s, signals_engine.HL_NORM_LEN))
+        else:
+            df[virt] = signals_engine.hl_normalize(df[src], signals_engine.HL_NORM_LEN)
+
     # Load external filter sources and merge
     external_sources = {}
     failed_sources = set()
@@ -3529,7 +3675,8 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
     if needs_ext_merge and is_multi_ticker:
         df = df.sort_values(['Ticker', 'Date']).reset_index(drop=True)
 
-    # Add shift columns for increasing/decreasing conditions (with lookback and EMA smoothing)
+    # Add shift columns for increasing/decreasing/crosses_above/crosses_below conditions
+    # (with lookback and EMA smoothing for noisy metrics).
     for flt in filters:
         col_name = flt.metric
         if flt.source != 'self':
@@ -3537,9 +3684,11 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
         # For Return metric, use the computed column
         if flt.metric == 'Return':
             col_name = f'__return_{flt.lookback or 252}'
-        if flt.condition in ('increasing', 'decreasing') and col_name in df.columns:
-            lookback = flt.lookback or 1
-            # EMA smoothing for noisy metrics
+        needs_prev = flt.condition in ('increasing', 'decreasing', 'crosses_above', 'crosses_below')
+        if needs_prev and col_name in df.columns:
+            # crosses_above / crosses_below always look one bar back; inc/dec honor lookback.
+            lookback = 1 if flt.condition in ('crosses_above', 'crosses_below') else (flt.lookback or 1)
+            # EMA smoothing only for noisy inc/dec metrics — raw values for crossings.
             col_for_shift = col_name
             if flt.metric in ('Volume', 'RV_EMA') and flt.condition in ('increasing', 'decreasing'):
                 smooth_col = f'{col_name}__ema10'
@@ -3780,6 +3929,18 @@ def _build_leg_trades(target, target_type, entry_signal, filters, start_date, en
                 cur = row.get(actual_col if flt.metric in ('Volume', 'RV_EMA') else col_name)
                 prev_val = row.get(prev_col)
                 regime_pass = regime_pass and (pd.notna(cur) and pd.notna(prev_val) and float(cur) < float(prev_val))
+            elif flt.condition in ('crosses_above', 'crosses_below'):
+                prev_col = f'{col_name}__prev_1'
+                cur = val
+                prev_val = row.get(prev_col)
+                if pd.isna(cur) or pd.isna(prev_val) or flt.value is None:
+                    regime_pass = False
+                else:
+                    cur_f, prev_f, thr = float(cur), float(prev_val), float(flt.value)
+                    if flt.condition == 'crosses_above':
+                        regime_pass = regime_pass and (prev_f <= thr and cur_f > thr)
+                    else:
+                        regime_pass = regime_pass and (prev_f >= thr and cur_f < thr)
             elif flt.condition == 'equals_true':
                 regime_pass = regime_pass and (pd.notna(val) and bool(val))
             elif flt.condition == 'equals_false':

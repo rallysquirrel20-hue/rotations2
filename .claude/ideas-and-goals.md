@@ -114,6 +114,16 @@ Completed sub-goals:
 ### 22. Biotechnology Q3 2026 anomaly in industry_u (2026-04-08)
 Noticed `gics_mappings_500.json` has odd gaps in `industry_u['Biotechnology']`: `[..., '2025 Q3', '2026 Q1', '2026 Q3']` — Q3 2026 is a future quarter that shouldn't exist yet. Several other industries have similar patterns (missing Q2 but having Q1 and Q3, or having future-quarter entries). Looks like an off-by-one or stale entry in `build_universes.py` — possibly in `_offset_key`, `_next_qtr`, or `_build_gics` quarterization. Worth investigating since it's the data source for the universe filter.
 
+### 24. H/L Reaction Oscillator & Backtest Filter (2026-04-16) — IN PROGRESS
+Port the Pine script `rotations_strategy.txt` H/L reaction oscillator to the signals pipeline and surface it on the dashboard. On every new-high bar, compute the percent gap from close to the prior bar's high and feed it through an EMA; mirror for lows. Normalize each EMA to `[-1, +1]` over a rolling window at read time (Pine `ta.highest`/`lowest` equivalent).
+- Config: `HL_EMA_LEN = 21`, `HL_NORM_LEN = 150` in `signals/config.py` (raw EMAs live on signal rows; normalization computed on demand — matches the virtual `Return` metric pattern).
+- Stored columns: `EMA_High`, `EMA_Low` on `signals_500.parquet` / `signals_etf_50.parquet` (two new columns; schema version NOT bumped — daily rebuild repopulates).
+- Derived columns (on demand): `EMA_High_Norm`, `EMA_Low_Norm` via `signals_engine.hl_normalize` — served by `/api/tickers/{ticker}` and also available as backtest filter metrics.
+- Frontend: new `hlreact` oscillator pane in `TVChart.tsx` with two lines (H Reaction blue, L Reaction pink) plus a 0 reference line. Toggleable from the indicator menu alongside Pivots/Targets/RV%/etc.
+- Backtest filter: `EMA_High_Norm` and `EMA_Low_Norm` added as selectable metrics. New conditions `crosses_above` / `crosses_below` (one-bar crossing detection) wired into the filter engine for all numeric metrics, not just HL.
+- No new trade signals (user has own backtest engine in the app) — this is visualization + filter only.
+- Touched: `signals/config.py`, `signals/build_signals.py` (batch + `_build_signals_next_row`), `app/backend/signals_engine.py`, `app/backend/main.py` (ticker endpoint + `_build_leg_trades` filter path), `app/frontend/src/App.tsx`, `app/frontend/src/components/TVChart.tsx`, `app/frontend/src/components/BacktestPanel.tsx`.
+
 ### 23. PM2 Python requirements file (2026-04-08)
 The PM2 loop processes use the system Python 3.14 at `%LOCALAPPDATA%\Python\pythoncore-3.14-64\python.exe`, not the backend venv. `exchange_calendars` wasn't installed there, causing rot-live, rot-signals, and rot-universes to crash-loop silently. Add a `requirements-pm2.txt` (or document the PM2 Python env separately) listing at minimum `exchange_calendars`, `databento`, `pyarrow`, `numba`, `python-dotenv`. The current packaging split between backend venv and system Python is easy to miss.
 

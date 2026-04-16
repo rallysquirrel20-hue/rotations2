@@ -10,6 +10,7 @@ from datetime import datetime
 
 from config import (
     SIZE, ETF_SIZE, SIGNALS, RV_MULT, EMA_MULT, RV_EMA_ALPHA,
+    HL_EMA_LEN,
     MARKET_SYMBOL, INCREMENTAL_MAX_DAYS,
     SIGNALS_CACHE_FILE, ETF_SIGNALS_CACHE_FILE,
     load_universe_from_disk, load_etf_universe_from_disk,
@@ -298,6 +299,39 @@ def _numba_pass5_signal(entry_arr, exit_arr, custom_entry_prices, has_custom,
             final_change_col, mfe_col, mae_col)
 
 
+@numba.njit(cache=True)
+def _numba_hl_reaction(closes, highs, lows, ema_len, n):
+    """H/L Reaction EMAs (port of rotations_strategy.txt Pine script).
+
+    On each bar that makes a new high (high > high[-1]) we compute the percent
+    distance from close to the prior bar's high; otherwise the raw series is
+    NaN and the EMA carries forward. Same logic mirrored for lows. EMAs are
+    seeded on the first valid observation. Returns ema_high, ema_low arrays.
+    The [-1, +1] normalization is NOT stored here -- callers compute it over
+    a rolling window on demand (see HL_NORM_LEN)."""
+    alpha = 2.0 / (ema_len + 1.0)
+    ema_high = np.full(n, np.nan)
+    ema_low = np.full(n, np.nan)
+    prev_high_ema = np.nan
+    prev_low_ema = np.nan
+    for i in range(1, n):
+        h = highs[i]
+        ph = highs[i - 1]
+        if np.isfinite(h) and np.isfinite(ph) and ph > 0 and h > ph:
+            src_h = (closes[i] - ph) / ph * 100.0
+            prev_high_ema = src_h if np.isnan(prev_high_ema) else alpha * src_h + (1.0 - alpha) * prev_high_ema
+
+        l = lows[i]
+        pl = lows[i - 1]
+        if np.isfinite(l) and np.isfinite(pl) and pl > 0 and l < pl:
+            src_l = (closes[i] - pl) / pl * 100.0
+            prev_low_ema = src_l if np.isnan(prev_low_ema) else alpha * src_l + (1.0 - alpha) * prev_low_ema
+
+        ema_high[i] = prev_high_ema
+        ema_low[i] = prev_low_ema
+    return ema_high, ema_low
+
+
 def _build_signals_from_df(df, ticker):
     """Core signal builder that expects OHLCV with a Date index or column.
     Uses numba-accelerated passes for ~50-100x speedup on the inner loops."""
@@ -411,6 +445,11 @@ def _build_signals_from_df(df, ticker):
         new_cols[f'{sig_name}_MAE'] = mae_col
 
     pass_times['pass5'] += time.time() - t5
+
+    # === H/L Reaction EMAs ===
+    ema_high, ema_low = _numba_hl_reaction(closes, highs, lows, HL_EMA_LEN, n)
+    new_cols['EMA_High'] = ema_high
+    new_cols['EMA_Low'] = ema_low
 
     new_cols['Ticker'] = ticker
     df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
@@ -557,6 +596,21 @@ def _build_signals_next_row(prev_row, live_price, live_dt,
         last_signal = 'breakdown'
     is_breakout_seq = (last_signal == 'breakout')
 
+    # H/L Reaction EMAs -- same one-bar recurrence as the batch numba path.
+    alpha_hl = 2.0 / (HL_EMA_LEN + 1.0)
+    prev_high = prev.get('High', np.nan)
+    prev_low = prev.get('Low', np.nan)
+    prev_ema_high = prev.get('EMA_High', np.nan)
+    prev_ema_low = prev.get('EMA_Low', np.nan)
+    ema_high_val = prev_ema_high
+    ema_low_val = prev_ema_low
+    if pd.notna(prev_high) and prev_high > 0 and high > prev_high:
+        src_h = (close - prev_high) / prev_high * 100.0
+        ema_high_val = src_h if pd.isna(prev_ema_high) else alpha_hl * src_h + (1.0 - alpha_hl) * prev_ema_high
+    if pd.notna(prev_low) and prev_low > 0 and low < prev_low:
+        src_l = (close - prev_low) / prev_low * 100.0
+        ema_low_val = src_l if pd.isna(prev_ema_low) else alpha_hl * src_l + (1.0 - alpha_hl) * prev_ema_low
+
     new_row = prev.copy()
     new_row.update({
         'Date': live_dt,
@@ -590,6 +644,8 @@ def _build_signals_next_row(prev_row, live_price, live_dt,
         'Rotation_ID': rotation_id,
         'BTFD_Triggered': btfd_triggered,
         'STFR_Triggered': stfr_triggered,
+        'EMA_High': ema_high_val,
+        'EMA_Low': ema_low_val,
     })
 
     if is_up_rot:
@@ -736,6 +792,7 @@ _BASE_KEEP = [
     'Is_Breakout', 'Is_Breakdown', 'Is_BTFD', 'Is_STFR',
     'Is_Breakout_Sequence',
     'Rotation_ID', 'BTFD_Triggered', 'STFR_Triggered',
+    'EMA_High', 'EMA_Low',
 ]
 
 

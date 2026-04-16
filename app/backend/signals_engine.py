@@ -6,6 +6,31 @@ SIGNALS = ["Up_Rot", "Down_Rot", "Breakout", "Breakdown", "BTFD", "STFR"]
 RV_MULT = np.sqrt(252) / np.sqrt(21)
 EMA_MULT = 2.0 / 11.0
 RV_EMA_ALPHA = 2.0 / 11.0
+HL_EMA_LEN = 21    # H/L reaction EMA span -- must match signals/config.py HL_EMA_LEN
+HL_NORM_LEN = 150  # H/L reaction normalization window -- must match signals/config.py HL_NORM_LEN
+
+
+def hl_normalize(s, norm_len=HL_NORM_LEN):
+    """Rescale a series to [-1, +1] over a rolling `norm_len` window.
+
+    min_periods=1 so the output populates as soon as the first EMA
+    observation is available instead of waiting for a full warmup.
+    When the window is flat we emit 0 — matches the Pine `ta.highest` /
+    `ta.lowest` convention. NaN inputs stay NaN."""
+    hi = s.rolling(norm_len, min_periods=1).max()
+    lo = s.rolling(norm_len, min_periods=1).min()
+    rng = hi - lo
+    normed = np.where(rng > 0, 2 * (s - lo) / rng - 1, 0.0)
+    return pd.Series(np.where(s.isna(), np.nan, normed), index=s.index)
+
+
+def add_hl_reaction_norm(df, norm_len=HL_NORM_LEN):
+    """Add EMA_High_Norm / EMA_Low_Norm to a single-ticker, time-sorted df."""
+    if 'EMA_High' in df.columns:
+        df['EMA_High_Norm'] = hl_normalize(df['EMA_High'], norm_len)
+    if 'EMA_Low' in df.columns:
+        df['EMA_Low_Norm'] = hl_normalize(df['EMA_Low'], norm_len)
+    return df
 
 
 class RollingStatsAccumulator:
@@ -339,6 +364,26 @@ def _build_signals_from_df(df, ticker):
         for stat_name, arr in stats_cols.items():
             new_cols[f"{sig_name}_{stat_name}"] = arr
 
+    # H/L Reaction EMAs -- mirror of signals/build_signals.py::_numba_hl_reaction.
+    alpha_hl = 2.0 / (HL_EMA_LEN + 1.0)
+    ema_high = np.full(n, np.nan)
+    ema_low = np.full(n, np.nan)
+    prev_high_ema = np.nan
+    prev_low_ema = np.nan
+    for i in range(1, n):
+        h, ph = highs[i], highs[i - 1]
+        if np.isfinite(h) and np.isfinite(ph) and ph > 0 and h > ph:
+            src_h = (closes[i] - ph) / ph * 100.0
+            prev_high_ema = src_h if np.isnan(prev_high_ema) else alpha_hl * src_h + (1.0 - alpha_hl) * prev_high_ema
+        l, pl = lows[i], lows[i - 1]
+        if np.isfinite(l) and np.isfinite(pl) and pl > 0 and l < pl:
+            src_l = (closes[i] - pl) / pl * 100.0
+            prev_low_ema = src_l if np.isnan(prev_low_ema) else alpha_hl * src_l + (1.0 - alpha_hl) * prev_low_ema
+        ema_high[i] = prev_high_ema
+        ema_low[i] = prev_low_ema
+    new_cols["EMA_High"] = ema_high
+    new_cols["EMA_Low"] = ema_low
+
     new_cols["Ticker"] = ticker
     return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
@@ -483,6 +528,21 @@ def _build_signals_next_row(prev_row, live_price, live_dt,
         last_signal = 'breakdown'
     is_breakout_seq = (last_signal == 'breakout')
 
+    # H/L Reaction EMAs -- one-bar incremental update (mirror of batch logic).
+    alpha_hl = 2.0 / (HL_EMA_LEN + 1.0)
+    prev_high = prev.get('High', np.nan)
+    prev_low = prev.get('Low', np.nan)
+    prev_ema_high = prev.get('EMA_High', np.nan)
+    prev_ema_low = prev.get('EMA_Low', np.nan)
+    ema_high_val = prev_ema_high
+    ema_low_val = prev_ema_low
+    if pd.notna(prev_high) and prev_high > 0 and high > prev_high:
+        src_h = (close - prev_high) / prev_high * 100.0
+        ema_high_val = src_h if pd.isna(prev_ema_high) else alpha_hl * src_h + (1.0 - alpha_hl) * prev_ema_high
+    if pd.notna(prev_low) and prev_low > 0 and low < prev_low:
+        src_l = (close - prev_low) / prev_low * 100.0
+        ema_low_val = src_l if pd.isna(prev_ema_low) else alpha_hl * src_l + (1.0 - alpha_hl) * prev_ema_low
+
     new_row = prev.copy()
     new_row.update({
         'Date': live_dt,
@@ -516,6 +576,8 @@ def _build_signals_next_row(prev_row, live_price, live_dt,
         'Rotation_ID': rotation_id,
         'BTFD_Triggered': btfd_triggered,
         'STFR_Triggered': stfr_triggered,
+        'EMA_High': ema_high_val,
+        'EMA_Low': ema_low_val,
     })
 
     if is_up_rot:

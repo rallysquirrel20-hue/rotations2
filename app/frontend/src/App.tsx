@@ -4,6 +4,7 @@ import { TVChart } from './components/TVChart'
 import { BasketSummary } from './components/BasketSummary'
 import { BacktestPanel } from './components/BacktestPanel'
 import { AnalogsPanel } from './components/AnalogsPanel'
+import { DistributionsPanel } from './components/DistributionsPanel'
 import { SignalsPanel } from './components/SignalsPanel'
 
 // DYNAMIC API BASE:
@@ -124,6 +125,8 @@ function App() {
   const [showRV, setShowRV] = useState(true)
   const [showYield, setShowYield] = useState(false)
   const [showDivGrowth, setShowDivGrowth] = useState(false)
+  const [showHReaction, setShowHReaction] = useState(false)
+  const [showLReaction, setShowLReaction] = useState(false)
   const [showCandleDetail, setShowCandleDetail] = useState(true)
   const [indicatorMenuOpen, setIndicatorMenuOpen] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(460)
@@ -140,6 +143,7 @@ function App() {
   const [summaryLoading, setSummaryLoading] = useState(false)
   const [showBacktest, setShowBacktest] = useState(false)
   const [showAnalogs, setShowAnalogs] = useState(false)
+  const [showDistributions, setShowDistributions] = useState(false)
   const [showSignals, setShowSignals] = useState(false)
   const [backtestBaskets, setBacktestBaskets] = useState<string[]>([])
   const contentStackRef = useRef<HTMLDivElement>(null)
@@ -1265,6 +1269,8 @@ function App() {
                       {!isBasketView && (
                         <>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showRV} onChange={e => setShowRV(e.target.checked)} /> RV%</label>
+                          <label className="overlay-checkbox"><input type="checkbox" checked={showHReaction} onChange={e => setShowHReaction(e.target.checked)} /> H React</label>
+                          <label className="overlay-checkbox"><input type="checkbox" checked={showLReaction} onChange={e => setShowLReaction(e.target.checked)} /> L React</label>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showYield} onChange={e => setShowYield(e.target.checked)} /> Yield%</label>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showDivGrowth} onChange={e => setShowDivGrowth(e.target.checked)} /> Div Growth%</label>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showVolume} onChange={e => setShowVolume(e.target.checked)} /> Volume</label>
@@ -1276,6 +1282,8 @@ function App() {
                           <label className="overlay-checkbox"><input type="checkbox" checked={showBreakout} onChange={e => setShowBreakout(e.target.checked)} /> Breakout%</label>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showCorrelation} onChange={e => setShowCorrelation(e.target.checked)} /> Correlation%</label>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showRV} onChange={e => setShowRV(e.target.checked)} /> RV%</label>
+                          <label className="overlay-checkbox"><input type="checkbox" checked={showHReaction} onChange={e => setShowHReaction(e.target.checked)} /> H React</label>
+                          <label className="overlay-checkbox"><input type="checkbox" checked={showLReaction} onChange={e => setShowLReaction(e.target.checked)} /> L React</label>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showYield} onChange={e => setShowYield(e.target.checked)} /> Yield%</label>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showDivGrowth} onChange={e => setShowDivGrowth(e.target.checked)} /> Div Growth%</label>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showCandleDetail} onChange={e => setShowCandleDetail(e.target.checked)} /> Constituents</label>
@@ -1290,21 +1298,21 @@ function App() {
               <button
                 className={`control-btn ${showSummary === 'cross' ? 'primary' : ''}`}
                 style={{ order: 1 }}
-                onClick={() => { setShowSummary(prev => prev === 'cross' ? false : 'cross'); setShowBacktest(false); setShowAnalogs(false); setShowSignals(false) }}
+                onClick={() => { setShowSummary(prev => prev === 'cross' ? false : 'cross'); setShowBacktest(false); setShowAnalogs(false); setShowSignals(false); setShowDistributions(false) }}
               >
                 Basket Returns
               </button>
               <button
                 className={`control-btn ${showAnalogs ? 'primary' : ''}`}
                 style={{ order: 2 }}
-                onClick={() => { setShowAnalogs(prev => !prev); setShowSummary(false); setShowBacktest(false); setShowSignals(false) }}
+                onClick={() => { setShowAnalogs(prev => !prev); setShowSummary(false); setShowBacktest(false); setShowSignals(false); setShowDistributions(false) }}
               >
                 Analogs
               </button>
               <button
                 className={`control-btn ${showBacktest ? 'primary' : ''}`}
                 style={{ order: 3 }}
-                onClick={() => { setShowBacktest(prev => !prev); setShowSummary(false); setShowAnalogs(false); setShowSignals(false) }}
+                onClick={() => { setShowBacktest(prev => !prev); setShowSummary(false); setShowAnalogs(false); setShowSignals(false); setShowDistributions(false) }}
               >
                 Backtest
               </button>
@@ -1316,7 +1324,7 @@ function App() {
                   else {
                     if (isBasketView && selectedItem) setIntraBasketTarget(selectedItem)
                     else setIntraBasketTarget('')
-                    setShowSummary('intra'); setShowBacktest(false); setShowAnalogs(false); setShowSignals(false)
+                    setShowSummary('intra'); setShowBacktest(false); setShowAnalogs(false); setShowSignals(false); setShowDistributions(false)
                   }
                 }}
               >
@@ -1325,11 +1333,18 @@ function App() {
               <button
                 className={`control-btn ${showSignals ? 'primary' : ''}`}
                 style={{ order: 5 }}
-                onClick={() => { setShowSignals(prev => !prev); setShowSummary(false); setShowBacktest(false); setShowAnalogs(false) }}
+                onClick={() => { setShowSignals(prev => !prev); setShowSummary(false); setShowBacktest(false); setShowAnalogs(false); setShowDistributions(false) }}
               >
                 Signals
               </button>
-              <button className="control-btn" style={{ order: 6 }} onClick={() => setExportTrigger(p => p + 1)}>Export</button>
+              <button
+                className={`control-btn ${showDistributions ? 'primary' : ''}`}
+                style={{ order: 6 }}
+                onClick={() => { setShowDistributions(prev => !prev); setShowSummary(false); setShowBacktest(false); setShowAnalogs(false); setShowSignals(false) }}
+              >
+                Distributions
+              </button>
+              <button className="control-btn" style={{ order: 7 }} onClick={() => setExportTrigger(p => p + 1)}>Export</button>
             </div>
             <div className="header-right-stack">
               {quarterKeys.length > 0 && (
@@ -1389,6 +1404,12 @@ function App() {
                 exportTrigger={exportTrigger}
                 allBaskets={baskets}
               />
+            ) : showDistributions ? (
+              <DistributionsPanel
+                apiBase={API_BASE}
+                activeTicker={activeTicker || (isTicker ? selectedItem : null)}
+                allTickers={tickers}
+              />
             ) : showBacktest ? (
               <BacktestPanel
                 apiBase={API_BASE}
@@ -1414,6 +1435,8 @@ function App() {
                 showRV={showRV}
                 showYield={showYield}
                 showDivGrowth={showDivGrowth}
+                showHReaction={showHReaction}
+                showLReaction={showLReaction}
                 rangeUpdateTrigger={rangeUpdateTrigger}
                 exportTrigger={exportTrigger}
                 symbolName={activeTicker || selectedItem}

@@ -136,14 +136,16 @@ const METRIC_DISPLAY: Record<string, string> = {
   Is_Breakout_Sequence: 'Long Term Uptrend', Uptrend_Pct: 'Breadth %',
   Breakout_Pct: 'Breakout %', Correlation_Pct: 'Correlation %',
   RV_EMA: 'Realized Vol', Volume: 'Volume', Return: 'Return',
+  EMA_High_Norm: 'H Reaction (norm)', EMA_Low_Norm: 'L Reaction (norm)',
   // Basket-prefixed versions for constituents mode
   'basket:Uptrend_Pct': 'Basket Breadth %', 'basket:Breakout_Pct': 'Basket Breakout %',
   'basket:Correlation_Pct': 'Basket Correlation %', 'basket:RV_EMA': 'Basket Realized Vol',
   'basket:Return': 'Basket Return', 'basket:Is_Breakout_Sequence': 'Basket LT Uptrend',
+  'basket:EMA_High_Norm': 'Basket H Reaction', 'basket:EMA_Low_Norm': 'Basket L Reaction',
 }
-const BASKET_STAT_METRICS = ['Uptrend_Pct', 'Breakout_Pct', 'Correlation_Pct', 'RV_EMA', 'Return']
+const BASKET_STAT_METRICS = ['Uptrend_Pct', 'Breakout_Pct', 'Correlation_Pct', 'RV_EMA', 'Return', 'EMA_High_Norm', 'EMA_Low_Norm']
 const BASKET_BOOL_METRICS = ['Is_Breakout_Sequence']
-const TICKER_STAT_METRICS = ['Volume', 'RV_EMA', 'Return']
+const TICKER_STAT_METRICS = ['Volume', 'RV_EMA', 'Return', 'EMA_High_Norm', 'EMA_Low_Norm']
 const TICKER_BOOL_METRICS = ['Is_Breakout_Sequence']
 // Prefixed versions for the Basket optgroup in constituents mode
 const CONSTITUENTS_BASKET_STAT = BASKET_STAT_METRICS.map(m => `basket:${m}`)
@@ -2797,17 +2799,21 @@ export function BacktestPanel({ apiBase, target, targetType, exportTrigger }: Ba
                     <>
                       <option value="above">Above</option>
                       <option value="below">Below</option>
+                      <option value="crosses_above">Crosses Above</option>
+                      <option value="crosses_below">Crosses Below</option>
                     </>
                   ) : (
                     <>
                       <option value="above">Above</option>
                       <option value="below">Below</option>
+                      <option value="crosses_above">Crosses Above</option>
+                      <option value="crosses_below">Crosses Below</option>
                       <option value="increasing">Increasing</option>
                       <option value="decreasing">Decreasing</option>
                     </>
                   )}
                 </select>
-                {!isBool && (f.condition === 'above' || f.condition === 'below') && (
+                {!isBool && (f.condition === 'above' || f.condition === 'below' || f.condition === 'crosses_above' || f.condition === 'crosses_below') && (
                   <input type="number" className="backtest-input" value={f.value}
                     onChange={e => updateFilterField(i, fi, 'value', e.target.value)}
                     style={{ width: 60 }} />
