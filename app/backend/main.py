@@ -1996,6 +1996,11 @@ def get_basket_data(basket_name: str):
             latest_universe = get_latest_universe_tickers(basket_name)
             tickers = [{"symbol": symbol, "weight": 0.0} for symbol in latest_universe]
 
+        # Normalized EMAs — derived on the fly from stored EMA_High/Low/PriceChg
+        if {'EMA_High', 'EMA_Low', 'EMA_PriceChg'} & set(df.columns):
+            df = df.sort_values('Date').reset_index(drop=True)
+            df = signals_engine.add_hl_reaction_norm(df)
+
         return {"chart_data": clean_data_for_json(df), "tickers": tickers}
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
@@ -2464,8 +2469,8 @@ def get_ticker_data(ticker: str):
             except Exception:
                 pass  # non-fatal: chart still works without dividend columns
 
-        # H/L Reaction normalized EMAs — derived on the fly from stored EMA_High/Low
-        if 'EMA_High' in df.columns and 'EMA_Low' in df.columns:
+        # Normalized EMAs — derived on the fly from stored EMA_High/Low/PriceChg
+        if {'EMA_High', 'EMA_Low', 'EMA_PriceChg'} & set(df.columns):
             df = df.sort_values('Date').reset_index(drop=True)
             df = signals_engine.add_hl_reaction_norm(df)
 
@@ -2476,85 +2481,123 @@ def get_ticker_data(ticker: str):
 
 @app.get("/api/distribution/next-bar")
 def get_next_bar_distribution(
-    ticker: str,
-    breakout_state: Optional[str] = None,   # 'breakout' | 'breakdown' — LT regime (Is_Breakout_Sequence)
-    rotation_state: Optional[str] = None,   # 'up' | 'down' — current trend state (Trend)
-    h_sign: Optional[str] = None,           # 'above' | 'below' — EMA_High_Norm vs 0
-    l_sign: Optional[str] = None,           # 'above' | 'below' — EMA_Low_Norm vs 0
-    h_trend: Optional[str] = None,          # 'increasing' | 'decreasing'
-    l_trend: Optional[str] = None,          # 'increasing' | 'decreasing'
+    ticker: Optional[str] = None,
+    basket: Optional[str] = None,
+    breakout_state: Optional[str] = None,
+    rotation_state: Optional[str] = None,
+    h_op: Optional[str] = None,  h_val: Optional[float] = None,
+    l_op: Optional[str] = None,  l_val: Optional[float] = None,
+    p_op: Optional[str] = None,  p_val: Optional[float] = None,
+    h_trend: Optional[str] = None,
+    l_trend: Optional[str] = None,
+    p_trend: Optional[str] = None,
+    rv_trend: Optional[str] = None,
+    breadth_op: Optional[str] = None,  breadth_val: Optional[float] = None,
+    breadth_trend: Optional[str] = None,
+    breakout_op: Optional[str] = None, breakout_val: Optional[float] = None,
+    breakout_trend: Optional[str] = None,
+    corr_op: Optional[str] = None,     corr_val: Optional[float] = None,
+    corr_trend: Optional[str] = None,
     lookback: int = 21,
 ):
-    """Conditional next-bar (close→close) return distribution for one ticker.
+    """Conditional next-bar return distribution for a ticker or basket."""
+    if not ticker and not basket:
+        raise HTTPException(status_code=400, detail="Either ticker or basket is required")
 
-    Condition semantics are REGIME-based, not point-in-time signal events:
-    - breakout_state = 'breakout' → currently in the breakout sequence (LT uptrend)
-    - breakout_state = 'breakdown' → currently in the breakdown sequence (LT downtrend)
-    - rotation_state = 'up' → currently in an uptrend (Trend == True)
-    - rotation_state = 'down' → currently in a downtrend (Trend == False)
+    ticker_cols = ['Date', 'Close', 'Trend', 'Is_Breakout_Sequence',
+                   'EMA_High', 'EMA_Low', 'EMA_PriceChg', 'RV_EMA']
+    basket_extra = ['Uptrend_Pct', 'Breakout_Pct', 'Correlation_Pct']
 
-    Any combination of the 6 condition knobs can be set; omitted knobs mean
-    "any state" for that condition. Returns both the filtered sample and the
-    ticker's unfiltered baseline so the caller can overlay them."""
-    cols = ['Date', 'Close', 'Trend', 'Is_Breakout_Sequence',
-            'EMA_High', 'EMA_Low']
     df = pd.DataFrame()
-    if INDIVIDUAL_SIGNALS_FILE.exists():
-        try:
-            df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=cols,
-                                 filters=[('Ticker', '==', ticker)])
-        except Exception:
-            df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
-                                 filters=[('Ticker', '==', ticker)])
-    if df.empty and ETF_SIGNALS_FILE.exists():
-        try:
-            df = pd.read_parquet(ETF_SIGNALS_FILE, columns=cols,
-                                 filters=[('Ticker', '==', ticker)])
-        except Exception:
-            df = pd.read_parquet(ETF_SIGNALS_FILE,
-                                 filters=[('Ticker', '==', ticker)])
-    if df.empty:
-        raise HTTPException(status_code=404, detail=f"No data for ticker {ticker}")
+    label = ticker or basket
+    if basket:
+        basket_file = _find_basket_parquet(basket)
+        if basket_file:
+            try:
+                df = pd.read_parquet(basket_file)
+            except Exception:
+                pass
+        if df.empty:
+            raise HTTPException(status_code=404, detail=f"No data for basket {basket}")
+    else:
+        cols = ticker_cols
+        if INDIVIDUAL_SIGNALS_FILE.exists():
+            try:
+                df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=cols,
+                                     filters=[('Ticker', '==', ticker)])
+            except Exception:
+                df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
+                                     filters=[('Ticker', '==', ticker)])
+        if df.empty and ETF_SIGNALS_FILE.exists():
+            try:
+                df = pd.read_parquet(ETF_SIGNALS_FILE, columns=cols,
+                                     filters=[('Ticker', '==', ticker)])
+            except Exception:
+                df = pd.read_parquet(ETF_SIGNALS_FILE,
+                                     filters=[('Ticker', '==', ticker)])
+        if df.empty:
+            raise HTTPException(status_code=404, detail=f"No data for ticker {ticker}")
 
     df = df.sort_values('Date').reset_index(drop=True)
-
-    # Derived series for reaction conditions
-    df['EMA_High_Norm'] = signals_engine.hl_normalize(df['EMA_High'], signals_engine.HL_NORM_LEN)
-    df['EMA_Low_Norm']  = signals_engine.hl_normalize(df['EMA_Low'],  signals_engine.HL_NORM_LEN)
     lookback = max(1, int(lookback or 21))
-    df['EMA_High_Prev'] = df['EMA_High'].shift(lookback)
-    df['EMA_Low_Prev']  = df['EMA_Low'].shift(lookback)
 
-    # Next-bar close-to-close return is the target distribution
+    # Derived normalized series
+    if 'EMA_High' in df.columns:
+        df['EMA_High_Norm'] = signals_engine.hl_normalize(df['EMA_High'], signals_engine.HL_NORM_LEN)
+        df['EMA_High_Prev'] = df['EMA_High'].shift(lookback)
+    if 'EMA_Low' in df.columns:
+        df['EMA_Low_Norm'] = signals_engine.hl_normalize(df['EMA_Low'], signals_engine.HL_NORM_LEN)
+        df['EMA_Low_Prev'] = df['EMA_Low'].shift(lookback)
+    if 'EMA_PriceChg' in df.columns:
+        df['EMA_PriceChg_Norm'] = signals_engine.hl_normalize(df['EMA_PriceChg'], signals_engine.HL_NORM_LEN)
+        df['EMA_PriceChg_Prev'] = df['EMA_PriceChg'].shift(lookback)
+    if 'RV_EMA' in df.columns:
+        df['RV_EMA_Prev'] = df['RV_EMA'].shift(lookback)
+    for bcol in basket_extra:
+        if bcol in df.columns:
+            df[f'{bcol}_Prev'] = df[bcol].shift(lookback)
+
     df['NextReturn'] = df['Close'].shift(-1) / df['Close'] - 1
-
     mask = df['NextReturn'].notna()
-    # Regime — which long-term sequence is the ticker currently in?
+
+    # --- Regime filters ---
     if breakout_state == 'breakout':
         mask &= df['Is_Breakout_Sequence'].fillna(False).astype(bool)
     elif breakout_state == 'breakdown':
         mask &= ~df['Is_Breakout_Sequence'].fillna(False).astype(bool)
-    # Current trend direction — Trend is stored as float32 {1.0 uptrend, 0.0 downtrend, NaN pre-init}
     if rotation_state == 'up':
         mask &= (df['Trend'] == 1.0)
     elif rotation_state == 'down':
         mask &= (df['Trend'] == 0.0)
-    if h_sign == 'above':
-        mask &= (df['EMA_High_Norm'] > 0)
-    elif h_sign == 'below':
-        mask &= (df['EMA_High_Norm'] < 0)
-    if l_sign == 'above':
-        mask &= (df['EMA_Low_Norm'] > 0)
-    elif l_sign == 'below':
-        mask &= (df['EMA_Low_Norm'] < 0)
-    if h_trend == 'increasing':
-        mask &= (df['EMA_High'] > df['EMA_High_Prev'])
-    elif h_trend == 'decreasing':
-        mask &= (df['EMA_High'] < df['EMA_High_Prev'])
-    if l_trend == 'increasing':
-        mask &= (df['EMA_Low'] > df['EMA_Low_Prev'])
-    elif l_trend == 'decreasing':
-        mask &= (df['EMA_Low'] < df['EMA_Low_Prev'])
+
+    # --- Threshold filters (op + val) ---
+    def _threshold_filter(col, op, val):
+        nonlocal mask
+        if col not in df.columns or op is None or val is None: return
+        if op == '>':    mask &= (df[col] > val)
+        elif op == '<':  mask &= (df[col] < val)
+        elif op == '>=': mask &= (df[col] >= val)
+        elif op == '<=': mask &= (df[col] <= val)
+    _threshold_filter('EMA_High_Norm', h_op, h_val)
+    _threshold_filter('EMA_Low_Norm', l_op, l_val)
+    _threshold_filter('EMA_PriceChg_Norm', p_op, p_val)
+    _threshold_filter('Uptrend_Pct', breadth_op, breadth_val)
+    _threshold_filter('Breakout_Pct', breakout_op, breakout_val)
+    _threshold_filter('Correlation_Pct', corr_op, corr_val)
+
+    # --- Trend (increasing/decreasing) filters ---
+    def _trend_filter(col, prev_col, val):
+        nonlocal mask
+        if col not in df.columns or prev_col not in df.columns: return
+        if val == 'increasing':   mask &= (df[col] > df[prev_col])
+        elif val == 'decreasing': mask &= (df[col] < df[prev_col])
+    _trend_filter('EMA_High', 'EMA_High_Prev', h_trend)
+    _trend_filter('EMA_Low', 'EMA_Low_Prev', l_trend)
+    _trend_filter('EMA_PriceChg', 'EMA_PriceChg_Prev', p_trend)
+    _trend_filter('RV_EMA', 'RV_EMA_Prev', rv_trend)
+    _trend_filter('Uptrend_Pct', 'Uptrend_Pct_Prev', breadth_trend)
+    _trend_filter('Breakout_Pct', 'Breakout_Pct_Prev', breakout_trend)
+    _trend_filter('Correlation_Pct', 'Correlation_Pct_Prev', corr_trend)
 
     def _summarize(returns):
         arr = np.asarray(returns, dtype=float)
@@ -2580,7 +2623,7 @@ def get_next_bar_distribution(
     baseline_returns = df.loc[df['NextReturn'].notna(), 'NextReturn']
     filtered_returns = df.loc[mask, 'NextReturn']
     return {
-        'ticker': ticker,
+        'ticker': label,
         'lookback': lookback,
         'filtered': _summarize(filtered_returns),
         'baseline': _summarize(baseline_returns),
@@ -2620,6 +2663,7 @@ EXIT_IS_COL = {
 _VIRTUAL_FILTER_COLS = {
     'EMA_High_Norm': 'EMA_High',
     'EMA_Low_Norm':  'EMA_Low',
+    'EMA_PriceChg_Norm': 'EMA_PriceChg',
 }
 
 

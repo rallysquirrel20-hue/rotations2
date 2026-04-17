@@ -25,11 +25,13 @@ def hl_normalize(s, norm_len=HL_NORM_LEN):
 
 
 def add_hl_reaction_norm(df, norm_len=HL_NORM_LEN):
-    """Add EMA_High_Norm / EMA_Low_Norm to a single-ticker, time-sorted df."""
+    """Add EMA_High_Norm / EMA_Low_Norm / EMA_PriceChg_Norm to a single-ticker, time-sorted df."""
     if 'EMA_High' in df.columns:
         df['EMA_High_Norm'] = hl_normalize(df['EMA_High'], norm_len)
     if 'EMA_Low' in df.columns:
         df['EMA_Low_Norm'] = hl_normalize(df['EMA_Low'], norm_len)
+    if 'EMA_PriceChg' in df.columns:
+        df['EMA_PriceChg_Norm'] = hl_normalize(df['EMA_PriceChg'], norm_len)
     return df
 
 
@@ -384,6 +386,17 @@ def _build_signals_from_df(df, ticker):
     new_cols["EMA_High"] = ema_high
     new_cols["EMA_Low"] = ema_low
 
+    # Price Change EMA — every bar contributes (no new-high/new-low gate).
+    ema_pricechg = np.full(n, np.nan)
+    prev_pc_ema = np.nan
+    for i in range(1, n):
+        c, pc = closes[i], closes[i - 1]
+        if np.isfinite(c) and np.isfinite(pc) and pc > 0:
+            pct = (c - pc) / pc * 100.0
+            prev_pc_ema = pct if np.isnan(prev_pc_ema) else alpha_hl * pct + (1.0 - alpha_hl) * prev_pc_ema
+        ema_pricechg[i] = prev_pc_ema
+    new_cols["EMA_PriceChg"] = ema_pricechg
+
     new_cols["Ticker"] = ticker
     return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
@@ -543,6 +556,13 @@ def _build_signals_next_row(prev_row, live_price, live_dt,
         src_l = (close - prev_low) / prev_low * 100.0
         ema_low_val = src_l if pd.isna(prev_ema_low) else alpha_hl * src_l + (1.0 - alpha_hl) * prev_ema_low
 
+    # Price Change EMA — every bar contributes.
+    prev_ema_pricechg = prev.get('EMA_PriceChg', np.nan)
+    ema_pricechg_val = prev_ema_pricechg
+    if pd.notna(prev_close) and prev_close > 0:
+        pct = (close - prev_close) / prev_close * 100.0
+        ema_pricechg_val = pct if pd.isna(prev_ema_pricechg) else alpha_hl * pct + (1.0 - alpha_hl) * prev_ema_pricechg
+
     new_row = prev.copy()
     new_row.update({
         'Date': live_dt,
@@ -578,6 +598,7 @@ def _build_signals_next_row(prev_row, live_price, live_dt,
         'STFR_Triggered': stfr_triggered,
         'EMA_High': ema_high_val,
         'EMA_Low': ema_low_val,
+        'EMA_PriceChg': ema_pricechg_val,
     })
 
     if is_up_rot:

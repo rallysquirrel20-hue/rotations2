@@ -10,7 +10,7 @@ from datetime import datetime
 
 from config import (
     SIZE, ETF_SIZE, SIGNALS, RV_MULT, EMA_MULT, RV_EMA_ALPHA,
-    HL_EMA_LEN,
+    HL_EMA_LEN, HL_NORM_LEN,
     MARKET_SYMBOL, INCREMENTAL_MAX_DAYS,
     SIGNALS_CACHE_FILE, ETF_SIGNALS_CACHE_FILE,
     load_universe_from_disk, load_etf_universe_from_disk,
@@ -332,6 +332,23 @@ def _numba_hl_reaction(closes, highs, lows, ema_len, n):
     return ema_high, ema_low
 
 
+@numba.njit(cache=True)
+def _numba_price_chg_ema(closes, ema_len, n):
+    """EMA of bar-to-bar % price change, no gating condition (every bar contributes).
+    Returns ema_pricechg array (raw EMA values; caller normalizes to [-1,+1])."""
+    alpha = 2.0 / (ema_len + 1.0)
+    ema_pricechg = np.full(n, np.nan)
+    prev_ema = np.nan
+    for i in range(1, n):
+        c = closes[i]
+        pc = closes[i - 1]
+        if np.isfinite(c) and np.isfinite(pc) and pc > 0:
+            pct = (c - pc) / pc * 100.0
+            prev_ema = pct if np.isnan(prev_ema) else alpha * pct + (1.0 - alpha) * prev_ema
+        ema_pricechg[i] = prev_ema
+    return ema_pricechg
+
+
 def _build_signals_from_df(df, ticker):
     """Core signal builder that expects OHLCV with a Date index or column.
     Uses numba-accelerated passes for ~50-100x speedup on the inner loops."""
@@ -450,6 +467,9 @@ def _build_signals_from_df(df, ticker):
     ema_high, ema_low = _numba_hl_reaction(closes, highs, lows, HL_EMA_LEN, n)
     new_cols['EMA_High'] = ema_high
     new_cols['EMA_Low'] = ema_low
+
+    # === Price Change EMA (ungated — every bar contributes) ===
+    new_cols['EMA_PriceChg'] = _numba_price_chg_ema(closes, HL_EMA_LEN, n)
 
     new_cols['Ticker'] = ticker
     df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
@@ -611,6 +631,13 @@ def _build_signals_next_row(prev_row, live_price, live_dt,
         src_l = (close - prev_low) / prev_low * 100.0
         ema_low_val = src_l if pd.isna(prev_ema_low) else alpha_hl * src_l + (1.0 - alpha_hl) * prev_ema_low
 
+    # Price Change EMA — every bar contributes (no gating).
+    prev_ema_pricechg = prev.get('EMA_PriceChg', np.nan)
+    ema_pricechg_val = prev_ema_pricechg
+    if pd.notna(prev_close) and prev_close > 0:
+        pct = (close - prev_close) / prev_close * 100.0
+        ema_pricechg_val = pct if pd.isna(prev_ema_pricechg) else alpha_hl * pct + (1.0 - alpha_hl) * prev_ema_pricechg
+
     new_row = prev.copy()
     new_row.update({
         'Date': live_dt,
@@ -646,6 +673,7 @@ def _build_signals_next_row(prev_row, live_price, live_dt,
         'STFR_Triggered': stfr_triggered,
         'EMA_High': ema_high_val,
         'EMA_Low': ema_low_val,
+        'EMA_PriceChg': ema_pricechg_val,
     })
 
     if is_up_rot:
@@ -792,7 +820,7 @@ _BASE_KEEP = [
     'Is_Breakout', 'Is_Breakdown', 'Is_BTFD', 'Is_STFR',
     'Is_Breakout_Sequence',
     'Rotation_ID', 'BTFD_Triggered', 'STFR_Triggered',
-    'EMA_High', 'EMA_Low',
+    'EMA_High', 'EMA_Low', 'EMA_PriceChg',
 ]
 
 

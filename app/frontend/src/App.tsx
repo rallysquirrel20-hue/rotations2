@@ -127,6 +127,7 @@ function App() {
   const [showDivGrowth, setShowDivGrowth] = useState(false)
   const [showHReaction, setShowHReaction] = useState(false)
   const [showLReaction, setShowLReaction] = useState(false)
+  const [showPriceChg, setShowPriceChg] = useState(false)
   const [showCandleDetail, setShowCandleDetail] = useState(true)
   const [indicatorMenuOpen, setIndicatorMenuOpen] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(460)
@@ -222,6 +223,12 @@ function App() {
   const isBasketView = !isTicker && !activeTicker
   const canShowSummary = isBasketView
 
+  useEffect(() => {
+    const on = !isBasketView;
+    setShowHReaction(on);
+    setShowLReaction(on);
+    setShowPriceChg(on);
+  }, [isBasketView]);
 
   // Quarters within the selected range (oldest-first for button display)
   const rangeQuarters = useMemo(() => {
@@ -1271,6 +1278,7 @@ function App() {
                           <label className="overlay-checkbox"><input type="checkbox" checked={showRV} onChange={e => setShowRV(e.target.checked)} /> RV%</label>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showHReaction} onChange={e => setShowHReaction(e.target.checked)} /> H React</label>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showLReaction} onChange={e => setShowLReaction(e.target.checked)} /> L React</label>
+                          <label className="overlay-checkbox"><input type="checkbox" checked={showPriceChg} onChange={e => setShowPriceChg(e.target.checked)} /> Price Chg</label>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showYield} onChange={e => setShowYield(e.target.checked)} /> Yield%</label>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showDivGrowth} onChange={e => setShowDivGrowth(e.target.checked)} /> Div Growth%</label>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showVolume} onChange={e => setShowVolume(e.target.checked)} /> Volume</label>
@@ -1284,6 +1292,7 @@ function App() {
                           <label className="overlay-checkbox"><input type="checkbox" checked={showRV} onChange={e => setShowRV(e.target.checked)} /> RV%</label>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showHReaction} onChange={e => setShowHReaction(e.target.checked)} /> H React</label>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showLReaction} onChange={e => setShowLReaction(e.target.checked)} /> L React</label>
+                          <label className="overlay-checkbox"><input type="checkbox" checked={showPriceChg} onChange={e => setShowPriceChg(e.target.checked)} /> Price Chg</label>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showYield} onChange={e => setShowYield(e.target.checked)} /> Yield%</label>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showDivGrowth} onChange={e => setShowDivGrowth(e.target.checked)} /> Div Growth%</label>
                           <label className="overlay-checkbox"><input type="checkbox" checked={showCandleDetail} onChange={e => setShowCandleDetail(e.target.checked)} /> Constituents</label>
@@ -1409,6 +1418,8 @@ function App() {
                 apiBase={API_BASE}
                 activeTicker={activeTicker || (isTicker ? selectedItem : null)}
                 allTickers={tickers}
+                activeBasket={isBasketView ? selectedItem : null}
+                allBaskets={baskets}
               />
             ) : showBacktest ? (
               <BacktestPanel
@@ -1437,6 +1448,7 @@ function App() {
                 showDivGrowth={showDivGrowth}
                 showHReaction={showHReaction}
                 showLReaction={showLReaction}
+                showPriceChg={showPriceChg}
                 rangeUpdateTrigger={rangeUpdateTrigger}
                 exportTrigger={exportTrigger}
                 symbolName={activeTicker || selectedItem}
