@@ -9,6 +9,7 @@ import databento as db
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import asyncio
+import bisect
 import logging
 import signals_engine
 import re
@@ -2479,6 +2480,225 @@ def get_ticker_data(ticker: str):
     except Exception: raise HTTPException(status_code=500)
 
 
+def _expanding_pct_rank(values: np.ndarray) -> np.ndarray:
+    """Expanding-window percentile rank: bar i's rank uses strictly-prior finite values.
+    Midrank is returned for ties. NaN/inf at bar i → NaN out; NaN inputs are skipped
+    from the growing pool so they do not dilute rank."""
+    n = len(values)
+    out = np.full(n, np.nan, dtype=float)
+    pool: list[float] = []
+    for i in range(n):
+        v = values[i]
+        if pool and np.isfinite(v):
+            lo = bisect.bisect_left(pool, float(v))
+            hi = bisect.bisect_right(pool, float(v))
+            out[i] = 0.5 * (lo + hi) / len(pool)
+        if np.isfinite(v):
+            bisect.insort(pool, float(v))
+    return out
+
+
+def _label_rotation_context(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach per-rotation context columns for four rotation types.
+
+    For each of UpRot, DownRot, Breakout, Breakdown, adds columns per bar:
+      {type}_Time_0, Range_0, Change_0       — active rotation if in state,
+                                               else last completed rotation.
+      {type}_Time_{1,2,3}, Range_*, Change_* — the three prior completed rotations.
+      {type}_Time_0_Pct, Range_0_Pct, Change_0_Pct — expanding-window percentile
+                                               rank of _0 vs strictly-prior completed
+                                               rotations of the same type.
+
+    Range is favorable extension from entry_open as a decimal (high-side for
+    UpRot/Breakout, low-side for DownRot/Breakdown). Change is (close −
+    entry_open) / entry_open, signed. df must be sorted by Date ascending.
+    """
+    n = len(df)
+    if n == 0:
+        return df
+    required = {'Open', 'High', 'Low', 'Close', 'Trend', 'Is_Breakout_Sequence'}
+    if required - set(df.columns):
+        return df
+
+    df = df.copy()
+    rotation_types = [
+        ('UpRot',     'Trend',                1.0,   True),
+        ('DownRot',   'Trend',                0.0,   False),
+        ('Breakout',  'Is_Breakout_Sequence', True,  True),
+        ('Breakdown', 'Is_Breakout_Sequence', False, False),
+    ]
+
+    for prefix, state_col, target_val, is_bullish in rotation_types:
+        in_state = (df[state_col] == target_val).fillna(False).to_numpy()
+        if not in_state.any():
+            continue
+
+        # Run IDs (1..R) for bars in this state; 0 for bars not in state
+        run_start = in_state & np.r_[True, ~in_state[:-1]]
+        run_id_active = np.where(in_state, np.cumsum(run_start), 0).astype(int)
+        # Final bar of each in-state run
+        run_end_mask = in_state & ~np.r_[in_state[1:], False]
+        last_completed = pd.Series(
+            np.where(run_end_mask, run_id_active, 0)
+        ).cummax().to_numpy().astype(int)
+        # last_completed_prior[i] = id of last run whose end is strictly before i
+        last_completed_prior = np.r_[0, last_completed[:-1]].astype(int)
+
+        # in-state bars: per-run running stats
+        in_idx = np.where(in_state)[0]
+        temp = pd.DataFrame({
+            'Open':  df['Open'].to_numpy()[in_idx],
+            'High':  df['High'].to_numpy()[in_idx],
+            'Low':   df['Low'].to_numpy()[in_idx],
+            'Close': df['Close'].to_numpy()[in_idx],
+            'run':   run_id_active[in_idx],
+        })
+        g = temp.groupby('run', sort=True)
+        entry_open      = g['Open'].transform('first').to_numpy()
+        max_high_so_far = g['High'].cummax().to_numpy()
+        min_low_so_far  = g['Low'].cummin().to_numpy()
+        bar_idx_in_run  = g.cumcount().to_numpy() + 1
+        close_in_run    = temp['Close'].to_numpy()
+
+        active_time   = bar_idx_in_run.astype(float)
+        if is_bullish:
+            active_range = (max_high_so_far - entry_open) / entry_open
+        else:
+            active_range = (entry_open - min_low_so_far) / entry_open
+        active_change = (close_in_run - entry_open) / entry_open
+
+        # Per-run final stats
+        run_finals = (
+            temp.assign(_mh=max_high_so_far, _ml=min_low_so_far,
+                        _entry=entry_open, _pos=bar_idx_in_run)
+                .groupby('run', sort=True)
+                .agg(time=('_pos', 'max'),
+                     entry_open=('_entry', 'first'),
+                     max_high=('_mh', 'max'),
+                     min_low=('_ml', 'min'),
+                     final_close=('Close', 'last'))
+        )
+        if is_bullish:
+            run_finals['range_final'] = (run_finals['max_high'] - run_finals['entry_open']) / run_finals['entry_open']
+        else:
+            run_finals['range_final'] = (run_finals['entry_open'] - run_finals['min_low']) / run_finals['entry_open']
+        run_finals['change_final'] = (run_finals['final_close'] - run_finals['entry_open']) / run_finals['entry_open']
+
+        # _0: active values where in state, final values of last completed run otherwise
+        time_0   = np.full(n, np.nan)
+        range_0  = np.full(n, np.nan)
+        change_0 = np.full(n, np.nan)
+        time_0[in_idx]   = active_time
+        range_0[in_idx]  = active_range
+        change_0[in_idx] = active_change
+
+        oos_mask = ~in_state & (last_completed_prior > 0)
+        if oos_mask.any():
+            runs_oos = last_completed_prior[oos_mask]
+            time_0[oos_mask]   = run_finals['time'].reindex(runs_oos).to_numpy()
+            range_0[oos_mask]  = run_finals['range_final'].reindex(runs_oos).to_numpy()
+            change_0[oos_mask] = run_finals['change_final'].reindex(runs_oos).to_numpy()
+
+        df[f'{prefix}_Time_0']   = time_0
+        df[f'{prefix}_Range_0']  = range_0
+        df[f'{prefix}_Change_0'] = change_0
+
+        # Attribution for priors: if in state, current run is _0; if not, last
+        # completed run is _0. Either way, _1/_2/_3 walk back from that run id.
+        run_id_for_zero = np.where(in_state, run_id_active, last_completed_prior).astype(int)
+
+        # Absolute extreme (peak high for bullish types, trough low for bearish).
+        # Compared bar-by-bar against the prior completed rotation's extreme to
+        # power HH / LH / HL / LL filters.
+        extreme_0 = np.full(n, np.nan)
+        extreme_1 = np.full(n, np.nan)
+        extreme_src_col = 'max_high' if is_bullish else 'min_low'
+        if is_bullish:
+            extreme_0[in_idx] = max_high_so_far
+        else:
+            extreme_0[in_idx] = min_low_so_far
+        if oos_mask.any():
+            runs_oos = last_completed_prior[oos_mask]
+            extreme_0[oos_mask] = run_finals[extreme_src_col].reindex(runs_oos).to_numpy()
+        df[f'{prefix}_Extreme_0'] = extreme_0
+        for back_n in (1, 2, 3):
+            tgt = run_id_for_zero - back_n
+            v = tgt > 0
+            arr = np.full(n, np.nan)
+            if v.any():
+                arr[v] = run_finals[extreme_src_col].reindex(tgt[v]).to_numpy()
+            df[f'{prefix}_Extreme_{back_n}'] = arr
+
+        for back_n in (1, 2, 3):
+            target_runs = run_id_for_zero - back_n
+            valid = target_runs > 0
+            tb = np.full(n, np.nan); rb = np.full(n, np.nan); cb = np.full(n, np.nan)
+            if valid.any():
+                vr = target_runs[valid]
+                tb[valid] = run_finals['time'].reindex(vr).to_numpy()
+                rb[valid] = run_finals['range_final'].reindex(vr).to_numpy()
+                cb[valid] = run_finals['change_final'].reindex(vr).to_numpy()
+            df[f'{prefix}_Time_{back_n}']   = tb
+            df[f'{prefix}_Range_{back_n}']  = rb
+            df[f'{prefix}_Change_{back_n}'] = cb
+
+        # Expanding-window percentile rank for _0 against strictly-prior completed runs.
+        # Pool for an in-state bar: runs 1..last_completed_prior[i] (excludes active run).
+        # Pool for an oos bar: runs 1..(last_completed_prior[i] - 1), to avoid self-ranking.
+        pool_size = np.where(in_state, last_completed_prior, np.maximum(last_completed_prior - 1, 0)).astype(int)
+        final_time   = run_finals['time'].to_numpy(dtype=float)
+        final_range  = run_finals['range_final'].to_numpy(dtype=float)
+        final_change = run_finals['change_final'].to_numpy(dtype=float)
+
+        # Percentile ranks for _0 (current) and _1/_2/_3 (back rotations), all ranked
+        # against the expanding pool of strictly-prior completed runs.
+        pct_arrays = {
+            (metric, bn): np.full(n, np.nan)
+            for metric in ('Time', 'Range', 'Change')
+            for bn in (0, 1, 2, 3)
+        }
+        # Value arrays per back-index (for N ≥ 1 these were already written to df above).
+        val_by_idx = {
+            ('Time', 0): time_0,       ('Range', 0): range_0,       ('Change', 0): change_0,
+        }
+        for bn in (1, 2, 3):
+            val_by_idx[('Time', bn)]   = df[f'{prefix}_Time_{bn}'].to_numpy(dtype=float)
+            val_by_idx[('Range', bn)]  = df[f'{prefix}_Range_{bn}'].to_numpy(dtype=float)
+            val_by_idx[('Change', bn)] = df[f'{prefix}_Change_{bn}'].to_numpy(dtype=float)
+
+        sorted_time, sorted_range, sorted_change = [], [], []
+        order = np.argsort(pool_size, kind='stable')
+        k_cursor = 0
+
+        def _rank(val, pool):
+            if not np.isfinite(val) or not pool:
+                return np.nan
+            lo = bisect.bisect_left(pool, val)
+            hi = bisect.bisect_right(pool, val)
+            return 0.5 * (lo + hi) / len(pool)
+
+        for bi in order:
+            k = int(pool_size[bi])
+            if k == 0:
+                continue
+            while k_cursor < k:
+                bisect.insort(sorted_time,   float(final_time[k_cursor]))
+                bisect.insort(sorted_range,  float(final_range[k_cursor]))
+                bisect.insort(sorted_change, float(final_change[k_cursor]))
+                k_cursor += 1
+            for bn in (0, 1, 2, 3):
+                pct_arrays[('Time',   bn)][bi] = _rank(val_by_idx[('Time',   bn)][bi], sorted_time)
+                pct_arrays[('Range',  bn)][bi] = _rank(val_by_idx[('Range',  bn)][bi], sorted_range)
+                pct_arrays[('Change', bn)][bi] = _rank(val_by_idx[('Change', bn)][bi], sorted_change)
+
+        for bn in (0, 1, 2, 3):
+            df[f'{prefix}_Time_{bn}_Pct']   = pct_arrays[('Time',   bn)]
+            df[f'{prefix}_Range_{bn}_Pct']  = pct_arrays[('Range',  bn)]
+            df[f'{prefix}_Change_{bn}_Pct'] = pct_arrays[('Change', bn)]
+
+    return df
+
+
 @app.get("/api/distribution/next-bar")
 def get_next_bar_distribution(
     ticker: Optional[str] = None,
@@ -2488,6 +2708,11 @@ def get_next_bar_distribution(
     h_op: Optional[str] = None,  h_val: Optional[float] = None,
     l_op: Optional[str] = None,  l_val: Optional[float] = None,
     p_op: Optional[str] = None,  p_val: Optional[float] = None,
+    h_pct_op: Optional[str] = None,  h_pct_val: Optional[float] = None,
+    l_pct_op: Optional[str] = None,  l_pct_val: Optional[float] = None,
+    p_pct_op: Optional[str] = None,  p_pct_val: Optional[float] = None,
+    rv_op: Optional[str] = None,     rv_val: Optional[float] = None,
+    rv_pct_op: Optional[str] = None, rv_pct_val: Optional[float] = None,
     h_trend: Optional[str] = None,
     l_trend: Optional[str] = None,
     p_trend: Optional[str] = None,
@@ -2499,13 +2724,26 @@ def get_next_bar_distribution(
     corr_op: Optional[str] = None,     corr_val: Optional[float] = None,
     corr_trend: Optional[str] = None,
     lookback: int = 21,
+    rot: Optional[str] = None,
+    horizon: str = "1",
+    loc_upper: Optional[str] = None,
+    loc_lower: Optional[str] = None,
 ):
-    """Conditional next-bar return distribution for a ticker or basket."""
+    """Conditional forward-return distribution for a ticker or basket.
+
+    `horizon` accepts a positive integer (bars ahead) or the string "rotation"
+    (hold until Trend flips). Default "1" preserves the original next-bar behaviour.
+
+    The `rot` param is a JSON string encoding rotation-context filters.
+    Shape: {<Type>: {threshold: {<Metric>: {op, val}}, percentile: {...}, trend: {<Metric>: 'increasing'|'decreasing'}}}
+    where Type ∈ {UpRot, DownRot, Breakout, Breakdown}, Metric ∈ {Time, Range, Change}.
+    """
     if not ticker and not basket:
         raise HTTPException(status_code=400, detail="Either ticker or basket is required")
 
-    ticker_cols = ['Date', 'Close', 'Trend', 'Is_Breakout_Sequence',
-                   'EMA_High', 'EMA_Low', 'EMA_PriceChg', 'RV_EMA']
+    ticker_cols = ['Date', 'Open', 'High', 'Low', 'Close', 'Trend', 'Is_Breakout_Sequence',
+                   'EMA_High', 'EMA_Low', 'EMA_PriceChg', 'RV_EMA',
+                   'Upper_Target', 'Lower_Target']
     basket_extra = ['Uptrend_Pct', 'Breakout_Pct', 'Correlation_Pct']
 
     df = pd.DataFrame()
@@ -2539,26 +2777,92 @@ def get_next_bar_distribution(
             raise HTTPException(status_code=404, detail=f"No data for ticker {ticker}")
 
     df = df.sort_values('Date').reset_index(drop=True)
+    df = _label_rotation_context(df)
     lookback = max(1, int(lookback or 21))
 
     # Derived normalized series
     if 'EMA_High' in df.columns:
         df['EMA_High_Norm'] = signals_engine.hl_normalize(df['EMA_High'], signals_engine.HL_NORM_LEN)
         df['EMA_High_Prev'] = df['EMA_High'].shift(lookback)
+        df['EMA_High_Pct']  = _expanding_pct_rank(df['EMA_High'].to_numpy(dtype=float))
     if 'EMA_Low' in df.columns:
         df['EMA_Low_Norm'] = signals_engine.hl_normalize(df['EMA_Low'], signals_engine.HL_NORM_LEN)
         df['EMA_Low_Prev'] = df['EMA_Low'].shift(lookback)
+        df['EMA_Low_Pct']  = _expanding_pct_rank(df['EMA_Low'].to_numpy(dtype=float))
     if 'EMA_PriceChg' in df.columns:
         df['EMA_PriceChg_Norm'] = signals_engine.hl_normalize(df['EMA_PriceChg'], signals_engine.HL_NORM_LEN)
         df['EMA_PriceChg_Prev'] = df['EMA_PriceChg'].shift(lookback)
+        df['EMA_PriceChg_Pct']  = _expanding_pct_rank(df['EMA_PriceChg'].to_numpy(dtype=float))
     if 'RV_EMA' in df.columns:
         df['RV_EMA_Prev'] = df['RV_EMA'].shift(lookback)
+        # Annualized RV (% per year), matches the TVChart pane display
+        df['RV_Annualized'] = df['RV_EMA'] * np.sqrt(252) * 100
+        df['RV_EMA_Pct']    = _expanding_pct_rank(df['RV_EMA'].to_numpy(dtype=float))
     for bcol in basket_extra:
         if bcol in df.columns:
             df[f'{bcol}_Prev'] = df[bcol].shift(lookback)
 
-    df['NextReturn'] = df['Close'].shift(-1) / df['Close'] - 1
+    # --- Horizon-based forward return ---
+    # horizon is one of "1", "5", "21", "63", "rotation", or any positive int.
+    close = df['Close'].to_numpy(dtype=float)
+    n_rows = len(close)
+    horizon_mode_rotation = (str(horizon).lower() == 'rotation')
+    horizon_bars_fixed: Optional[int] = None
+    if not horizon_mode_rotation:
+        try:
+            horizon_bars_fixed = max(1, int(horizon))
+        except (TypeError, ValueError):
+            horizon_bars_fixed = 1
+
+    next_return = np.full(n_rows, np.nan)
+    # Target index for each entry bar; -1 means "no valid exit".
+    target_idx = np.full(n_rows, -1, dtype=int)
+    if horizon_mode_rotation and 'Trend' in df.columns:
+        trend = df['Trend'].to_numpy()
+        # Run ID changes whenever Trend flips (ignoring NaNs at edges).
+        run_id = np.zeros(n_rows, dtype=int)
+        cur = 0
+        prev = None
+        for i in range(n_rows):
+            t = trend[i]
+            if prev is None or (not np.isnan(t) and not np.isnan(prev) and t != prev):
+                cur += 1
+            run_id[i] = cur
+            if not np.isnan(t):
+                prev = t
+        # Last bar index of each run
+        idx_arr = np.arange(n_rows)
+        run_last = pd.Series(idx_arr).groupby(pd.Series(run_id)).transform('max').to_numpy()
+        # Bars-to-end = last_in_run - current_index. The final (in-progress) run is invalid.
+        bars_to_end = run_last - idx_arr
+        last_run = run_id[-1]
+        bars_to_end[run_id == last_run] = -1
+        valid = bars_to_end > 0
+        target_idx[valid] = idx_arr[valid] + bars_to_end[valid]
+    elif horizon_bars_fixed is not None:
+        H = horizon_bars_fixed
+        idx_arr = np.arange(n_rows)
+        potential = idx_arr + H
+        valid = potential < n_rows
+        target_idx[valid] = potential[valid]
+
+    valid_mask = target_idx >= 0
+    if valid_mask.any():
+        entries = np.arange(n_rows)[valid_mask]
+        exits = target_idx[valid_mask]
+        next_return[valid_mask] = close[exits] / close[entries] - 1
+
+    df['NextReturn'] = next_return
+    df['_target_idx'] = target_idx
     mask = df['NextReturn'].notna()
+
+    # --- Location filters (price vs target) ---
+    if loc_upper in ('above', 'below') and 'Upper_Target' in df.columns:
+        if loc_upper == 'above': mask &= (df['Close'] > df['Upper_Target'])
+        else:                    mask &= (df['Close'] < df['Upper_Target'])
+    if loc_lower in ('above', 'below') and 'Lower_Target' in df.columns:
+        if loc_lower == 'above': mask &= (df['Close'] > df['Lower_Target'])
+        else:                    mask &= (df['Close'] < df['Lower_Target'])
 
     # --- Regime filters ---
     if breakout_state == 'breakout':
@@ -2574,13 +2878,26 @@ def get_next_bar_distribution(
     def _threshold_filter(col, op, val):
         nonlocal mask
         if col not in df.columns or op is None or val is None: return
-        if op == '>':    mask &= (df[col] > val)
-        elif op == '<':  mask &= (df[col] < val)
-        elif op == '>=': mask &= (df[col] >= val)
-        elif op == '<=': mask &= (df[col] <= val)
+        s = df[col]
+        if op == '>':    mask &= (s > val)
+        elif op == '<':  mask &= (s < val)
+        elif op == '>=': mask &= (s >= val)
+        elif op == '<=': mask &= (s <= val)
+        # Crossing ops: only the bar where the series crosses val qualifies.
+        elif op == '↑':  # previous bar strictly below val, current at-or-above
+            prev = s.shift(1)
+            mask &= (prev < val) & (s >= val)
+        elif op == '↓':  # previous bar strictly above val, current at-or-below
+            prev = s.shift(1)
+            mask &= (prev > val) & (s <= val)
     _threshold_filter('EMA_High_Norm', h_op, h_val)
     _threshold_filter('EMA_Low_Norm', l_op, l_val)
     _threshold_filter('EMA_PriceChg_Norm', p_op, p_val)
+    _threshold_filter('EMA_High_Pct',     h_pct_op, h_pct_val)
+    _threshold_filter('EMA_Low_Pct',      l_pct_op, l_pct_val)
+    _threshold_filter('EMA_PriceChg_Pct', p_pct_op, p_pct_val)
+    _threshold_filter('RV_Annualized',    rv_op,     rv_val)
+    _threshold_filter('RV_EMA_Pct',       rv_pct_op, rv_pct_val)
     _threshold_filter('Uptrend_Pct', breadth_op, breadth_val)
     _threshold_filter('Breakout_Pct', breakout_op, breakout_val)
     _threshold_filter('Correlation_Pct', corr_op, corr_val)
@@ -2598,6 +2915,81 @@ def get_next_bar_distribution(
     _trend_filter('Uptrend_Pct', 'Uptrend_Pct_Prev', breadth_trend)
     _trend_filter('Breakout_Pct', 'Breakout_Pct_Prev', breakout_trend)
     _trend_filter('Correlation_Pct', 'Correlation_Pct_Prev', corr_trend)
+
+    # --- Rotation context filters (Phase 2) ---
+    if rot:
+        try:
+            rot_spec = json.loads(rot)
+        except Exception:
+            rot_spec = {}
+        for prefix in ('UpRot', 'DownRot', 'Breakout', 'Breakdown'):
+            fspec = rot_spec.get(prefix) or {}
+            th_spec = fspec.get('threshold') or {}
+            pct_spec = fspec.get('percentile') or {}
+            tr_spec = fspec.get('trend') or {}
+            # Threshold format:
+            #   Legacy flat: {Time: {op,val}, Range: ..., Change: ...} — applied to index 0
+            #   New indexed: {"0": {Time: ..., Range: ...}, "1": {...}, "2": {...}}
+            # Detect by whether any top-level key is a digit string.
+            is_indexed_threshold = any(isinstance(k, str) and k.isdigit() for k in th_spec.keys()) if isinstance(th_spec, dict) else False
+            pattern = fspec.get('pattern')
+            # Accept either a bare string (legacy — compares 0 vs 1) or a dict of
+            # per-pair comparisons like {"0_1": "higher", "1_2": "lower", "2_3": "higher"}.
+            if pattern in ('higher', 'lower'):
+                pattern = {'0_1': pattern}
+            if isinstance(pattern, dict):
+                for key, direction in pattern.items():
+                    if direction not in ('higher', 'lower'): continue
+                    try:
+                        a_idx, b_idx = key.split('_')
+                        int(a_idx); int(b_idx)
+                    except Exception:
+                        continue
+                    ca, cb = f'{prefix}_Extreme_{a_idx}', f'{prefix}_Extreme_{b_idx}'
+                    if ca in df.columns and cb in df.columns:
+                        if direction == 'higher':
+                            mask &= (df[ca] > df[cb])
+                        else:
+                            mask &= (df[ca] < df[cb])
+            # Thresholds: per rotation index (0 / 1 / 2) on Time / Range / Change.
+            if is_indexed_threshold:
+                for idx_str, idx_spec in th_spec.items():
+                    if not (isinstance(idx_str, str) and idx_str.isdigit()): continue
+                    if not isinstance(idx_spec, dict): continue
+                    for metric in ('Time', 'Range', 'Change'):
+                        th = idx_spec.get(metric) or {}
+                        if th.get('op') is not None and th.get('val') is not None:
+                            _threshold_filter(f'{prefix}_{metric}_{idx_str}', th['op'], float(th['val']))
+            else:
+                # Legacy flat format — applies to rotation 0.
+                for metric in ('Time', 'Range', 'Change'):
+                    th = th_spec.get(metric) or {}
+                    if th.get('op') is not None and th.get('val') is not None:
+                        _threshold_filter(f'{prefix}_{metric}_0', th['op'], float(th['val']))
+            # Percentile: new indexed format mirrors threshold; legacy flat applies to R0.
+            is_indexed_pct = any(isinstance(k, str) and k.isdigit() for k in pct_spec.keys()) if isinstance(pct_spec, dict) else False
+            if is_indexed_pct:
+                for idx_str, idx_spec in pct_spec.items():
+                    if not (isinstance(idx_str, str) and idx_str.isdigit()): continue
+                    if not isinstance(idx_spec, dict): continue
+                    for metric in ('Time', 'Range', 'Change'):
+                        pc = idx_spec.get(metric) or {}
+                        if pc.get('op') is not None and pc.get('val') is not None:
+                            _threshold_filter(f'{prefix}_{metric}_{idx_str}_Pct', pc['op'], float(pc['val']))
+            else:
+                for metric in ('Time', 'Range', 'Change'):
+                    pc = pct_spec.get(metric) or {}
+                    if pc.get('op') is not None and pc.get('val') is not None:
+                        _threshold_filter(f'{prefix}_{metric}_0_Pct', pc['op'], float(pc['val']))
+            for metric in ('Time', 'Range', 'Change'):
+                # Monotonic trend (deprecated, retained for backward compat).
+                direction = tr_spec.get(metric)
+                c0, c1, c2 = f'{prefix}_{metric}_0', f'{prefix}_{metric}_1', f'{prefix}_{metric}_2'
+                if direction and all(c in df.columns for c in (c0, c1, c2)):
+                    if direction == 'increasing':
+                        mask &= (df[c0] > df[c1]) & (df[c1] > df[c2])
+                    elif direction == 'decreasing':
+                        mask &= (df[c0] < df[c1]) & (df[c1] < df[c2])
 
     def _summarize(returns):
         arr = np.asarray(returns, dtype=float)
@@ -2622,11 +3014,143 @@ def get_next_bar_distribution(
 
     baseline_returns = df.loc[df['NextReturn'].notna(), 'NextReturn']
     filtered_returns = df.loc[mask, 'NextReturn']
+
+    # --- Forward paths per filtered match (for winner/loser viz, Phase 4) ---
+    # Only emit for fixed horizons — the 'rotation' mode has variable-length paths.
+    MAX_MATCHES = 500
+    forward_paths: list[dict] = []
+    if horizon_bars_fixed is not None and int(mask.sum()) > 0:
+        match_idx_all = np.where(mask.to_numpy())[0]
+        # Cap N at MAX_MATCHES, evenly sampling across time to keep temporal coverage.
+        if len(match_idx_all) > MAX_MATCHES:
+            sel = np.linspace(0, len(match_idx_all) - 1, MAX_MATCHES).astype(int)
+            match_idx = match_idx_all[sel]
+        else:
+            match_idx = match_idx_all
+
+        H = horizon_bars_fixed
+        # Downsample path length when horizon is large to keep payload small.
+        DOWNSAMPLE_LIMIT = 126
+        if H + 1 > DOWNSAMPLE_LIMIT:
+            sample_steps = np.linspace(0, H, DOWNSAMPLE_LIMIT).astype(int)
+        else:
+            sample_steps = np.arange(H + 1)
+
+        dates = df['Date'].to_numpy()
+        for i in match_idx:
+            end = i + H
+            if end >= n_rows:
+                continue
+            entry = close[i]
+            if not np.isfinite(entry) or entry == 0:
+                continue
+            series_vals = close[i + sample_steps] / entry - 1
+            forward_paths.append({
+                'date': pd.Timestamp(dates[i]).strftime('%Y-%m-%d') if pd.notna(dates[i]) else None,
+                'final_return': round(float(close[end] / entry - 1), 6),
+                'series': [round(float(v), 6) for v in series_vals.tolist()],
+            })
+
+    def _last_finite(col):
+        if col not in df.columns:
+            return None
+        s = df[col].dropna()
+        if s.empty:
+            return None
+        v = float(s.iloc[-1])
+        return v if np.isfinite(v) else None
+
+    # Latest bar state flags
+    last_trend = df['Trend'].iloc[-1] if 'Trend' in df.columns and len(df) else None
+    last_bseq = df['Is_Breakout_Sequence'].iloc[-1] if 'Is_Breakout_Sequence' in df.columns and len(df) else None
+    active_map = {
+        'UpRot':     bool(last_trend == 1.0),
+        'DownRot':   bool(last_trend == 0.0),
+        'Breakout':  bool(last_bseq == True),
+        'Breakdown': bool(last_bseq == False),
+    }
+
+    # Per-rotation context with pattern flag (HH/LH for bullish, HL/LL for bearish)
+    rotation_context = {}
+    for prefix in ('UpRot', 'DownRot', 'Breakout', 'Breakdown'):
+        is_bullish = prefix in ('UpRot', 'Breakout')
+        e0 = _last_finite(f'{prefix}_Extreme_0')
+        e1 = _last_finite(f'{prefix}_Extreme_1')
+        pattern = None
+        if e0 is not None and e1 is not None:
+            if e0 > e1:   pattern = 'HH' if is_bullish else 'HL'
+            elif e0 < e1: pattern = 'LH' if is_bullish else 'LL'
+        rotation_context[prefix] = {
+            'active':       active_map[prefix],
+            'pattern':      pattern,
+            'Time_0':       _last_finite(f'{prefix}_Time_0'),
+            'Range_0':      _last_finite(f'{prefix}_Range_0'),
+            'Change_0':     _last_finite(f'{prefix}_Change_0'),
+            'Time_0_Pct':   _last_finite(f'{prefix}_Time_0_Pct'),
+            'Range_0_Pct':  _last_finite(f'{prefix}_Range_0_Pct'),
+            'Change_0_Pct': _last_finite(f'{prefix}_Change_0_Pct'),
+            'Time_1':       _last_finite(f'{prefix}_Time_1'),
+            'Range_1':      _last_finite(f'{prefix}_Range_1'),
+            'Change_1':     _last_finite(f'{prefix}_Change_1'),
+            'Time_2':       _last_finite(f'{prefix}_Time_2'),
+            'Range_2':      _last_finite(f'{prefix}_Range_2'),
+            'Change_2':     _last_finite(f'{prefix}_Change_2'),
+            'Time_3':       _last_finite(f'{prefix}_Time_3'),
+            'Range_3':      _last_finite(f'{prefix}_Range_3'),
+            'Change_3':     _last_finite(f'{prefix}_Change_3'),
+        }
+
+    # Latest bar date
+    last_date = None
+    if 'Date' in df.columns and len(df):
+        v = df['Date'].iloc[-1]
+        if pd.notna(v):
+            last_date = pd.Timestamp(v).strftime('%Y-%m-%d')
+
+    # Price-vs-target position at the latest bar
+    last_close = _last_finite('Close')
+    last_upper = _last_finite('Upper_Target')
+    last_lower = _last_finite('Lower_Target')
+    position = None
+    if last_close is not None and last_upper is not None and last_close > last_upper:
+        position = 'above_upper'
+    elif last_close is not None and last_lower is not None and last_close < last_lower:
+        position = 'below_lower'
+    elif last_close is not None and last_upper is not None and last_lower is not None:
+        position = 'between'
+
+    current_context = {
+        'date':            last_date,
+        'close':           last_close,
+        'upper_target':    last_upper,
+        'lower_target':    last_lower,
+        'position':        position,
+        'active_rotation': 'up' if active_map['UpRot'] else ('down' if active_map['DownRot'] else None),
+        'active_regime':   'breakout' if active_map['Breakout'] else ('breakdown' if active_map['Breakdown'] else None),
+        'indicators': {
+            'rv_ann':        _last_finite('RV_Annualized'),
+            'rv_pct':        _last_finite('RV_EMA_Pct'),
+            'h_react':       _last_finite('EMA_High_Norm'),
+            'h_pct':         _last_finite('EMA_High_Pct'),
+            'l_react':       _last_finite('EMA_Low_Norm'),
+            'l_pct':         _last_finite('EMA_Low_Pct'),
+            'p_react':       _last_finite('EMA_PriceChg_Norm'),
+            'p_pct':         _last_finite('EMA_PriceChg_Pct'),
+            'breadth':       _last_finite('Uptrend_Pct'),
+            'breakout_pct':  _last_finite('Breakout_Pct'),
+            'corr_pct':      _last_finite('Correlation_Pct'),
+        },
+        'rotations': rotation_context,
+    }
+
     return {
         'ticker': label,
         'lookback': lookback,
+        'horizon': ('rotation' if horizon_mode_rotation else int(horizon_bars_fixed or 1)),
         'filtered': _summarize(filtered_returns),
         'baseline': _summarize(baseline_returns),
+        'forward_paths': forward_paths,
+        'current_context': current_context,
     }
 
 
