@@ -1,6 +1,6 @@
 # Monorepo Integration Map
 
-Updated: 2026-04-13 (dividend yield + growth end-to-end — build_dividend_metrics.py, basket dividend series, TVChart panes; TTM/YoY switched to 365 calendar days)
+Updated: 2026-04-20 (Distributions panel `/api/distribution/next-bar` expanded — reads Open/High/Low/Upper_Target/Lower_Target; adds `horizon`, `rot` JSON, `loc_upper/lower`, percentile + RV filters; returns `forward_paths` and `current_context`)
 
 ## Data Flow
 
@@ -120,6 +120,7 @@ All files in `~/Documents/Python_Outputs/Data_Storage/` (configurable via `PYTHO
 | `GET /api/etfs` | `etf_universes_50.json`, `signals_etf_50.parquet` |
 | `GET /api/ticker-names` | `ticker_names.json` |
 | `GET /api/live-signals` | `live_signals_500.parquet` |
+| `GET /api/distribution/next-bar` | `signals_500.parquet` or `{slug}_*_signals.parquet` — reads `Date, Open, High, Low, Close, Trend, Is_Breakout_Sequence, EMA_High, EMA_Low, EMA_PriceChg, RV_EMA, Upper_Target, Lower_Target` (tickers; baskets read the full parquet). Consumer-only — no producer or schema changes. Query params: `ticker` or `basket`, `lookback`, `horizon` (`1`/`5`/`21`/`63`/`252`/`rotation`), `rot` (JSON: per-rotation-index threshold/percentile + pattern `0_1`/`1_2`/`2_3`), `loc_upper`/`loc_lower`, `h_pct_op`/`val`, `l_pct_op`/`val`, `p_pct_op`/`val`, `rv_op`/`val`, `rv_pct_op`/`val`, plus existing regime/threshold/trend params. Threshold ops `>` `<` `>=` `<=` plus crossing `↑` `↓`. Response: `filtered`, `baseline`, `forward_paths` (up to 500 per-match paths, downsampled to ≤127 pts when horizon > 126), `current_context` (active rotation/regime, indicators, position vs target, per-rotation pattern + priors). |
 | `WS /ws/live/{ticker}` | Databento Live API (real-time) |
 
 ---
