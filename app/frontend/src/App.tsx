@@ -218,6 +218,8 @@ function App() {
 
   // Single derived flag: is quarter mode on?
   const isQuarterMode = quarterActive && !!quarterStart && !!quarterEnd
+  const basketUniverseStart = isQuarterMode ? quarterStart : ''
+  const basketUniverseEnd = isQuarterMode ? quarterEnd : ''
 
   const isTicker = viewType === 'Tickers' || viewType === 'LiveSignals' || viewType === 'ETFs' || viewType === 'Portfolio'
   const isBasketView = !isTicker && !activeTicker
@@ -409,11 +411,21 @@ function App() {
     return () => { window.removeEventListener('mousemove', onMouseMove); window.removeEventListener('mouseup', onMouseUp) }
   }, [])
 
-  // Fetch all reference data on mount
+  // Keep the sidebar basket list aligned with the active universe filter.
   useEffect(() => {
-    axios.get(`${API_BASE}/baskets`).then(res => {
+    const params = new URLSearchParams()
+    if (basketUniverseStart && basketUniverseEnd) {
+      params.set('universe_start', basketUniverseStart)
+      params.set('universe_end', basketUniverseEnd)
+    }
+    const qs = params.toString()
+    axios.get(`${API_BASE}/baskets${qs ? `?${qs}` : ''}`).then(res => {
       setBaskets(res.data);
     }).catch(err => console.error(err));
+  }, [basketUniverseStart, basketUniverseEnd])
+
+  // Fetch other reference data on mount
+  useEffect(() => {
     axios.get(`${API_BASE}/tickers`).then(res => setTickers(res.data)).catch(err => console.error(err));
     axios.get(`${API_BASE}/tickers/quarters`).then(res => {
       setQuarterData(res.data.tickers_by_quarter || {})

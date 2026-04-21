@@ -57,6 +57,7 @@ The backend auto-loads `.env` from the local `backend/` directory first, falling
 
 API endpoints:
 - `GET /api/baskets` — Lists all baskets (Themes, Sectors, Industries)
+- Optional query params: `universe_start` / `universe_end` (quarter keys like `2026 Q1`) widen industry inclusion to any active quarter in the selected window; default is current quarter only.
 - `GET /api/baskets/returns` — Cross-basket, single-basket, or analogs returns. Query params: `mode` (`period` for ranked bar chart, `daily` for single basket day-by-day, `analogs` for regime analog matching), `start`/`end` (date range), `group` (`all`/`themes`/`sectors`/`industries`), `basket` (slug, daily mode), `threshold` (min similarity, analogs mode). The `analogs` mode returns: multi-timeframe returns, cross-basket correlation, `forward_series`, aggregate stats, per-basket `ranks`, and `basket_count`.
 - `GET /api/baskets/{name}` — Basket OHLCV data, signals, correlation, weighted tickers
 - `GET /api/baskets/{name}/summary` — Open signals, 21-day correlation matrix, 1-year cumulative returns

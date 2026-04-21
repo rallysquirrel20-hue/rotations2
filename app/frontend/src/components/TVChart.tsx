@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { createChart, ColorType, CrosshairMode, LineType, IChartApi, ISeriesApi, PriceScaleMode } from 'lightweight-charts';
 import axios from 'axios';
 import { RangeScrollbar } from './RangeScrollbar';
@@ -43,6 +43,26 @@ const parseTime = (dateStr: string) => {
   return dateStr;
 };
 
+const dedupeChartRowsByDate = <T extends { Date: any }>(rows: T[]): T[] => {
+  const byDate = new Map<string, T>();
+  rows.forEach((row) => {
+    const value = row.Date;
+    let dateKey = '';
+    if (typeof value === 'string') {
+      dateKey = value.slice(0, 10);
+    } else if (value instanceof Date && !Number.isNaN(value.getTime())) {
+      dateKey = value.toISOString().slice(0, 10);
+    }
+    const time = parseTime(dateKey);
+    if (dateKey && typeof time === 'number' && Number.isFinite(time)) {
+      byDate.set(dateKey, row);
+    }
+  });
+  return Array.from(byDate.entries())
+    .sort((a, b) => parseTime(a[0]) - parseTime(b[0]))
+    .map(([, row]) => row);
+};
+
 const COLOR_PINK = 'rgb(255, 50, 150)';
 const COLOR_BLUE = 'rgb(50, 50, 255)';
 const SOLAR_BASE3 = '#fdf6e3';
@@ -71,6 +91,7 @@ interface CandleDetail {
 
 export const TVChart: React.FC<TVChartProps> = (props) => {
   const { data, showPivots, showTargets, showVolume, showBreadth, showBreakout, showCorrelation, showRV, showYield, showDivGrowth, showHReaction, showLReaction, showPriceChg } = props;
+  const normalizedData = useMemo(() => dedupeChartRowsByDate(data), [data]);
 
   const pRef  = useRef<HTMLDivElement>(null);
   const vRef  = useRef<HTMLDivElement>(null);
@@ -134,14 +155,14 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
   const timeDateMap = useRef<Map<any, string>>(new Map());
   useEffect(() => {
     const map = new Map<any, string>();
-    const sortedData = [...data].sort((a, b) => String(a.Date).localeCompare(String(b.Date)));
+    const sortedData = [...normalizedData].sort((a, b) => String(a.Date).localeCompare(String(b.Date)));
     sortedData.forEach(d => {
       const t = parseTime(d.Date);
       const dateStr = String(d.Date).slice(0, 10);
       map.set(t, dateStr);
     });
     timeDateMap.current = map;
-  }, [data]);
+  }, [normalizedData]);
 
   // Escape key to unpin
   useEffect(() => {
@@ -241,9 +262,9 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
 
   // Chart creation — runs when data/pivots/targets change
   useEffect(() => {
-    if (!pRef.current || data.length === 0) return;
+    if (!pRef.current || normalizedData.length === 0) return;
 
-    const sortedData = [...data].sort((a, b) => String(a.Date).localeCompare(String(b.Date)));
+    const sortedData = [...normalizedData].sort((a, b) => String(a.Date).localeCompare(String(b.Date)));
     const times = sortedData.map(d => parseTime(d.Date));
     const ohlc = sortedData
       .map((d, i) => ({ time: times[i], open: Number(d.Open), high: Number(d.High), low: Number(d.Low), close: Number(d.Close) }))
@@ -530,7 +551,7 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
       }
       chartEntries.forEach(([, c]) => c.remove());
     };
-  }, [data, showPivots, showTargets, props.isBasketView, props.basketName, props.apiBase, fetchCandleDetail, pinnedDetail]);
+  }, [normalizedData, showPivots, showTargets, props.isBasketView, props.basketName, props.apiBase, fetchCandleDetail, pinnedDetail]);
 
   // Toggle log/linear on price chart
   useEffect(() => {

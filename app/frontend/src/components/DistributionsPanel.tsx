@@ -14,11 +14,17 @@ interface DistStats {
 interface RotCtx {
   active: boolean
   pattern: 'HH' | 'LH' | 'HL' | 'LL' | null
+  patterns: Record<'0_1' | '1_2' | '2_3', 'HH' | 'LH' | 'HL' | 'LL' | null>
+  pattern_display?: string | null
+  patterns_display?: Record<'0_1' | '1_2' | '2_3', string | null>
   Time_0: number | null;  Range_0: number | null;  Change_0: number | null
   Time_0_Pct: number | null;  Range_0_Pct: number | null;  Change_0_Pct: number | null
   Time_1: number | null;  Range_1: number | null;  Change_1: number | null
+  Time_1_Pct: number | null;  Range_1_Pct: number | null;  Change_1_Pct: number | null
   Time_2: number | null;  Range_2: number | null;  Change_2: number | null
+  Time_2_Pct: number | null;  Range_2_Pct: number | null;  Change_2_Pct: number | null
   Time_3: number | null;  Range_3: number | null;  Change_3: number | null
+  Time_3_Pct: number | null;  Range_3_Pct: number | null;  Change_3_Pct: number | null
 }
 
 interface CurrentContext {
@@ -31,10 +37,15 @@ interface CurrentContext {
   active_regime: 'breakout' | 'breakdown' | null
   indicators: {
     rv_ann: number | null;       rv_pct: number | null
+    rv_delta: number | null
     h_react: number | null;      h_pct: number | null
+    h_delta: number | null
     l_react: number | null;      l_pct: number | null
+    l_delta: number | null
     p_react: number | null;      p_pct: number | null
+    p_delta: number | null
     breadth: number | null;      breakout_pct: number | null;  corr_pct: number | null
+    breadth_delta: number | null; breakout_delta: number | null; corr_delta: number | null
   }
   rotations: Record<'UpRot' | 'DownRot' | 'Breakout' | 'Breakdown', RotCtx>
 }
@@ -48,7 +59,7 @@ interface ForwardPath {
 interface DistResponse {
   ticker: string
   lookback: number
-  horizon: number | string
+  horizon: number
   filtered: DistStats
   baseline: DistStats
   forward_paths: ForwardPath[]
@@ -77,8 +88,10 @@ const PINK = 'rgb(255, 50, 150)'
 const PINK_FILL = 'rgba(255, 50, 150, 0.25)'
 const SOLAR_BG = '#fdf6e3'
 const SOLAR_BORDER = '#eee8d5'
+const SHEET_GRID_BORDER = '#d8cfb7'
 const SOLAR_TEXT = '#586e75'
-const SOLAR_MUTED = '#93a1a1'
+const SOLAR_MUTED = '#7f8d92'
+const SOLAR_TITLE = '#6c7a80'
 
 // Tercile colors for the forward-path chart
 const GREEN       = 'rgb(40, 160, 60)'
@@ -92,7 +105,6 @@ const RED_FILL    = 'rgba(220, 50, 80, 0.12)'
 // fixed pixel widths in index.css. Wrapping them in a flex:1 div with the inner
 // control at width:100% guarantees equal column widths regardless of the class defaults.
 const ROT_CELL: React.CSSProperties = { flex: 1, minWidth: 0, display: 'flex' }
-const ROT_INNER: React.CSSProperties = { width: '100%', height: 28, fontSize: 11, padding: '0 6px', boxSizing: 'border-box' }
 
 // Convert internal decimal state (e.g. 0.80) to display scale (80) when the field
 // is a percentage. Backend contract stays in decimals — only the UI shows percent.
@@ -132,44 +144,47 @@ const COND_DEFS: CondDef[] = [
 const TRI_KEYS = COND_DEFS.filter(d => d.kind === 'tri').map(d => d.key)
 const TH_DEFS = COND_DEFS.filter((d): d is ThDef => d.kind === 'th')
 
-// Condition groups for the collapsible UI
-type CondGroup = { key: string; label: string; keys: string[]; columns?: string[][]; basketOnly?: boolean }
-const COND_GROUPS: CondGroup[] = [
-  {
-    key: 'regime', label: 'Regime',
-    keys: ['breakout_state', 'rotation_state'],
-    columns: [['breakout_state'], ['rotation_state']],
-  },
-  {
-    key: 'reactions', label: 'Reactions',
-    keys: ['l', 'l_pct', 'l_trend', 'p', 'p_pct', 'p_trend', 'h', 'h_pct', 'h_trend'],
-    columns: [
-      ['l', 'l_pct', 'l_trend'],
-      ['p', 'p_pct', 'p_trend'],
-      ['h', 'h_pct', 'h_trend'],
-    ],
-  },
-  {
-    key: 'volatility', label: 'Volatility',
-    keys: ['rv', 'rv_pct', 'rv_trend'],
-    columns: [['rv', 'rv_pct', 'rv_trend']],
-  },
-  {
-    key: 'location', label: 'Location',
-    keys: ['loc_upper', 'loc_lower'],
-    columns: [['loc_upper'], ['loc_lower']],
-  },
-  {
-    key: 'basket', label: 'Basket Internals', basketOnly: true,
-    keys: ['breadth', 'breadth_trend', 'breakout', 'breakout_trend', 'corr', 'corr_trend'],
-    columns: [
-      ['breadth', 'breadth_trend'],
-      ['breakout', 'breakout_trend'],
-      ['corr', 'corr_trend'],
-    ],
-  },
+const COND_COLUMN_WIDTH = 176  // px — fixed to keep column widths consistent across groups
+
+type StandardSourceId =
+  | 'regime'
+  | 'rotation'
+  | 'loc_upper'
+  | 'loc_lower'
+  | 'rv'
+  | 'h'
+  | 'p'
+  | 'l'
+  | 'breadth'
+  | 'breakout_pct'
+  | 'corr'
+
+type StandardSourceMode = 'state' | 'value' | 'percentile' | 'trend'
+
+interface StandardFilterSourceConfig {
+  id: StandardSourceId
+  label: string
+  thresholdKey?: string
+  percentileKey?: string
+  trendKey?: string
+  triKey?: string
+  basketOnly?: boolean
+  modeOrder: StandardSourceMode[]
+}
+
+const STANDARD_FILTER_SOURCES: StandardFilterSourceConfig[] = [
+  { id: 'regime', label: 'LT Regime', triKey: 'breakout_state', modeOrder: ['state'] },
+  { id: 'rotation', label: 'Rotation', triKey: 'rotation_state', modeOrder: ['state'] },
+  { id: 'loc_upper', label: 'Vs Upper', triKey: 'loc_upper', modeOrder: ['state'] },
+  { id: 'loc_lower', label: 'Vs Lower', triKey: 'loc_lower', modeOrder: ['state'] },
+  { id: 'rv', label: 'RV', thresholdKey: 'rv', percentileKey: 'rv_pct', trendKey: 'rv_trend', modeOrder: ['value', 'percentile', 'trend'] },
+  { id: 'h', label: 'H React', thresholdKey: 'h', percentileKey: 'h_pct', trendKey: 'h_trend', modeOrder: ['value', 'percentile', 'trend'] },
+  { id: 'p', label: 'Price Chg', thresholdKey: 'p', percentileKey: 'p_pct', trendKey: 'p_trend', modeOrder: ['value', 'percentile', 'trend'] },
+  { id: 'l', label: 'L React', thresholdKey: 'l', percentileKey: 'l_pct', trendKey: 'l_trend', modeOrder: ['value', 'percentile', 'trend'] },
+  { id: 'breadth', label: 'Breadth %', thresholdKey: 'breadth', trendKey: 'breadth_trend', basketOnly: true, modeOrder: ['value', 'trend'] },
+  { id: 'breakout_pct', label: 'Breakout %', thresholdKey: 'breakout', trendKey: 'breakout_trend', basketOnly: true, modeOrder: ['value', 'trend'] },
+  { id: 'corr', label: 'Corr %', thresholdKey: 'corr', trendKey: 'corr_trend', basketOnly: true, modeOrder: ['value', 'trend'] },
 ]
-const COND_COLUMN_WIDTH = 240  // px — fixed to keep column widths consistent across groups
 
 // --- Rotation context filter types (Phase 2) ---
 const METRICS = ['Time', 'Range', 'Change'] as const
@@ -214,11 +229,23 @@ interface RotFilterState {
 }
 type AllRotFilters = Record<RotType, RotFilterState>
 
-// Per-type labels for the Pattern rows (HH/LH for bullish, HL/LL for bearish).
+type RotationFilterMode = 'value' | 'percentile' | 'pattern'
+
+interface ActiveRotationFilterRow {
+  id: string
+  type: RotType
+  idx: RotIdx
+  mode: RotationFilterMode
+  metric?: Metric
+  patternKey?: PatternKey
+}
+
+// Per-type labels for the pattern rows.
+// Bullish types use HH / HL, bearish types use HL / LL.
 const ROT_PATTERN_LABELS: Record<RotType, { a: string; b: string; title: string }> = {
-  UpRot:     { a: 'HH', b: 'LH', title: 'Peak high comparison between consecutive up rotations' },
+  UpRot:     { a: 'HH', b: 'HL', title: 'Relative high/low relationship between consecutive up rotations' },
   DownRot:   { a: 'HL', b: 'LL', title: 'Trough low comparison between consecutive down rotations' },
-  Breakout:  { a: 'HH', b: 'LH', title: 'Peak high comparison between consecutive breakouts' },
+  Breakout:  { a: 'HH', b: 'HL', title: 'Relative high/low relationship between consecutive breakouts' },
   Breakdown: { a: 'HL', b: 'LL', title: 'Trough low comparison between consecutive breakdowns' },
 }
 
@@ -289,6 +316,581 @@ const initTriConds = (): Record<string, TriState> =>
 const initThresholds = (): Record<string, ThresholdState> =>
   Object.fromEntries(TH_DEFS.map(d => [d.key, { active: false, op: '>' as Op, val: d.defaultVal }]))
 
+const CARD_STYLE: React.CSSProperties = {
+  border: `1px solid ${SOLAR_BORDER}`,
+  background: SOLAR_BG,
+  borderRadius: 0,
+}
+
+const CARD_HEADER_STYLE: React.CSSProperties = {
+  padding: '5px 8px',
+  color: SOLAR_TITLE,
+  fontSize: 9,
+  borderBottom: `1px solid ${SOLAR_BORDER}`,
+  background: 'rgba(88, 110, 117, 0.06)',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'space-between',
+  gap: 6,
+  letterSpacing: 0.4,
+}
+
+const CARD_BODY_STYLE: React.CSSProperties = {
+  padding: 8,
+}
+
+const FIELD_LABEL_STYLE: React.CSSProperties = {
+  fontSize: 9,
+  color: SOLAR_TITLE,
+  marginBottom: 3,
+  letterSpacing: 0.3,
+}
+
+const CONTROLS_GRID_STYLE: React.CSSProperties = {
+  display: 'flex',
+  gap: 8,
+  flexWrap: 'wrap',
+  alignItems: 'flex-end',
+}
+
+const COMPACT_BUTTON_STYLE: React.CSSProperties = {
+  fontSize: 10,
+  height: 24,
+  padding: '0 8px',
+  width: 'auto',
+  boxSizing: 'border-box',
+}
+
+const COMPACT_INPUT_STYLE: React.CSSProperties = {
+  height: 24,
+  padding: '4px 6px',
+  fontSize: 10,
+  boxSizing: 'border-box',
+}
+
+const GROUP_TOGGLE_STYLE: React.CSSProperties = {
+  padding: '3px 8px',
+  cursor: 'pointer',
+  fontSize: 11,
+  fontFamily: 'monospace',
+  display: 'flex',
+  alignItems: 'center',
+  gap: 5,
+}
+
+const GROUP_BODY_PADDING = '3px 6px 6px 14px'
+const FILTER_VALUE_GRID_STYLE: React.CSSProperties = {
+  display: 'grid',
+  gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+  minHeight: 22,
+}
+
+const FILTER_VALUE_CELL_STYLE: React.CSSProperties = {
+  minWidth: 0,
+  borderRight: `1px solid ${SOLAR_BORDER}`,
+}
+
+const FILTER_VALUE_LAST_CELL_STYLE: React.CSSProperties = {
+  minWidth: 0,
+}
+
+const FILTER_CELL_INPUT_STYLE: React.CSSProperties = {
+  width: '100%',
+  height: '100%',
+  minHeight: 22,
+  padding: '0 4px',
+  border: 0,
+  background: SOLAR_BG,
+  boxSizing: 'border-box',
+  fontSize: 9,
+  textAlign: 'center',
+}
+
+const SHEET_BUTTON_BASE_STYLE: React.CSSProperties = {
+  width: '100%',
+  minHeight: 22,
+  padding: '0 4px',
+  border: 0,
+  borderRadius: 0,
+  background: 'transparent',
+  color: SOLAR_TEXT,
+  fontFamily: 'monospace',
+  fontSize: 9,
+  boxSizing: 'border-box',
+  cursor: 'pointer',
+}
+
+const FILTER_EDITOR_ROW_STYLE: React.CSSProperties = {
+  display: 'grid',
+  gridTemplateColumns: '84px 76px 114px minmax(0, 1fr) 24px',
+  borderTop: `1px solid ${SOLAR_BORDER}`,
+}
+
+const FILTER_EDITOR_CELL_STYLE: React.CSSProperties = {
+  minWidth: 0,
+  padding: '3px 6px',
+  borderRight: `1px solid ${SOLAR_BORDER}`,
+  display: 'flex',
+  alignItems: 'center',
+  fontFamily: 'monospace',
+  fontSize: 10,
+}
+
+const FILTER_EDITOR_HEADER_CELL_STYLE: React.CSSProperties = {
+  ...FILTER_EDITOR_CELL_STYLE,
+  color: SOLAR_MUTED,
+  fontSize: 8,
+  letterSpacing: 0.3,
+  background: 'rgba(147, 161, 161, 0.08)',
+}
+
+const CONTEXT_GRID_STYLE: React.CSSProperties = {
+  display: 'grid',
+  gridTemplateColumns: 'repeat(auto-fit, minmax(110px, 1fr))',
+}
+
+const HORIZON_OPTIONS = ['1', '5', '21', '63', '252'] as const
+type HorizonOption = typeof HORIZON_OPTIONS[number]
+
+const SHEET_TABLE_STYLE: React.CSSProperties = {
+  width: '100%',
+  borderCollapse: 'collapse',
+  tableLayout: 'fixed',
+  color: SOLAR_TEXT,
+  fontSize: 10,
+  fontFamily: 'monospace',
+  lineHeight: 1.1,
+}
+
+const SHEET_HEADER_CELL_STYLE: React.CSSProperties = {
+  padding: '2px 5px',
+  textAlign: 'center',
+  color: SOLAR_TITLE,
+  borderBottom: `1px solid ${SHEET_GRID_BORDER}`,
+  background: 'rgba(147, 161, 161, 0.08)',
+  fontSize: 7,
+  letterSpacing: 0.25,
+  whiteSpace: 'nowrap',
+}
+
+const SHEET_ROW_LABEL_STYLE: React.CSSProperties = {
+  padding: '2px 5px',
+  borderTop: `1px solid ${SHEET_GRID_BORDER}`,
+  whiteSpace: 'nowrap',
+  fontWeight: 700,
+  textAlign: 'center',
+  verticalAlign: 'middle',
+}
+
+const SHEET_CELL_STYLE: React.CSSProperties = {
+  padding: '2px 5px',
+  borderTop: `1px solid ${SHEET_GRID_BORDER}`,
+  borderLeft: `1px solid ${SHEET_GRID_BORDER}`,
+  textAlign: 'center',
+  whiteSpace: 'nowrap',
+  verticalAlign: 'middle',
+  overflow: 'hidden',
+}
+
+const SHEET_BUTTON_CELL_STYLE: React.CSSProperties = {
+  width: '100%',
+  minHeight: 18,
+  padding: '2px 4px',
+  border: 0,
+  background: 'transparent',
+  color: SOLAR_TEXT,
+  fontFamily: 'monospace',
+  fontSize: 9,
+  textAlign: 'center',
+  cursor: 'pointer',
+}
+
+const modeLabel = (mode: StandardSourceMode) =>
+  mode === 'state' ? 'State' : mode === 'value' ? 'Value' : mode === 'percentile' ? '%ile' : 'Trend'
+
+const patternToTriState = (type: RotType, pattern: string | null | undefined): TriState => {
+  const labels = ROT_PATTERN_LABELS[type]
+  if (pattern === labels.a) return 'a'
+  if (pattern === labels.b) return 'b'
+  return 'any'
+}
+
+const rotationIndexLabel = (idx: RotIdx) => (
+  idx === 0 ? 'Current' : `${idx}-back`
+)
+
+const rotationModeLabel = (mode: RotationFilterMode) => (
+  mode === 'value' ? 'Value' : mode === 'percentile' ? '%ile' : 'Pattern'
+)
+
+const getRotationMetricValue = (ctx: RotCtx, idx: RotIdx, metric: Metric) => (
+  ctx[`${metric}_${idx}` as keyof RotCtx] as number | null | undefined
+)
+
+const getRotationMetricPercentile = (ctx: RotCtx, idx: RotIdx, metric: Metric) => (
+  ctx[`${metric}_${idx}_Pct` as keyof RotCtx] as number | null | undefined
+)
+
+const getRotationPatternDisplay = (ctx: RotCtx, key: PatternKey) => (
+  ctx.patterns_display?.[key] ?? ctx.patterns?.[key] ?? null
+)
+
+const triStateFromCurrent = (sourceId: StandardSourceId, cc: CurrentContext): TriState => {
+  switch (sourceId) {
+    case 'regime':
+      return cc.active_regime === 'breakout' ? 'a' : cc.active_regime === 'breakdown' ? 'b' : 'any'
+    case 'rotation':
+      return cc.active_rotation === 'up' ? 'a' : cc.active_rotation === 'down' ? 'b' : 'any'
+    case 'loc_upper':
+      return cc.position === 'above_upper' ? 'a' : cc.position == null ? 'any' : 'b'
+    case 'loc_lower':
+      return cc.position === 'below_lower' ? 'b' : cc.position == null ? 'any' : 'a'
+    default:
+      return 'any'
+  }
+}
+
+const metricSnapshot = (sourceId: StandardSourceId, cc: CurrentContext): { value: number | null; percentile: number | null } => {
+  const ind = cc.indicators
+  switch (sourceId) {
+    case 'rv':
+      return { value: ind.rv_ann, percentile: ind.rv_pct }
+    case 'h':
+      return { value: ind.h_react, percentile: ind.h_pct }
+    case 'p':
+      return { value: ind.p_react, percentile: ind.p_pct }
+    case 'l':
+      return { value: ind.l_react, percentile: ind.l_pct }
+    case 'breadth':
+      return { value: ind.breadth, percentile: null }
+    case 'breakout_pct':
+      return { value: ind.breakout_pct, percentile: null }
+    case 'corr':
+      return { value: ind.corr_pct, percentile: null }
+    default:
+      return { value: null, percentile: null }
+  }
+}
+
+const SectionCard: React.FC<{
+  title: string
+  right?: React.ReactNode
+  children: React.ReactNode
+  bodyStyle?: React.CSSProperties
+}> = ({ title, right, children, bodyStyle }) => (
+  <div style={CARD_STYLE}>
+    <div style={CARD_HEADER_STYLE}>
+      <span>{title}</span>
+      {right}
+    </div>
+    <div style={{ ...CARD_BODY_STYLE, ...bodyStyle }}>
+      {children}
+    </div>
+  </div>
+)
+
+const FieldLabel: React.FC<{ children: React.ReactNode }> = ({ children }) => (
+  <div style={FIELD_LABEL_STYLE}>{children}</div>
+)
+
+const SheetToggleButton: React.FC<{
+  active: boolean
+  label: string
+  onClick: () => void
+  title?: string
+}> = ({ active, label, onClick, title }) => (
+  <button
+    type="button"
+    onClick={onClick}
+    title={title}
+    style={{
+      ...SHEET_BUTTON_BASE_STYLE,
+      background: active ? 'rgba(50, 50, 255, 0.10)' : 'transparent',
+      color: active ? BLUE : SOLAR_TEXT,
+      fontWeight: active ? 700 : 500,
+    }}
+  >
+    {label}
+  </button>
+)
+
+const ContextMetricCell: React.FC<{
+  label: string
+  value: string
+  sub?: string
+  active?: boolean
+  color?: string
+  onClick?: () => void
+}> = ({ label, value, sub, active = false, color, onClick }) => {
+  const content = (
+    <>
+      <div style={{ fontSize: 8, color: SOLAR_MUTED, letterSpacing: 0.25 }}>{label}</div>
+      <div style={{ fontSize: 11, fontFamily: 'monospace', fontWeight: 700, color: color ?? SOLAR_TEXT, whiteSpace: 'nowrap' }}>{value}</div>
+      {sub != null && <div style={{ fontSize: 8, color: SOLAR_MUTED, fontFamily: 'monospace' }}>{sub}</div>}
+    </>
+  )
+
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        onClick={onClick}
+        style={{
+          textAlign: 'left',
+          padding: '4px 6px',
+          border: 0,
+          borderRight: `1px solid ${SOLAR_BORDER}`,
+          borderBottom: `1px solid ${SOLAR_BORDER}`,
+          background: active ? 'rgba(50, 50, 255, 0.08)' : SOLAR_BG,
+          cursor: 'pointer',
+          minWidth: 0,
+        }}
+      >
+        {content}
+      </button>
+    )
+  }
+
+  return (
+    <div style={{ padding: '4px 6px', borderRight: `1px solid ${SOLAR_BORDER}`, borderBottom: `1px solid ${SOLAR_BORDER}`, minWidth: 0, background: SOLAR_BG }}>
+      {content}
+    </div>
+  )
+}
+
+const TypeaheadField: React.FC<{
+  label: string
+  value: string
+  selectedValue: string
+  options: string[]
+  showDropdown: boolean
+  setShowDropdown: (next: boolean) => void
+  onValueChange: (next: string) => void
+  onSelect: (next: string) => void
+  onCommit?: (value: string) => void
+  placeholder: string
+  width: number
+}> = ({
+  label,
+  value,
+  selectedValue,
+  options,
+  showDropdown,
+  setShowDropdown,
+  onValueChange,
+  onSelect,
+  onCommit,
+  placeholder,
+  width,
+}) => (
+  <div style={{ position: 'relative' }}>
+    <FieldLabel>{label}</FieldLabel>
+    <input
+      type="text"
+      className="backtest-input"
+      value={value}
+      onChange={e => { onValueChange(e.target.value); setShowDropdown(true) }}
+      onFocus={() => setShowDropdown(true)}
+      onBlur={() => setTimeout(() => setShowDropdown(false), 120)}
+      onKeyDown={e => {
+        if (e.key === 'Enter') {
+          const next = value.trim()
+          if (next) {
+            if (onCommit) onCommit(next)
+            else onSelect(next)
+            setShowDropdown(false)
+          }
+        }
+      }}
+      placeholder={placeholder}
+      style={{ ...COMPACT_INPUT_STYLE, width }}
+    />
+    {showDropdown && options.length > 0 && (
+      <div
+        style={{
+          position: 'absolute',
+          top: '100%',
+          left: 0,
+          zIndex: 50,
+          background: SOLAR_BG,
+          border: `1px solid ${SOLAR_BORDER}`,
+          maxHeight: 180,
+          overflowY: 'auto',
+          minWidth: width,
+          borderRadius: 4,
+          boxShadow: '0 4px 10px rgba(88, 110, 117, 0.10)',
+        }}
+      >
+        {options.map(option => (
+          <div
+            key={option}
+            onMouseDown={() => { onSelect(option); setShowDropdown(false) }}
+            style={{
+              padding: '3px 6px',
+              cursor: 'pointer',
+              fontSize: 11,
+              fontFamily: 'monospace',
+              background: option === selectedValue ? SOLAR_BORDER : 'transparent',
+            }}
+          >
+            {option}
+          </div>
+        ))}
+      </div>
+    )}
+  </div>
+)
+
+const AnyOpValueControl: React.FC<{
+  state: ThresholdState
+  min: number
+  max: number
+  step: number
+  percent?: boolean
+  onSetAny: () => void
+  onCycleOrEnable: () => void
+  onSetValue: (value: number) => void
+}> = ({ state, min, max, step, percent, onSetAny, onCycleOrEnable, onSetValue }) => (
+  <div style={FILTER_VALUE_GRID_STYLE}>
+    <div style={FILTER_VALUE_CELL_STYLE}>
+      <SheetToggleButton active={!state.active} label="Any" onClick={onSetAny} />
+    </div>
+    <div style={FILTER_VALUE_CELL_STYLE}>
+      <SheetToggleButton active={state.active} label={state.op} onClick={onCycleOrEnable} />
+    </div>
+    <div style={FILTER_VALUE_LAST_CELL_STYLE}>
+      <input
+        type="number"
+        className="backtest-input"
+        value={toDisp(state.val, percent)}
+        min={toDisp(min, percent)}
+        max={toDisp(max, percent)}
+        step={toDisp(step, percent)}
+        onChange={e => {
+          const entered = parseFloat(e.target.value)
+          if (!isNaN(entered)) {
+            const internal = fromDisp(entered, percent)
+            onSetValue(Math.min(max, Math.max(min, internal)))
+          }
+        }}
+        style={FILTER_CELL_INPUT_STYLE}
+      />
+    </div>
+  </div>
+)
+
+const countRotationFilters = (state: RotFilterState) => {
+  let activeCount = 0
+  for (const idx of ROT_INDICES) {
+    for (const metric of METRICS) {
+      if (state.threshold[idx][metric].active) activeCount++
+      if (state.percentile[idx][metric].active) activeCount++
+    }
+  }
+  for (const key of PATTERN_KEYS) {
+    if (state.pattern[key] !== 'any') activeCount++
+  }
+  return activeCount
+}
+
+const buildDistributionParams = ({
+  lookback,
+  target,
+  isBasket,
+  triConds,
+  thresholds,
+  rotFilters,
+  horizon,
+}: {
+  lookback: number
+  target: string
+  isBasket: boolean
+  triConds: Record<string, TriState>
+  thresholds: Record<string, ThresholdState>
+  rotFilters: AllRotFilters
+  horizon: HorizonOption
+}) => {
+  const params: Record<string, string | number> = { lookback, horizon }
+  if (isBasket) params.basket = target
+  else params.ticker = target
+
+  for (const def of COND_DEFS) {
+    if (def.basketOnly && !isBasket) continue
+    if (def.kind === 'tri') {
+      const state = triConds[def.key]
+      if (state === 'a') params[def.key] = def.a.value
+      else if (state === 'b') params[def.key] = def.b.value
+      continue
+    }
+    const threshold = thresholds[def.key]
+    if (threshold?.active) {
+      params[def.opParam] = threshold.op
+      params[def.valParam] = threshold.val
+    }
+  }
+
+  const rotParam = buildRotParam(rotFilters)
+  if (rotParam) params.rot = rotParam
+  return params
+}
+
+const buildForwardTerciles = (paths?: ForwardPath[] | null) => {
+  if (!paths || paths.length === 0) return null
+  const sortedByReturn = [...paths]
+    .map((p, originalIdx) => ({ p, originalIdx }))
+    .sort((a, b) => a.p.final_return - b.p.final_return)
+  const n = sortedByReturn.length
+  const cutA = Math.floor(n / 3)
+  const cutB = Math.floor(2 * n / 3)
+  const tercileOfOriginal = new Map<number, 'bottom' | 'middle' | 'top'>()
+  sortedByReturn.forEach((entry, i) => {
+    const tercile: 'bottom' | 'middle' | 'top' = i < cutA ? 'bottom' : i < cutB ? 'middle' : 'top'
+    tercileOfOriginal.set(entry.originalIdx, tercile)
+  })
+
+  const computeStats = (group: ForwardPath[]): { mean: number[]; upper: number[]; lower: number[] } => {
+    if (group.length === 0 || group[0].series.length === 0) return { mean: [], upper: [], lower: [] }
+    const len = group[0].series.length
+    const mean = new Array(len).fill(0)
+    const upper = new Array(len).fill(0)
+    const lower = new Array(len).fill(0)
+    for (let i = 0; i < len; i++) {
+      let sum = 0
+      let count = 0
+      for (const path of group) {
+        const value = path.series[i]
+        if (Number.isFinite(value)) {
+          sum += value
+          count++
+        }
+      }
+      const avg = count > 0 ? sum / count : 0
+      let sq = 0
+      for (const path of group) {
+        const value = path.series[i]
+        if (Number.isFinite(value)) sq += (value - avg) * (value - avg)
+      }
+      const std = count > 1 ? Math.sqrt(sq / count) : 0
+      mean[i] = avg
+      upper[i] = avg + std
+      lower[i] = avg - std
+    }
+    return { mean, upper, lower }
+  }
+
+  const bottom = sortedByReturn.slice(0, cutA).map(x => x.p)
+  const middle = sortedByReturn.slice(cutA, cutB).map(x => x.p)
+  const top = sortedByReturn.slice(cutB).map(x => x.p)
+
+  return {
+    bottom: { paths: bottom, ...computeStats(bottom) },
+    middle: { paths: middle, ...computeStats(middle) },
+    top: { paths: top, ...computeStats(top) },
+    tercileOfOriginal,
+    all: paths,
+  }
+}
+
 export const DistributionsPanel: React.FC<DistributionsPanelProps> = ({
   apiBase, activeTicker, allTickers = [], activeBasket, allBaskets,
 }) => {
@@ -300,15 +902,14 @@ export const DistributionsPanel: React.FC<DistributionsPanelProps> = ({
   const [basketQuery, setBasketQuery] = useState<string>(activeBasket || '')
   const [showBasketDropdown, setShowBasketDropdown] = useState(false)
   const [lookback, setLookback] = useState(21)
-  const [horizon, setHorizon] = useState<string>('1')
+  const [horizon, setHorizon] = useState<HorizonOption>('1')
   const [triConds, setTriConds] = useState<Record<string, TriState>>(initTriConds)
   const [thresholds, setThresholds] = useState<Record<string, ThresholdState>>(initThresholds)
   const [rotFilters, setRotFilters] = useState<AllRotFilters>(initRotFilters)
+  const [selectedSourceIds, setSelectedSourceIds] = useState<StandardSourceId[]>([])
+  const [selectedSourceModes, setSelectedSourceModes] = useState<Partial<Record<StandardSourceId, StandardSourceMode>>>({})
   const [openRotType, setOpenRotType] = useState<Record<RotType, boolean>>({
     UpRot: false, DownRot: false, Breakout: false, Breakdown: false,
-  })
-  const [openCondGroup, setOpenCondGroup] = useState<Record<string, boolean>>({
-    regime: false, reactions: false, volatility: false, location: false, basket: false,
   })
   const [data, setData] = useState<DistResponse | null>(null)
   const [loading, setLoading] = useState(false)
@@ -342,30 +943,120 @@ export const DistributionsPanel: React.FC<DistributionsPanelProps> = ({
 
   const isBasket = mode === 'basket'
   const target = isBasket ? basket : ticker
+  const currentContext = data?.current_context ?? null
+
+  const visibleStandardSources = useMemo(
+    () => STANDARD_FILTER_SOURCES.filter(source => !source.basketOnly || isBasket),
+    [isBasket],
+  )
+
+  const sourceConfigMap = useMemo(
+    () => Object.fromEntries(STANDARD_FILTER_SOURCES.map(source => [source.id, source])) as Record<StandardSourceId, StandardFilterSourceConfig>,
+    [],
+  )
+
+  const clearSourceFilters = useCallback((source: StandardFilterSourceConfig) => {
+    const triPatch: Partial<Record<string, TriState>> = {}
+    if (source.triKey) triPatch[source.triKey] = 'any'
+    if (source.trendKey) triPatch[source.trendKey] = 'any'
+    if (Object.keys(triPatch).length > 0) {
+      setTriConds(prev => ({ ...prev, ...triPatch }))
+    }
+    setThresholds(prev => {
+      const next = { ...prev }
+      if (source.thresholdKey) next[source.thresholdKey] = { ...next[source.thresholdKey], active: false }
+      if (source.percentileKey) next[source.percentileKey] = { ...next[source.percentileKey], active: false }
+      return next
+    })
+  }, [])
+
+  const applySourceDefaults = useCallback((source: StandardFilterSourceConfig, mode: StandardSourceMode, cc: CurrentContext | null) => {
+    const triPatch: Partial<Record<string, TriState>> = {}
+    if (source.triKey) triPatch[source.triKey] = 'any'
+    if (source.trendKey) triPatch[source.trendKey] = 'any'
+    if (cc && source.triKey) triPatch[source.triKey] = triStateFromCurrent(source.id, cc)
+    if (Object.keys(triPatch).length > 0) {
+      setTriConds(prev => ({ ...prev, ...triPatch }))
+    }
+
+    setThresholds(prev => {
+      const next = { ...prev }
+      if (source.thresholdKey) next[source.thresholdKey] = { ...next[source.thresholdKey], active: false }
+      if (source.percentileKey) next[source.percentileKey] = { ...next[source.percentileKey], active: false }
+      if (!cc) return next
+
+      const snap = metricSnapshot(source.id, cc)
+      if (mode === 'value' && source.thresholdKey && snap.value != null) {
+        next[source.thresholdKey] = { ...next[source.thresholdKey], active: true, val: snap.value }
+      }
+      if (mode === 'percentile' && source.percentileKey && snap.percentile != null) {
+        next[source.percentileKey] = { ...next[source.percentileKey], active: true, val: snap.percentile }
+      }
+      return next
+    })
+  }, [])
+
+  const setSourceMode = useCallback((sourceId: StandardSourceId, mode: StandardSourceMode) => {
+    const source = sourceConfigMap[sourceId]
+    setSelectedSourceModes(prev => ({ ...prev, [sourceId]: mode }))
+    applySourceDefaults(source, mode, currentContext)
+  }, [applySourceDefaults, currentContext, sourceConfigMap])
+
+  const toggleSourceSelection = useCallback((sourceId: StandardSourceId) => {
+    const source = sourceConfigMap[sourceId]
+    setSelectedSourceIds(prev => {
+      if (prev.includes(sourceId)) {
+        clearSourceFilters(source)
+        setSelectedSourceModes(modes => {
+          const next = { ...modes }
+          delete next[sourceId]
+          return next
+        })
+        return prev.filter(id => id !== sourceId)
+      }
+
+      const nextMode = source.modeOrder[0]
+      setSelectedSourceModes(modes => ({ ...modes, [sourceId]: nextMode }))
+      applySourceDefaults(source, nextMode, currentContext)
+      return [...prev, sourceId]
+    })
+  }, [applySourceDefaults, clearSourceFilters, currentContext, sourceConfigMap])
+
+  const toggleSourceModeSelection = useCallback((sourceId: StandardSourceId, mode: StandardSourceMode) => {
+    const source = sourceConfigMap[sourceId]
+    const isSelected = selectedSourceIds.includes(sourceId)
+    const currentMode = selectedSourceModes[sourceId] ?? source.modeOrder[0]
+
+    if (isSelected && currentMode === mode) {
+      clearSourceFilters(source)
+      setSelectedSourceIds(prev => prev.filter(id => id !== sourceId))
+      setSelectedSourceModes(prev => {
+        const next = { ...prev }
+        delete next[sourceId]
+        return next
+      })
+      return
+    }
+
+    if (!isSelected) {
+      setSelectedSourceIds(prev => [...prev, sourceId])
+    }
+    setSelectedSourceModes(prev => ({ ...prev, [sourceId]: mode }))
+    applySourceDefaults(source, mode, currentContext)
+  }, [applySourceDefaults, clearSourceFilters, currentContext, selectedSourceIds, selectedSourceModes, sourceConfigMap])
 
   // Fetch
   useEffect(() => {
     if (!target) { setData(null); return }
-    const params: Record<string, string | number> = { lookback }
-    if (isBasket) params.basket = target
-    else params.ticker = target
-    for (const def of COND_DEFS) {
-      if (def.basketOnly && !isBasket) continue
-      if (def.kind === 'tri') {
-        const state = triConds[def.key]
-        if (state === 'a') params[def.key] = def.a.value
-        else if (state === 'b') params[def.key] = def.b.value
-      } else {
-        const th = thresholds[def.key]
-        if (th?.active) {
-          params[def.opParam] = th.op
-          params[def.valParam] = th.val
-        }
-      }
-    }
-    const rotParam = buildRotParam(rotFilters)
-    if (rotParam) params.rot = rotParam
-    params.horizon = horizon
+    const params = buildDistributionParams({
+      lookback,
+      target,
+      isBasket,
+      triConds,
+      thresholds,
+      rotFilters,
+      horizon,
+    })
     setLoading(true); setError(null)
     axios.get(`${apiBase}/distribution/next-bar`, { params })
       .then(res => { setData(res.data); setLoading(false) })
@@ -390,7 +1081,11 @@ export const DistributionsPanel: React.FC<DistributionsPanelProps> = ({
     }), [])
 
   const resetAll = () => {
-    setTriConds(initTriConds()); setThresholds(initThresholds()); setRotFilters(initRotFilters())
+    setTriConds(initTriConds())
+    setThresholds(initThresholds())
+    setRotFilters(initRotFilters())
+    setSelectedSourceIds([])
+    setSelectedSourceModes({})
   }
 
   // Rotation filter setters — per rotation index for threshold, flat for percentile
@@ -452,6 +1147,87 @@ export const DistributionsPanel: React.FC<DistributionsPanelProps> = ({
       [t]: { ...prev[t], pattern: { ...prev[t].pattern, [key]: next } },
     })), [])
 
+  const toggleRotMetricSelection = useCallback((
+    type: RotType,
+    idx: RotIdx,
+    metric: Metric,
+    mode: Exclude<RotationFilterMode, 'pattern'>,
+    currentValue: number | null | undefined,
+  ) => {
+    if (currentValue == null) return
+    if (mode === 'value') {
+      setRotFilters(prev => {
+        const current = prev[type].threshold[idx][metric]
+        return {
+          ...prev,
+          [type]: {
+            ...prev[type],
+            threshold: {
+              ...prev[type].threshold,
+              [idx]: {
+                ...prev[type].threshold[idx],
+                [metric]: current.active
+                  ? { ...current, active: false }
+                  : { ...current, active: true, val: currentValue },
+              },
+            },
+          },
+        }
+      })
+      return
+    }
+
+    setRotFilters(prev => {
+      const current = prev[type].percentile[idx][metric]
+      return {
+        ...prev,
+        [type]: {
+          ...prev[type],
+          percentile: {
+            ...prev[type].percentile,
+            [idx]: {
+              ...prev[type].percentile[idx],
+              [metric]: current.active
+                ? { ...current, active: false }
+                : { ...current, active: true, val: currentValue },
+            },
+          },
+        },
+      }
+    })
+  }, [])
+
+  const toggleRotPatternSelection = useCallback((type: RotType, key: PatternKey, pattern: string | null | undefined) => {
+    const nextState = patternToTriState(type, pattern)
+    if (nextState === 'any') return
+    setRotFilters(prev => {
+      const current = prev[type].pattern[key]
+      return {
+        ...prev,
+        [type]: {
+          ...prev[type],
+          pattern: {
+            ...prev[type].pattern,
+            [key]: current === 'any' ? nextState : 'any',
+          },
+        },
+      }
+    })
+  }, [])
+
+  const clearActiveRotationFilter = useCallback((row: ActiveRotationFilterRow) => {
+    if (row.mode === 'pattern' && row.patternKey) {
+      setRotPattern(row.type, row.patternKey, 'any')
+      return
+    }
+    if (!row.metric) return
+    if (row.mode === 'value') {
+      setRotTh(row.type, row.idx, row.metric, { active: false })
+      return
+    }
+    setRotPct(row.type, row.idx, row.metric, { active: false })
+  }, [setRotPattern, setRotPct, setRotTh])
+
   // ── Canvas (KDE) ──
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [dims, setDims] = useState({ w: 800, h: 360 })
@@ -477,53 +1253,7 @@ export const DistributionsPanel: React.FC<DistributionsPanelProps> = ({
 
   // Compute tercile groups + mean paths from data.forward_paths
   const forwardTerciles = useMemo(() => {
-    const paths = data?.forward_paths
-    if (!paths || paths.length === 0) return null
-    const sortedByReturn = [...paths]
-      .map((p, originalIdx) => ({ p, originalIdx }))
-      .sort((a, b) => a.p.final_return - b.p.final_return)
-    const n = sortedByReturn.length
-    const cutA = Math.floor(n / 3)
-    const cutB = Math.floor(2 * n / 3)
-    const tercileOfOriginal = new Map<number, 'bottom' | 'middle' | 'top'>()
-    sortedByReturn.forEach((entry, i) => {
-      const t: 'bottom' | 'middle' | 'top' = i < cutA ? 'bottom' : i < cutB ? 'middle' : 'top'
-      tercileOfOriginal.set(entry.originalIdx, t)
-    })
-    const bottom = sortedByReturn.slice(0, cutA).map(x => x.p)
-    const middle = sortedByReturn.slice(cutA, cutB).map(x => x.p)
-    const top    = sortedByReturn.slice(cutB).map(x => x.p)
-
-    const computeStats = (group: ForwardPath[]): { mean: number[]; upper: number[]; lower: number[] } => {
-      if (group.length === 0 || group[0].series.length === 0) return { mean: [], upper: [], lower: [] }
-      const len = group[0].series.length
-      const mean = new Array(len).fill(0)
-      const upper = new Array(len).fill(0)
-      const lower = new Array(len).fill(0)
-      for (let i = 0; i < len; i++) {
-        let sum = 0; let count = 0
-        for (const p of group) {
-          const v = p.series[i]
-          if (Number.isFinite(v)) { sum += v; count++ }
-        }
-        const m = count > 0 ? sum / count : 0
-        let sq = 0
-        for (const p of group) {
-          const v = p.series[i]
-          if (Number.isFinite(v)) sq += (v - m) * (v - m)
-        }
-        const std = count > 1 ? Math.sqrt(sq / count) : 0
-        mean[i] = m; upper[i] = m + std; lower[i] = m - std
-      }
-      return { mean, upper, lower }
-    }
-    return {
-      bottom: { paths: bottom, ...computeStats(bottom) },
-      middle: { paths: middle, ...computeStats(middle) },
-      top:    { paths: top,    ...computeStats(top)    },
-      tercileOfOriginal,
-      all: paths,
-    }
+    return buildForwardTerciles(data?.forward_paths)
   }, [data?.forward_paths])
 
   // Draw the forward-paths chart
@@ -543,10 +1273,7 @@ export const DistributionsPanel: React.FC<DistributionsPanelProps> = ({
 
     if (!forwardTerciles) {
       ctx.fillStyle = SOLAR_MUTED; ctx.font = '12px monospace'; ctx.textAlign = 'center'
-      const msg = (typeof data?.horizon === 'string' && data?.horizon === 'rotation')
-        ? 'Forward paths unavailable for Rotation horizon (variable length)'
-        : 'No forward paths'
-      ctx.fillText(msg, fwdDims.w / 2, fwdDims.h / 2)
+      ctx.fillText('No forward paths', fwdDims.w / 2, fwdDims.h / 2)
       return
     }
 
@@ -650,7 +1377,7 @@ export const DistributionsPanel: React.FC<DistributionsPanelProps> = ({
       ctx.fillStyle = c; ctx.fillRect(pad.left + 4, y, 12, 3)
       ctx.fillStyle = SOLAR_TEXT; ctx.fillText(label, pad.left + 20, y + 5)
     })
-  }, [forwardTerciles, fwdDims, hoveredMatchIdx, data?.forward_paths, data?.horizon])
+  }, [forwardTerciles, fwdDims, hoveredMatchIdx, data?.forward_paths])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -722,227 +1449,409 @@ export const DistributionsPanel: React.FC<DistributionsPanelProps> = ({
     row(1, BLUE_FILL, BLUE, 'Filtered', data.filtered.n, data.filtered.median)
   }, [data, dims, target, loading, error])
 
-  const stats = data?.filtered, baseSt = data?.baseline
+  const stats = data?.filtered
+  const baseSt = data?.baseline
+  const sortedForwardEntries = useMemo(() => {
+    if (!data?.forward_paths) return []
+    const entries = data.forward_paths.map((p, i) => ({ p, i }))
+    entries.sort((a, b) => {
+      const dir = fwdSortDir === 'asc' ? 1 : -1
+      if (fwdSortBy === 'return') return (a.p.final_return - b.p.final_return) * dir
+      const ad = a.p.date ?? ''
+      const bd = b.p.date ?? ''
+      return (ad < bd ? -1 : ad > bd ? 1 : 0) * dir
+    })
+    return entries
+  }, [data?.forward_paths, fwdSortBy, fwdSortDir])
+
+  const selectedStandardSources = useMemo(
+    () => visibleStandardSources.filter(source => selectedSourceIds.includes(source.id)),
+    [selectedSourceIds, visibleStandardSources],
+  )
+
+  const activeRotationFilters = useMemo(() => {
+    const rows: ActiveRotationFilterRow[] = []
+    for (const type of ROT_TYPES) {
+      const state = rotFilters[type]
+      for (const idx of ROT_INDICES) {
+        for (const metric of METRICS) {
+          if (state.threshold[idx][metric].active) {
+            rows.push({ id: `${type}:${idx}:${metric}:value`, type, idx, metric, mode: 'value' })
+          }
+          if (state.percentile[idx][metric].active) {
+            rows.push({ id: `${type}:${idx}:${metric}:percentile`, type, idx, metric, mode: 'percentile' })
+          }
+        }
+      }
+      for (const patternKey of PATTERN_KEYS) {
+        if (state.pattern[patternKey] !== 'any') {
+          const idx = Number(patternKey.split('_')[0]) as RotIdx
+          rows.push({ id: `${type}:${patternKey}:pattern`, type, idx, patternKey, mode: 'pattern' })
+        }
+      }
+    }
+    return rows
+  }, [rotFilters])
+
+  const formatSourceSnapshot = useCallback((sourceId: StandardSourceId) => {
+    if (!currentContext) return { value: '--', sub: undefined as string | undefined }
+    const snap = metricSnapshot(sourceId, currentContext)
+    const positionToText = (state: TriState, aLabel: string, bLabel: string) =>
+      state === 'a' ? aLabel : state === 'b' ? bLabel : '--'
+
+    switch (sourceId) {
+      case 'regime': {
+        const state = triStateFromCurrent(sourceId, currentContext)
+        return { value: positionToText(state, 'Breakout', 'Breakdown'), sub: undefined }
+      }
+      case 'rotation': {
+        const state = triStateFromCurrent(sourceId, currentContext)
+        return { value: positionToText(state, 'Up', 'Down'), sub: undefined }
+      }
+      case 'loc_upper': {
+        const state = triStateFromCurrent(sourceId, currentContext)
+        return { value: positionToText(state, 'Above', 'Below'), sub: currentContext.upper_target == null ? undefined : `Tgt ${currentContext.upper_target.toFixed(2)}` }
+      }
+      case 'loc_lower': {
+        const state = triStateFromCurrent(sourceId, currentContext)
+        return { value: positionToText(state, 'Above', 'Below'), sub: currentContext.lower_target == null ? undefined : `Tgt ${currentContext.lower_target.toFixed(2)}` }
+      }
+      case 'rv':
+        return { value: snap.value == null ? '--' : `${snap.value.toFixed(1)}%`, sub: snap.percentile == null ? undefined : `%ile ${(snap.percentile * 100).toFixed(1)}%` }
+      case 'breadth':
+      case 'breakout_pct':
+      case 'corr':
+        return { value: snap.value == null ? '--' : `${snap.value.toFixed(1)}%`, sub: undefined }
+      default:
+        return {
+          value: snap.value == null ? '--' : snap.value.toFixed(2),
+          sub: snap.percentile == null ? undefined : `%ile ${(snap.percentile * 100).toFixed(1)}%`,
+        }
+    }
+  }, [currentContext])
+
+  const formatRotationFilterSnapshot = useCallback((row: ActiveRotationFilterRow) => {
+    const labelBase = `${ROT_TYPE_LABELS[row.type]} ${rotationIndexLabel(row.idx)}`
+    if (!currentContext) {
+      return {
+        label: row.mode === 'pattern'
+          ? `${ROT_TYPE_LABELS[row.type]} ${row.patternKey?.replace('_', ' vs ') ?? 'pattern'}`
+          : `${labelBase} ${row.metric}${row.mode === 'percentile' ? ' %ile' : ''}`,
+        current: '--',
+      }
+    }
+
+    const ctx = currentContext.rotations[row.type]
+    if (row.mode === 'pattern' && row.patternKey) {
+      return {
+        label: `${ROT_TYPE_LABELS[row.type]} ${row.patternKey.replace('_', ' vs ')} Pattern`,
+        current: getRotationPatternDisplay(ctx, row.patternKey) ?? '--',
+      }
+    }
+
+    if (!row.metric) {
+      return { label: labelBase, current: '--' }
+    }
+
+    const rawValue = row.mode === 'value'
+      ? getRotationMetricValue(ctx, row.idx, row.metric)
+      : getRotationMetricPercentile(ctx, row.idx, row.metric)
+
+    const current = row.mode === 'percentile'
+      ? pct(rawValue, 1)
+      : row.metric === 'Time'
+        ? (rawValue == null ? '--' : rawValue.toFixed(0))
+        : pct(rawValue, 1)
+
+    return {
+      label: `${labelBase} ${row.metric}${row.mode === 'percentile' ? ' %ile' : ''}`,
+      current,
+    }
+  }, [currentContext])
 
   return (
-    <div className="distributions-panel" style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 12, height: '100%', overflow: 'auto' }}>
-
-      {/* Controls row */}
-      <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-end' }}>
-        <div>
-          <div style={{ fontSize: 10, color: SOLAR_MUTED, marginBottom: 3 }}>MODE</div>
-          <div style={{ display: 'flex', gap: 2 }}>
-            <button className={`control-btn ${mode === 'ticker' ? 'primary' : ''}`} style={{ fontSize: 11, padding: '3px 10px' }} onClick={() => setMode('ticker')}>Ticker</button>
-            <button className={`control-btn ${mode === 'basket' ? 'primary' : ''}`} style={{ fontSize: 11, padding: '3px 10px' }} onClick={() => setMode('basket')}>Basket</button>
+    <div className="distributions-panel" style={{ padding: 8, display: 'flex', flexDirection: 'column', gap: 8, height: '100%', overflow: 'auto' }}>
+      <SectionCard
+        title="SETUP"
+        right={
+          target ? (
+            <span style={{ fontSize: 9, color: SOLAR_MUTED, fontFamily: 'monospace' }}>
+              {mode.toUpperCase()} · {target} · {lookback} lookback · {horizon} bars
+            </span>
+          ) : null
+        }
+      >
+        <div style={CONTROLS_GRID_STYLE}>
+          <div>
+            <FieldLabel>MODE</FieldLabel>
+            <div style={{ display: 'flex', gap: 2 }}>
+              <button className={`control-btn ${mode === 'ticker' ? 'primary' : ''}`} style={COMPACT_BUTTON_STYLE} onClick={() => setMode('ticker')}>Ticker</button>
+              <button className={`control-btn ${mode === 'basket' ? 'primary' : ''}`} style={COMPACT_BUTTON_STYLE} onClick={() => setMode('basket')}>Basket</button>
+            </div>
           </div>
+
+          {mode === 'ticker' ? (
+            <TypeaheadField
+              label="TICKER"
+              value={tickerQuery}
+              selectedValue={ticker}
+              options={filteredTickerOptions}
+              showDropdown={showTickerDropdown}
+              setShowDropdown={setShowTickerDropdown}
+              onValueChange={next => setTickerQuery(next.toUpperCase())}
+              onSelect={next => { setTicker(next); setTickerQuery(next) }}
+              onCommit={next => setTicker(next.toUpperCase())}
+              placeholder="AAPL"
+              width={104}
+            />
+          ) : (
+            <TypeaheadField
+              label="BASKET"
+              value={basketQuery}
+              selectedValue={basket}
+              options={filteredBasketOptions}
+              showDropdown={showBasketDropdown}
+              setShowDropdown={setShowBasketDropdown}
+              onValueChange={setBasketQuery}
+              onSelect={next => { setBasket(next); setBasketQuery(next) }}
+              onCommit={next => setBasket(next)}
+              placeholder="Search baskets..."
+              width={220}
+            />
+          )}
+
+          <div>
+            <FieldLabel>LOOKBACK</FieldLabel>
+            <input
+              type="number"
+              className="backtest-input"
+              value={lookback}
+              min={1}
+              max={252}
+              onChange={e => setLookback(Math.max(1, Number(e.target.value) || 1))}
+              style={{ ...COMPACT_INPUT_STYLE, width: 64 }}
+            />
+          </div>
+
+          <div>
+            <FieldLabel>HORIZON</FieldLabel>
+            <div style={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
+              {HORIZON_OPTIONS.map(h => (
+                <button
+                  key={h}
+                  className={`control-btn ${horizon === h ? 'primary' : ''}`}
+                  style={COMPACT_BUTTON_STYLE}
+                  onClick={() => setHorizon(h)}
+                >
+                  {`${h}b`}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <button className="control-btn" onClick={resetAll} style={{ ...COMPACT_BUTTON_STYLE, marginLeft: 'auto' }}>Reset conditions</button>
         </div>
-
-        {mode === 'ticker' ? (
-          <div style={{ position: 'relative' }}>
-            <div style={{ fontSize: 10, color: SOLAR_MUTED, marginBottom: 3 }}>TICKER</div>
-            <input type="text" className="backtest-input" value={tickerQuery}
-              onChange={e => { setTickerQuery(e.target.value.toUpperCase()); setShowTickerDropdown(true) }}
-              onFocus={() => setShowTickerDropdown(true)}
-              onBlur={() => setTimeout(() => setShowTickerDropdown(false), 120)}
-              onKeyDown={e => { if (e.key === 'Enter') { const q = tickerQuery.trim().toUpperCase(); if (q) { setTicker(q); setShowTickerDropdown(false) } } }}
-              placeholder="AAPL" style={{ width: 120, textTransform: 'uppercase' }} />
-            {showTickerDropdown && filteredTickerOptions.length > 0 && (
-              <div style={{ position: 'absolute', top: '100%', left: 0, zIndex: 50, background: SOLAR_BG, border: `1px solid ${SOLAR_BORDER}`, maxHeight: 220, overflowY: 'auto', minWidth: 120 }}>
-                {filteredTickerOptions.map(t => (
-                  <div key={t} onMouseDown={() => { setTicker(t); setTickerQuery(t); setShowTickerDropdown(false) }}
-                    style={{ padding: '3px 8px', cursor: 'pointer', fontSize: 12, fontFamily: 'monospace', background: t === ticker ? SOLAR_BORDER : 'transparent' }}>{t}</div>
-                ))}
-              </div>
-            )}
-          </div>
-        ) : (
-          <div style={{ position: 'relative' }}>
-            <div style={{ fontSize: 10, color: SOLAR_MUTED, marginBottom: 3 }}>BASKET</div>
-            <input type="text" className="backtest-input" value={basketQuery}
-              onChange={e => { setBasketQuery(e.target.value); setShowBasketDropdown(true) }}
-              onFocus={() => setShowBasketDropdown(true)}
-              onBlur={() => setTimeout(() => setShowBasketDropdown(false), 120)}
-              onKeyDown={e => { if (e.key === 'Enter') { const q = basketQuery.trim(); if (q) { setBasket(q); setShowBasketDropdown(false) } } }}
-              placeholder="Search baskets..." style={{ width: 240 }} />
-            {showBasketDropdown && filteredBasketOptions.length > 0 && (
-              <div style={{ position: 'absolute', top: '100%', left: 0, zIndex: 50, background: SOLAR_BG, border: `1px solid ${SOLAR_BORDER}`, maxHeight: 220, overflowY: 'auto', minWidth: 240 }}>
-                {filteredBasketOptions.map(b => (
-                  <div key={b} onMouseDown={() => { setBasket(b); setBasketQuery(b); setShowBasketDropdown(false) }}
-                    style={{ padding: '3px 8px', cursor: 'pointer', fontSize: 12, fontFamily: 'monospace', background: b === basket ? SOLAR_BORDER : 'transparent' }}>{b}</div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        <div>
-          <div style={{ fontSize: 10, color: SOLAR_MUTED, marginBottom: 3 }}>TREND LOOKBACK (bars)</div>
-          <input type="number" className="backtest-input" value={lookback} min={1} max={252}
-            onChange={e => setLookback(Math.max(1, Number(e.target.value) || 1))} style={{ width: 70 }} />
-        </div>
-
-        <div>
-          <div style={{ fontSize: 10, color: SOLAR_MUTED, marginBottom: 3 }}>HORIZON</div>
-          <div style={{ display: 'flex', gap: 2 }}>
-            {(['1', '5', '21', '63', '252', 'rotation'] as const).map(h => (
-              <button key={h}
-                className={`control-btn ${horizon === h ? 'primary' : ''}`}
-                style={{ fontSize: 11, padding: '3px 10px', width: 'auto', height: 28 }}
-                onClick={() => setHorizon(h)}>
-                {h === 'rotation' ? 'Rotation' : `${h}b`}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <button className="control-btn" onClick={resetAll} style={{ marginLeft: 'auto' }}>Reset conditions</button>
-      </div>
+      </SectionCard>
 
       {/* Filters — grouped collapsible */}
-      <div style={{ border: `1px solid ${SOLAR_BORDER}`, background: SOLAR_BG }}>
-        <div style={{ padding: '6px 8px', color: SOLAR_MUTED, fontSize: 10, borderBottom: `1px solid ${SOLAR_BORDER}` }}>
-          FILTERS
+      <SectionCard
+        title="ACTIVE FILTERS"
+        right={<span style={{ fontSize: 9, color: SOLAR_MUTED }}>Click cells in CURRENT CONTEXT to add or remove filters from the current setup.</span>}
+        bodyStyle={{ padding: 0 }}
+      >
+        <div style={FILTER_EDITOR_ROW_STYLE}>
+          <div style={FILTER_EDITOR_HEADER_CELL_STYLE}>Field</div>
+          <div style={FILTER_EDITOR_HEADER_CELL_STYLE}>Current</div>
+          <div style={FILTER_EDITOR_HEADER_CELL_STYLE}>Mode</div>
+          <div style={FILTER_EDITOR_HEADER_CELL_STYLE}>Condition</div>
+          <div style={{ ...FILTER_EDITOR_HEADER_CELL_STYLE, borderRight: 0, justifyContent: 'center' }}>x</div>
         </div>
-        {COND_GROUPS.map(group => {
-          if (group.basketOnly && !isBasket) return null
-          const groupDefs = group.keys
-            .map(k => COND_DEFS.find(d => d.key === k))
-            .filter((d): d is CondDef => !!d && (!d.basketOnly || isBasket))
-          if (groupDefs.length === 0) return null
-          const isOpen = openCondGroup[group.key]
-          const activeCount = groupDefs.reduce((acc, d) => {
-            if (d.kind === 'tri') return acc + (triConds[d.key] !== 'any' ? 1 : 0)
-            return acc + (thresholds[d.key]?.active ? 1 : 0)
-          }, 0)
-          return (
-            <div key={group.key} style={{ borderTop: `1px solid ${SOLAR_BORDER}` }}>
-              <div
-                onClick={() => setOpenCondGroup(prev => ({ ...prev, [group.key]: !prev[group.key] }))}
-                style={{ padding: '4px 8px', cursor: 'pointer', fontSize: 12, fontFamily: 'monospace', display: 'flex', alignItems: 'center', gap: 6 }}
-              >
-                <span style={{ width: 10, color: SOLAR_MUTED }}>{isOpen ? '▼' : '▶'}</span>
-                <span>{group.label}</span>
-                {activeCount > 0 && (
-                  <span style={{ fontSize: 10, color: BLUE, marginLeft: 4 }}>({activeCount} active)</span>
-                )}
-              </div>
-              {isOpen && (() => {
-                const renderDef = (def: CondDef) => {
-                  if (def.kind === 'tri') {
-                    const state = triConds[def.key]
-                    const mkBtn = (next: TriState, label: string) => (
-                      <div style={ROT_CELL}>
-                        <button className={`control-btn ${state === next ? 'primary' : ''}`}
-                          style={ROT_INNER}
-                          onClick={() => setTri(def.key, next)}>{label}</button>
-                      </div>
-                    )
-                    return (
-                      <div key={def.key} style={{ border: `1px solid ${SOLAR_BORDER}`, padding: 6, background: SOLAR_BG }}>
-                        <div style={{ fontSize: 10, color: SOLAR_MUTED, marginBottom: 4 }}>{def.label.toUpperCase()}</div>
-                        <div style={{ display: 'flex', gap: 4 }}>
-                          {mkBtn('any', 'Any')}
-                          {mkBtn('a', def.a.label)}
-                          {mkBtn('b', def.b.label)}
-                        </div>
-                      </div>
-                    )
-                  }
-                  const th = thresholds[def.key]
-                  return (
-                    <div key={def.key} style={{ border: `1px solid ${SOLAR_BORDER}`, padding: 6, background: SOLAR_BG }}>
-                      <div style={{ fontSize: 10, color: SOLAR_MUTED, marginBottom: 4 }}>{def.label.toUpperCase()}</div>
-                      <div style={{ display: 'flex', gap: 4 }}>
-                        <div style={ROT_CELL}>
-                          <button className={`control-btn ${!th.active ? 'primary' : ''}`}
-                            style={ROT_INNER}
-                            onClick={() => setTh(def.key, { active: false })}>Any</button>
-                        </div>
-                        <div style={ROT_CELL}>
-                          <button className={`control-btn ${th.active ? 'primary' : ''}`}
-                            style={{ ...ROT_INNER, fontFamily: 'monospace' }}
-                            onClick={() => {
-                              if (!th.active) setTh(def.key, { active: true })
-                              else cycleOp(def.key)
-                            }}>{th.op}</button>
-                        </div>
-                        <div style={ROT_CELL}>
-                          <input type="number" className="backtest-input"
-                            value={toDisp(th.val, def.percent)}
-                            min={toDisp(def.min, def.percent)}
-                            max={toDisp(def.max, def.percent)}
-                            step={toDisp(def.step, def.percent)}
-                            onChange={e => {
-                              const entered = parseFloat(e.target.value)
-                              if (!isNaN(entered)) {
-                                const internal = fromDisp(entered, def.percent)
-                                setTh(def.key, { active: true, val: Math.min(def.max, Math.max(def.min, internal)) })
-                              }
-                            }}
-                            style={{ ...ROT_INNER, textAlign: 'center' }} />
-                        </div>
-                      </div>
-                    </div>
-                  )
-                }
+        {selectedStandardSources.length === 0 && activeRotationFilters.length === 0 ? (
+          <div style={{ padding: '8px 10px', color: SOLAR_MUTED, fontSize: 10, fontFamily: 'monospace' }}>
+            No active filters.
+          </div>
+        ) : (
+          <>
+          {selectedStandardSources.map(source => {
+            const mode = selectedSourceModes[source.id] ?? source.modeOrder[0]
+            const snapshot = formatSourceSnapshot(source.id)
+            const triDef = source.triKey
+              ? COND_DEFS.find((def): def is TriDef => def.kind === 'tri' && def.key === source.triKey)
+              : undefined
+            const trendDef = source.trendKey
+              ? COND_DEFS.find((def): def is TriDef => def.kind === 'tri' && def.key === source.trendKey)
+              : undefined
+            const rawDef = source.thresholdKey ? TH_DEFS.find(def => def.key === source.thresholdKey) : undefined
+            const pctDef = source.percentileKey ? TH_DEFS.find(def => def.key === source.percentileKey) : undefined
 
-                // If the group declares explicit columns, render each column as a stack.
-                // All columns are fixed-width so widths match across different groups.
-                if (group.columns && group.columns.length > 0) {
-                  return (
-                    <div style={{ padding: '6px 12px 10px 26px', display: 'grid',
-                                  gridTemplateColumns: `repeat(${group.columns.length}, ${COND_COLUMN_WIDTH}px)`, gap: 8 }}>
-                      {group.columns.map((col, ci) => {
-                        const colDefs = col
-                          .map(k => COND_DEFS.find(d => d.key === k))
-                          .filter((d): d is CondDef => !!d && (!d.basketOnly || isBasket))
-                        return (
-                          <div key={ci} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                            {colDefs.map(renderDef)}
-                          </div>
-                        )
-                      })}
-                    </div>
-                  )
-                }
-
-                return (
-                  <div style={{ padding: '6px 12px 10px 26px', display: 'grid',
-                                gridTemplateColumns: `repeat(auto-fill, ${COND_COLUMN_WIDTH}px)`, gap: 8 }}>
-                    {groupDefs.map(renderDef)}
+            const renderThresholdEditor = (def: ThDef) => {
+              const state = thresholds[def.key]
+              return (
+                <div style={FILTER_VALUE_GRID_STYLE}>
+                  <div style={FILTER_VALUE_CELL_STYLE}>
+                    <SheetToggleButton active={!state.active} label="Any" onClick={() => setTh(def.key, { active: false })} />
                   </div>
-                )
-              })()}
-            </div>
-          )
-        })}
-      </div>
+                  <div style={FILTER_VALUE_CELL_STYLE}>
+                    <SheetToggleButton
+                      active={state.active}
+                      label={state.op}
+                      onClick={() => {
+                        if (!state.active) setTh(def.key, { active: true })
+                        else cycleOp(def.key)
+                      }}
+                    />
+                  </div>
+                  <div style={FILTER_VALUE_LAST_CELL_STYLE}>
+                    <input
+                      type="number"
+                      value={toDisp(state.val, def.percent)}
+                      min={toDisp(def.min, def.percent)}
+                      max={toDisp(def.max, def.percent)}
+                      step={toDisp(def.step, def.percent)}
+                      onChange={e => {
+                        const entered = parseFloat(e.target.value)
+                        if (!isNaN(entered)) {
+                          const internal = fromDisp(entered, def.percent)
+                          setTh(def.key, { active: true, val: Math.min(def.max, Math.max(def.min, internal)) })
+                        }
+                      }}
+                      style={FILTER_CELL_INPUT_STYLE}
+                    />
+                  </div>
+                </div>
+              )
+            }
 
-      {/* Rotation context filters (Phase 2) */}
-      <div style={{ border: `1px solid ${SOLAR_BORDER}`, background: SOLAR_BG }}>
-        <div style={{ padding: '6px 8px', color: SOLAR_MUTED, fontSize: 10, borderBottom: `1px solid ${SOLAR_BORDER}` }}>
-          ROTATION CONTEXT FILTERS
-        </div>
+            const renderTriEditor = (def: TriDef) => (
+              <div style={FILTER_VALUE_GRID_STYLE}>
+                <div style={FILTER_VALUE_CELL_STYLE}>
+                  <SheetToggleButton active={triConds[def.key] === 'any'} label="Any" onClick={() => setTri(def.key, 'any')} />
+                </div>
+                <div style={FILTER_VALUE_CELL_STYLE}>
+                  <SheetToggleButton active={triConds[def.key] === 'a'} label={def.a.label} onClick={() => setTri(def.key, 'a')} />
+                </div>
+                <div style={FILTER_VALUE_LAST_CELL_STYLE}>
+                  <SheetToggleButton active={triConds[def.key] === 'b'} label={def.b.label} onClick={() => setTri(def.key, 'b')} />
+                </div>
+              </div>
+            )
+
+            return (
+              <div key={source.id} style={FILTER_EDITOR_ROW_STYLE}>
+                <div style={FILTER_EDITOR_CELL_STYLE}>{source.label}</div>
+                <div style={FILTER_EDITOR_CELL_STYLE}>
+                  <div>
+                    <div>{snapshot.value}</div>
+                    {snapshot.sub && <div style={{ fontSize: 8, color: SOLAR_MUTED }}>{snapshot.sub}</div>}
+                  </div>
+                </div>
+                <div style={{ ...FILTER_EDITOR_CELL_STYLE, padding: 0 }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: `repeat(${source.modeOrder.length}, minmax(0, 1fr))`, width: '100%' }}>
+                    {source.modeOrder.map(entry => (
+                      <div key={entry} style={{ borderRight: entry === source.modeOrder[source.modeOrder.length - 1] ? undefined : `1px solid ${SOLAR_BORDER}` }}>
+                        <SheetToggleButton active={mode === entry} label={modeLabel(entry)} onClick={() => setSourceMode(source.id, entry)} />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div style={{ ...FILTER_EDITOR_CELL_STYLE, padding: 0 }}>
+                  {mode === 'state' && triDef && renderTriEditor(triDef)}
+                  {mode === 'trend' && trendDef && renderTriEditor(trendDef)}
+                  {mode === 'value' && rawDef && renderThresholdEditor(rawDef)}
+                  {mode === 'percentile' && pctDef && renderThresholdEditor(pctDef)}
+                </div>
+                <div style={{ ...FILTER_EDITOR_CELL_STYLE, borderRight: 0, justifyContent: 'center', padding: 0 }}>
+                  <SheetToggleButton active={false} label="×" onClick={() => toggleSourceSelection(source.id)} title={`Remove ${source.label}`} />
+                </div>
+              </div>
+            )
+          })}
+          {activeRotationFilters.map(row => {
+            const snapshot = formatRotationFilterSnapshot(row)
+            const patternLabels = ROT_PATTERN_LABELS[row.type]
+
+            const renderRotationThreshold = () => {
+              if (!row.metric) return null
+              const defaults = ROT_DEFAULTS[row.metric]
+              const state = row.mode === 'value'
+                ? rotFilters[row.type].threshold[row.idx][row.metric]
+                : rotFilters[row.type].percentile[row.idx][row.metric]
+              return (
+                <AnyOpValueControl
+                  state={state}
+                  min={row.mode === 'value' ? defaults.th.min : 0}
+                  max={row.mode === 'value' ? defaults.th.max : 1}
+                  step={row.mode === 'value' ? defaults.th.step : defaults.pct.step}
+                  percent={row.mode === 'value' ? defaults.th.percent : defaults.pct.percent}
+                  onSetAny={() => clearActiveRotationFilter(row)}
+                  onCycleOrEnable={() => {
+                    if (row.mode === 'value') {
+                      if (state.active) cycleRotThOp(row.type, row.idx, row.metric)
+                      else setRotTh(row.type, row.idx, row.metric, { active: true })
+                      return
+                    }
+                    if (state.active) cycleRotPctOp(row.type, row.idx, row.metric)
+                    else setRotPct(row.type, row.idx, row.metric, { active: true })
+                  }}
+                  onSetValue={(value) => {
+                    if (row.mode === 'value') setRotTh(row.type, row.idx, row.metric!, { active: true, val: value })
+                    else setRotPct(row.type, row.idx, row.metric!, { active: true, val: value })
+                  }}
+                />
+              )
+            }
+
+            const renderRotationPattern = () => {
+              if (!row.patternKey) return null
+              return (
+                <div style={FILTER_VALUE_GRID_STYLE}>
+                  <div style={FILTER_VALUE_CELL_STYLE}>
+                    <SheetToggleButton active={rotFilters[row.type].pattern[row.patternKey] === 'any'} label="Any" onClick={() => clearActiveRotationFilter(row)} />
+                  </div>
+                  <div style={FILTER_VALUE_CELL_STYLE}>
+                    <SheetToggleButton active={rotFilters[row.type].pattern[row.patternKey] === 'a'} label={patternLabels.a} onClick={() => setRotPattern(row.type, row.patternKey, 'a')} />
+                  </div>
+                  <div style={FILTER_VALUE_LAST_CELL_STYLE}>
+                    <SheetToggleButton active={rotFilters[row.type].pattern[row.patternKey] === 'b'} label={patternLabels.b} onClick={() => setRotPattern(row.type, row.patternKey, 'b')} />
+                  </div>
+                </div>
+              )
+            }
+
+            return (
+              <div key={row.id} style={FILTER_EDITOR_ROW_STYLE}>
+                <div style={FILTER_EDITOR_CELL_STYLE}>{snapshot.label}</div>
+                <div style={FILTER_EDITOR_CELL_STYLE}>{snapshot.current}</div>
+                <div style={FILTER_EDITOR_CELL_STYLE}>{rotationModeLabel(row.mode)}</div>
+                <div style={{ ...FILTER_EDITOR_CELL_STYLE, padding: 0 }}>
+                  {row.mode === 'pattern' ? renderRotationPattern() : renderRotationThreshold()}
+                </div>
+                <div style={{ ...FILTER_EDITOR_CELL_STYLE, borderRight: 0, justifyContent: 'center', padding: 0 }}>
+                  <SheetToggleButton active={false} label="x" onClick={() => clearActiveRotationFilter(row)} title={`Remove ${snapshot.label}`} />
+                </div>
+              </div>
+            )
+          })}
+          </>
+        )}
+      </SectionCard>
+
+      <div style={{ display: 'none' }}>
+      <SectionCard title="ROTATION CONTEXT FILTERS" bodyStyle={{ padding: 0 }}>
         {ROT_TYPES.map(type => {
           const isOpen = openRotType[type]
           const s = rotFilters[type]
-          // Count active filters for this type
-          let activeCount = 0
-          for (const i of ROT_INDICES) for (const m of METRICS) {
-            if (s.threshold[i][m].active) activeCount++
-            if (s.percentile[i][m].active) activeCount++
-          }
-          for (const k of PATTERN_KEYS) if (s.pattern[k] !== 'any') activeCount++
+          const activeCount = countRotationFilters(s)
           return (
             <div key={type} style={{ borderTop: `1px solid ${SOLAR_BORDER}` }}>
               <div
                 onClick={() => setOpenRotType(prev => ({ ...prev, [type]: !prev[type] }))}
-                style={{ padding: '4px 8px', cursor: 'pointer', fontSize: 12, fontFamily: 'monospace', display: 'flex', alignItems: 'center', gap: 6 }}
+                style={GROUP_TOGGLE_STYLE}
               >
-                <span style={{ width: 10, color: SOLAR_MUTED }}>{isOpen ? '▼' : '▶'}</span>
+                <span style={{ width: 10, color: SOLAR_MUTED }}>{isOpen ? 'v' : '>'}</span>
                 <span>{ROT_TYPE_LABELS[type]}</span>
                 {activeCount > 0 && (
-                  <span style={{ fontSize: 10, color: BLUE, marginLeft: 4 }}>({activeCount} active)</span>
+                  <span style={{ fontSize: 9, color: BLUE, marginLeft: 3 }}>({activeCount} active)</span>
                 )}
               </div>
               {isOpen && (() => {
@@ -955,39 +1864,23 @@ export const DistributionsPanel: React.FC<DistributionsPanelProps> = ({
                   dmin: number, dmax: number, dstep: number, dpercent: boolean | undefined,
                   onToggleAny: () => void, onCycleOp: () => void, onVal: (val: number) => void,
                 ) => (
-                  <div style={{ display: 'flex', gap: 4 }}>
-                    <div style={ROT_CELL}>
-                      <button className={`control-btn ${!th.active ? 'primary' : ''}`}
-                        style={ROT_INNER}
-                        onClick={onToggleAny}>Any</button>
-                    </div>
-                    <div style={ROT_CELL}>
-                      <button className={`control-btn ${th.active ? 'primary' : ''}`}
-                        style={{ ...ROT_INNER, fontFamily: 'monospace' }}
-                        onClick={onCycleOp}>{th.op}</button>
-                    </div>
-                    <div style={ROT_CELL}>
-                      <input type="number" className="backtest-input"
-                        value={toDisp(th.val, dpercent)}
-                        min={toDisp(dmin, dpercent)}
-                        max={toDisp(dmax, dpercent)}
-                        step={toDisp(dstep, dpercent)}
-                        onChange={e => {
-                          const entered = parseFloat(e.target.value)
-                          if (!isNaN(entered)) {
-                            const internal = fromDisp(entered, dpercent)
-                            onVal(Math.min(dmax, Math.max(dmin, internal)))
-                          }
-                        }}
-                        style={{ ...ROT_INNER, textAlign: 'center' }} />
-                    </div>
-                  </div>
+                  <AnyOpValueControl
+                    state={th}
+                    min={dmin}
+                    max={dmax}
+                    step={dstep}
+                    percent={dpercent}
+                    onSetAny={onToggleAny}
+                    onCycleOrEnable={onCycleOp}
+                    onSetValue={onVal}
+                  />
                 )
 
                 return (
-                  <div style={{ padding: '6px 12px 10px 26px', display: 'grid',
-                                gridTemplateColumns: `110px repeat(4, ${COND_COLUMN_WIDTH}px)`,
-                                gap: '4px 8px', alignItems: 'center' }}>
+                  <div style={{ overflowX: 'auto' }}>
+                    <div style={{ padding: GROUP_BODY_PADDING, display: 'grid',
+                                  gridTemplateColumns: `90px repeat(4, ${COND_COLUMN_WIDTH}px)`,
+                                  gap: '3px 6px', alignItems: 'center', minWidth: 'fit-content' }}>
                     {/* Header row: rotation index columns */}
                     <div />
                     {ROT_INDICES.map(i => (
@@ -1004,7 +1897,7 @@ export const DistributionsPanel: React.FC<DistributionsPanelProps> = ({
                       return (
                         <React.Fragment key={m}>
                           {/* Threshold row */}
-                          <div style={{ fontSize: 11, color: SOLAR_TEXT, fontFamily: 'monospace' }}>{m}</div>
+                          <div style={{ fontSize: 10, color: SOLAR_TEXT, fontFamily: 'monospace' }}>{m}</div>
                           {ROT_INDICES.map(i => {
                             const th = s.threshold[i][m]
                             return (
@@ -1019,7 +1912,7 @@ export const DistributionsPanel: React.FC<DistributionsPanelProps> = ({
                             )
                           })}
                           {/* Percentile row */}
-                          <div style={{ fontSize: 11, color: SOLAR_MUTED, fontFamily: 'monospace' }}
+                          <div style={{ fontSize: 10, color: SOLAR_MUTED, fontFamily: 'monospace' }}
                                title="Percentile rank of each rotation's value vs this ticker's history of completed rotations of the same type">
                             {m} %ile
                           </div>
@@ -1042,7 +1935,7 @@ export const DistributionsPanel: React.FC<DistributionsPanelProps> = ({
 
                     {/* Pattern row: HH/LH (or HL/LL) between each rotation and the one older than it.
                         Column under index 3 is empty — we'd need a 4-back reference to compare. */}
-                    <div style={{ fontSize: 11, color: SOLAR_TEXT, fontFamily: 'monospace' }} title={lbl.title}>
+                    <div style={{ fontSize: 10, color: SOLAR_TEXT, fontFamily: 'monospace' }} title={lbl.title}>
                       Pattern vs prior
                     </div>
                     {ROT_INDICES.map(i => {
@@ -1051,35 +1944,513 @@ export const DistributionsPanel: React.FC<DistributionsPanelProps> = ({
                       const p = s.pattern[key]
                       const a_idx = key.split('_')[0], b_idx = key.split('_')[1]
                       return (
-                        <div key={`pattern-${i}`} style={{ display: 'flex', gap: 4 }}>
+                        <div key={`pattern-${i}`} style={{ display: 'flex', gap: 3 }}>
                           <div style={ROT_CELL}>
-                            <button className={`control-btn ${p === 'any' ? 'primary' : ''}`}
-                              style={ROT_INNER}
-                              onClick={() => setRotPattern(type, key, 'any')}>Any</button>
+                            <SheetToggleButton active={p === 'any'} label="Any" onClick={() => setRotPattern(type, key, 'any')} />
                           </div>
                           <div style={ROT_CELL}>
-                            <button className={`control-btn ${p === 'a' ? 'primary' : ''}`}
-                              style={ROT_INNER}
+                            <SheetToggleButton
+                              active={p === 'a'}
+                              label={lbl.a}
                               title={`Rotation ${a_idx} is a ${lbl.a} vs rotation ${b_idx}`}
-                              onClick={() => setRotPattern(type, key, 'a')}>{lbl.a}</button>
+                              onClick={() => setRotPattern(type, key, 'a')}
+                            />
                           </div>
                           <div style={ROT_CELL}>
-                            <button className={`control-btn ${p === 'b' ? 'primary' : ''}`}
-                              style={ROT_INNER}
+                            <SheetToggleButton
+                              active={p === 'b'}
+                              label={lbl.b}
                               title={`Rotation ${a_idx} is a ${lbl.b} vs rotation ${b_idx}`}
-                              onClick={() => setRotPattern(type, key, 'b')}>{lbl.b}</button>
+                              onClick={() => setRotPattern(type, key, 'b')}
+                            />
                           </div>
                         </div>
                       )
                     })}
+                    </div>
                   </div>
                 )
               })()}
             </div>
           )
         })}
+      </SectionCard>
       </div>
 
+      {data?.current_context && (() => {
+        const cc = data.current_context!
+        const ind = cc.indicators
+        const num = (v: number | null | undefined, d = 2) => v == null ? '--' : v.toFixed(d)
+        const pctD = (v: number | null | undefined, d = 1) => v == null ? '--' : (v * 100).toFixed(d) + '%'
+        const signed = (v: number | null | undefined, d = 2, suffix = '') => {
+          if (v == null) return '--'
+          const prefix = v > 0 ? '+' : ''
+          return `${prefix}${v.toFixed(d)}${suffix}`
+        }
+        const patternColor = (p: string | null | undefined) =>
+          p === 'HH' || p === 'HL' || p === 'HH/HL'
+            ? GREEN
+            : p === 'LH' || p === 'LL' || p === 'LH/LL'
+              ? RED
+              : SOLAR_MUTED
+        const activeBar = cc.active_rotation === 'up' ? cc.rotations.UpRot.Time_0
+          : cc.active_rotation === 'down' ? cc.rotations.DownRot.Time_0 : null
+        const renderSheetValue = ({
+          main,
+          sub,
+          active = false,
+          onClick,
+          color,
+          align = 'center',
+        }: {
+          main: string
+          sub?: string
+          active?: boolean
+          onClick?: () => void
+          color?: string
+          align?: 'left' | 'center' | 'right'
+        }) => {
+          const alignItems = align === 'right' ? 'flex-end' : align === 'center' ? 'center' : 'flex-start'
+          const justifyContent = align === 'right' ? 'flex-end' : align === 'center' ? 'center' : 'flex-start'
+          const body = (
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems, justifyContent, gap: 0, lineHeight: 1.05 }}>
+              <span style={{ color: color ?? (active ? BLUE : SOLAR_TEXT), fontWeight: 700 }}>{main}</span>
+              {sub && <span style={{ fontSize: 7, color: SOLAR_MUTED }}>{sub}</span>}
+            </div>
+          )
+
+          if (onClick) {
+            return (
+              <button
+                type="button"
+                onClick={onClick}
+                style={{
+                  ...SHEET_BUTTON_CELL_STYLE,
+                  background: active ? 'rgba(50, 50, 255, 0.08)' : 'transparent',
+                  textAlign: align,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent,
+                }}
+              >
+                {body}
+              </button>
+            )
+          }
+
+          return (
+            <div style={{ minHeight: 18, display: 'flex', alignItems: 'center', justifyContent }}>
+              {body}
+            </div>
+          )
+        }
+
+        const renderOverviewRow = ({
+          label,
+          value,
+          valueActive = false,
+          onValueClick,
+          delta,
+          deltaActive = false,
+          onDeltaClick,
+          context,
+          contextActive = false,
+          onContextClick,
+          contextColor,
+          contextAlign = 'center',
+        }: {
+          label: string
+          value: string
+          valueActive?: boolean
+          onValueClick?: () => void
+          delta: string
+          deltaActive?: boolean
+          onDeltaClick?: () => void
+          context: string
+          contextActive?: boolean
+          onContextClick?: () => void
+          contextColor?: string
+          contextAlign?: 'left' | 'center' | 'right'
+        }) => (
+          <tr key={label}>
+            <td style={SHEET_ROW_LABEL_STYLE}>{label}</td>
+            <td style={SHEET_CELL_STYLE}>
+              {renderSheetValue({ main: value, active: valueActive, onClick: onValueClick, align: 'center' })}
+            </td>
+            <td style={SHEET_CELL_STYLE}>
+              {renderSheetValue({ main: delta, active: deltaActive, onClick: onDeltaClick, align: 'center' })}
+            </td>
+            <td style={SHEET_CELL_STYLE}>
+              {renderSheetValue({ main: context, active: contextActive, onClick: onContextClick, color: contextColor, align: contextAlign })}
+            </td>
+          </tr>
+        )
+
+        const renderRotationHistory = (title: string, type: RotType) => {
+          const ctx = cc.rotations[type]
+          const statusLabel = ctx.active ? 'ACTIVE' : 'INACTIVE'
+          const statusColor = ctx.active ? BLUE : SOLAR_MUTED
+
+          return (
+            <div style={{ borderTop: `1px solid ${SHEET_GRID_BORDER}`, overflowX: 'auto' }}>
+              <div style={{ padding: '3px 5px', color: SOLAR_MUTED, fontSize: 7, letterSpacing: 0.25 }}>{title}</div>
+              <table style={SHEET_TABLE_STYLE}>
+                <colgroup>
+                  <col style={{ width: 88 }} />
+                  <col style={{ width: 92 }} />
+                  <col style={{ width: 72 }} />
+                  <col style={{ width: 78 }} />
+                  <col style={{ width: 78 }} />
+                  <col style={{ width: 82 }} />
+                  <col style={{ width: 72 }} />
+                  <col style={{ width: 72 }} />
+                  <col style={{ width: 72 }} />
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th style={SHEET_HEADER_CELL_STYLE}>Row</th>
+                    <th style={SHEET_HEADER_CELL_STYLE}>Status</th>
+                    <th style={SHEET_HEADER_CELL_STYLE}>Time</th>
+                    <th style={SHEET_HEADER_CELL_STYLE}>Range</th>
+                    <th style={SHEET_HEADER_CELL_STYLE}>Change</th>
+                    <th style={{ ...SHEET_HEADER_CELL_STYLE, textAlign: 'center' }}>H/L Rel</th>
+                    <th style={SHEET_HEADER_CELL_STYLE}>T %ile</th>
+                    <th style={SHEET_HEADER_CELL_STYLE}>R %ile</th>
+                    <th style={SHEET_HEADER_CELL_STYLE}>C %ile</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {ROT_INDICES.map(idx => {
+                    const timeValue = getRotationMetricValue(ctx, idx, 'Time')
+                    const rangeValue = getRotationMetricValue(ctx, idx, 'Range')
+                    const changeValue = getRotationMetricValue(ctx, idx, 'Change')
+                    const timePct = getRotationMetricPercentile(ctx, idx, 'Time')
+                    const rangePct = getRotationMetricPercentile(ctx, idx, 'Range')
+                    const changePct = getRotationMetricPercentile(ctx, idx, 'Change')
+                    const patternKey = PATTERN_KEY_FOR_IDX[idx]
+                    const pattern = patternKey ? getRotationPatternDisplay(ctx, patternKey) : null
+                    const patternFilterValue = patternKey ? ctx.patterns?.[patternKey] ?? null : null
+
+                    return (
+                      <tr key={`${title}-${idx}`} style={{ background: idx === 0 ? 'rgba(50, 50, 255, 0.04)' : 'transparent' }}>
+                        <td style={SHEET_ROW_LABEL_STYLE}>{rotationIndexLabel(idx)}</td>
+                        <td style={SHEET_CELL_STYLE}>
+                          {renderSheetValue({
+                            main: idx === 0 ? statusLabel : 'Prior',
+                            active: idx === 0 && ctx.active,
+                            color: idx === 0 ? statusColor : SOLAR_MUTED,
+                            align: 'center',
+                          })}
+                        </td>
+                        <td style={SHEET_CELL_STYLE}>
+                          {renderSheetValue({
+                            main: timeValue == null ? '--' : timeValue.toFixed(0),
+                            active: rotFilters[type].threshold[idx].Time.active,
+                            onClick: () => toggleRotMetricSelection(type, idx, 'Time', 'value', timeValue),
+                            align: 'center',
+                          })}
+                        </td>
+                        <td style={SHEET_CELL_STYLE}>
+                          {renderSheetValue({
+                            main: pctD(rangeValue),
+                            active: rotFilters[type].threshold[idx].Range.active,
+                            onClick: () => toggleRotMetricSelection(type, idx, 'Range', 'value', rangeValue),
+                            align: 'center',
+                          })}
+                        </td>
+                        <td style={SHEET_CELL_STYLE}>
+                          {renderSheetValue({
+                            main: pctD(changeValue),
+                            active: rotFilters[type].threshold[idx].Change.active,
+                            onClick: () => toggleRotMetricSelection(type, idx, 'Change', 'value', changeValue),
+                            align: 'center',
+                          })}
+                        </td>
+                        <td style={SHEET_CELL_STYLE}>
+                          {renderSheetValue({
+                            main: pattern ?? '--',
+                            active: !!patternKey && rotFilters[type].pattern[patternKey] !== 'any',
+                            onClick: patternKey ? () => toggleRotPatternSelection(type, patternKey, patternFilterValue) : undefined,
+                            color: patternColor(patternFilterValue),
+                            align: 'center',
+                          })}
+                        </td>
+                        <td style={SHEET_CELL_STYLE}>
+                          {renderSheetValue({
+                            main: pctD(timePct),
+                            active: rotFilters[type].percentile[idx].Time.active,
+                            onClick: () => toggleRotMetricSelection(type, idx, 'Time', 'percentile', timePct),
+                            align: 'center',
+                          })}
+                        </td>
+                        <td style={SHEET_CELL_STYLE}>
+                          {renderSheetValue({
+                            main: pctD(rangePct),
+                            active: rotFilters[type].percentile[idx].Range.active,
+                            onClick: () => toggleRotMetricSelection(type, idx, 'Range', 'percentile', rangePct),
+                            align: 'center',
+                          })}
+                        </td>
+                        <td style={SHEET_CELL_STYLE}>
+                          {renderSheetValue({
+                            main: pctD(changePct),
+                            active: rotFilters[type].percentile[idx].Change.active,
+                            onClick: () => toggleRotMetricSelection(type, idx, 'Change', 'percentile', changePct),
+                            align: 'center',
+                          })}
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )
+        }
+
+        return (
+          <SectionCard
+            title="CURRENT CONTEXT"
+            right={
+              <span style={{ fontSize: 9, color: SOLAR_MUTED, fontFamily: 'monospace' }}>
+                {data.ticker} | {cc.date ?? '--'} | Close {num(cc.close)}{activeBar != null ? ` | bar ${activeBar.toFixed(0)}` : ''}
+              </span>
+            }
+            bodyStyle={{ padding: 0 }}
+          >
+            <div style={{ padding: '3px 5px', color: SOLAR_MUTED, fontSize: 7, borderBottom: `1px solid ${SHEET_GRID_BORDER}`, letterSpacing: 0.25 }}>
+              CLICK THE DISPLAYED CELLS TO BUILD ACTIVE FILTERS FROM THE CURRENT SETUP
+            </div>
+            <div style={{ overflowX: 'auto' }}>
+              <div style={{ padding: '3px 5px', color: SOLAR_MUTED, fontSize: 7, letterSpacing: 0.25 }}>SEQUENCE STATUS</div>
+              <table style={SHEET_TABLE_STYLE}>
+                <colgroup>
+                  <col style={{ width: 128 }} />
+                  <col style={{ width: 84 }} />
+                  <col style={{ width: 72 }} />
+                  <col style={{ width: 78 }} />
+                  <col style={{ width: 78 }} />
+                  <col style={{ width: 82 }} />
+                  <col style={{ width: 72 }} />
+                  <col style={{ width: 72 }} />
+                  <col style={{ width: 72 }} />
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th style={SHEET_HEADER_CELL_STYLE}>Type</th>
+                    <th style={SHEET_HEADER_CELL_STYLE}>Status</th>
+                    <th style={SHEET_HEADER_CELL_STYLE}>Time</th>
+                    <th style={SHEET_HEADER_CELL_STYLE}>Range</th>
+                    <th style={SHEET_HEADER_CELL_STYLE}>Change</th>
+                    <th style={{ ...SHEET_HEADER_CELL_STYLE, textAlign: 'center' }}>H/L Rel</th>
+                    <th style={SHEET_HEADER_CELL_STYLE}>T %ile</th>
+                    <th style={SHEET_HEADER_CELL_STYLE}>R %ile</th>
+                    <th style={SHEET_HEADER_CELL_STYLE}>C %ile</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(['Breakout', 'Breakdown', 'UpRot', 'DownRot'] as const).map(type => {
+                    const ctx = cc.rotations[type]
+                    const pattern = getRotationPatternDisplay(ctx, '0_1')
+                    const patternFilterValue = ctx.patterns?.['0_1'] ?? null
+                    return (
+                      <tr key={`summary-${type}`} style={{ background: ctx.active ? 'rgba(50, 50, 255, 0.04)' : 'transparent' }}>
+                        <td style={SHEET_ROW_LABEL_STYLE}>{ROT_TYPE_LABELS[type]}</td>
+                        <td style={SHEET_CELL_STYLE}>
+                          {renderSheetValue({
+                            main: ctx.active ? 'ACTIVE' : 'INACTIVE',
+                            color: ctx.active ? BLUE : SOLAR_MUTED,
+                            align: 'center',
+                          })}
+                        </td>
+                        <td style={SHEET_CELL_STYLE}>
+                          {renderSheetValue({
+                            main: ctx.Time_0 == null ? '--' : ctx.Time_0.toFixed(0),
+                            active: rotFilters[type].threshold[0].Time.active,
+                            onClick: () => toggleRotMetricSelection(type, 0, 'Time', 'value', ctx.Time_0),
+                            align: 'center',
+                          })}
+                        </td>
+                        <td style={SHEET_CELL_STYLE}>
+                          {renderSheetValue({
+                            main: pctD(ctx.Range_0),
+                            active: rotFilters[type].threshold[0].Range.active,
+                            onClick: () => toggleRotMetricSelection(type, 0, 'Range', 'value', ctx.Range_0),
+                            align: 'center',
+                          })}
+                        </td>
+                        <td style={SHEET_CELL_STYLE}>
+                          {renderSheetValue({
+                            main: pctD(ctx.Change_0),
+                            active: rotFilters[type].threshold[0].Change.active,
+                            onClick: () => toggleRotMetricSelection(type, 0, 'Change', 'value', ctx.Change_0),
+                            align: 'center',
+                          })}
+                        </td>
+                        <td style={SHEET_CELL_STYLE}>
+                          {renderSheetValue({
+                            main: pattern ?? '--',
+                            active: rotFilters[type].pattern['0_1'] !== 'any',
+                            onClick: () => toggleRotPatternSelection(type, '0_1', patternFilterValue),
+                            color: patternColor(patternFilterValue),
+                            align: 'center',
+                          })}
+                        </td>
+                        <td style={SHEET_CELL_STYLE}>
+                          {renderSheetValue({
+                            main: pctD(ctx.Time_0_Pct),
+                            active: rotFilters[type].percentile[0].Time.active,
+                            onClick: () => toggleRotMetricSelection(type, 0, 'Time', 'percentile', ctx.Time_0_Pct),
+                            align: 'center',
+                          })}
+                        </td>
+                        <td style={SHEET_CELL_STYLE}>
+                          {renderSheetValue({
+                            main: pctD(ctx.Range_0_Pct),
+                            active: rotFilters[type].percentile[0].Range.active,
+                            onClick: () => toggleRotMetricSelection(type, 0, 'Range', 'percentile', ctx.Range_0_Pct),
+                            align: 'center',
+                          })}
+                        </td>
+                        <td style={SHEET_CELL_STYLE}>
+                          {renderSheetValue({
+                            main: pctD(ctx.Change_0_Pct),
+                            active: rotFilters[type].percentile[0].Change.active,
+                            onClick: () => toggleRotMetricSelection(type, 0, 'Change', 'percentile', ctx.Change_0_Pct),
+                            align: 'center',
+                          })}
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <div style={{ overflowX: 'auto', borderTop: `1px solid ${SHEET_GRID_BORDER}` }}>
+              <div style={{ padding: '3px 5px', color: SOLAR_MUTED, fontSize: 7, letterSpacing: 0.25 }}>CURRENT SNAPSHOT</div>
+              <table style={SHEET_TABLE_STYLE}>
+                <colgroup>
+                  <col style={{ width: 132 }} />
+                  <col style={{ width: 112 }} />
+                  <col style={{ width: 112 }} />
+                  <col style={{ width: 176 }} />
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th style={SHEET_HEADER_CELL_STYLE}>Metric</th>
+                    <th style={SHEET_HEADER_CELL_STYLE}>Current</th>
+                    <th style={SHEET_HEADER_CELL_STYLE}>{`Rel ${lookback}`}</th>
+                    <th style={SHEET_HEADER_CELL_STYLE}>Selection</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {renderOverviewRow({
+                    label: 'Upper Target',
+                    value: num(cc.upper_target),
+                    delta: '--',
+                    context: formatSourceSnapshot('loc_upper').value,
+                    contextActive: selectedSourceIds.includes('loc_upper') && (selectedSourceModes.loc_upper ?? sourceConfigMap.loc_upper.modeOrder[0]) === 'state',
+                    onContextClick: () => toggleSourceModeSelection('loc_upper', 'state'),
+                    contextColor: BLUE,
+                    contextAlign: 'center',
+                  })}
+                  {renderOverviewRow({
+                    label: 'Lower Target',
+                    value: num(cc.lower_target),
+                    delta: '--',
+                    context: formatSourceSnapshot('loc_lower').value,
+                    contextActive: selectedSourceIds.includes('loc_lower') && (selectedSourceModes.loc_lower ?? sourceConfigMap.loc_lower.modeOrder[0]) === 'state',
+                    onContextClick: () => toggleSourceModeSelection('loc_lower', 'state'),
+                    contextColor: BLUE,
+                    contextAlign: 'center',
+                  })}
+                  {renderOverviewRow({
+                    label: 'RV (ann)',
+                    value: `${num(ind.rv_ann, 1)}%`,
+                    valueActive: selectedSourceIds.includes('rv') && (selectedSourceModes.rv ?? sourceConfigMap.rv.modeOrder[0]) === 'value',
+                    onValueClick: () => toggleSourceModeSelection('rv', 'value'),
+                    delta: signed(ind.rv_delta, 1, 'pp'),
+                    deltaActive: selectedSourceIds.includes('rv') && (selectedSourceModes.rv ?? sourceConfigMap.rv.modeOrder[0]) === 'trend',
+                    onDeltaClick: () => toggleSourceModeSelection('rv', 'trend'),
+                    context: `%ile ${pctD(ind.rv_pct)}`,
+                    contextActive: selectedSourceIds.includes('rv') && (selectedSourceModes.rv ?? sourceConfigMap.rv.modeOrder[0]) === 'percentile',
+                    onContextClick: () => toggleSourceModeSelection('rv', 'percentile'),
+                  })}
+                  {renderOverviewRow({
+                    label: 'H React',
+                    value: num(ind.h_react, 2),
+                    valueActive: selectedSourceIds.includes('h') && (selectedSourceModes.h ?? sourceConfigMap.h.modeOrder[0]) === 'value',
+                    onValueClick: () => toggleSourceModeSelection('h', 'value'),
+                    delta: signed(ind.h_delta, 2),
+                    deltaActive: selectedSourceIds.includes('h') && (selectedSourceModes.h ?? sourceConfigMap.h.modeOrder[0]) === 'trend',
+                    onDeltaClick: () => toggleSourceModeSelection('h', 'trend'),
+                    context: `%ile ${pctD(ind.h_pct)}`,
+                    contextActive: selectedSourceIds.includes('h') && (selectedSourceModes.h ?? sourceConfigMap.h.modeOrder[0]) === 'percentile',
+                    onContextClick: () => toggleSourceModeSelection('h', 'percentile'),
+                  })}
+                  {renderOverviewRow({
+                    label: 'Price Change',
+                    value: num(ind.p_react, 2),
+                    valueActive: selectedSourceIds.includes('p') && (selectedSourceModes.p ?? sourceConfigMap.p.modeOrder[0]) === 'value',
+                    onValueClick: () => toggleSourceModeSelection('p', 'value'),
+                    delta: signed(ind.p_delta, 2),
+                    deltaActive: selectedSourceIds.includes('p') && (selectedSourceModes.p ?? sourceConfigMap.p.modeOrder[0]) === 'trend',
+                    onDeltaClick: () => toggleSourceModeSelection('p', 'trend'),
+                    context: `%ile ${pctD(ind.p_pct)}`,
+                    contextActive: selectedSourceIds.includes('p') && (selectedSourceModes.p ?? sourceConfigMap.p.modeOrder[0]) === 'percentile',
+                    onContextClick: () => toggleSourceModeSelection('p', 'percentile'),
+                  })}
+                  {renderOverviewRow({
+                    label: 'L React',
+                    value: num(ind.l_react, 2),
+                    valueActive: selectedSourceIds.includes('l') && (selectedSourceModes.l ?? sourceConfigMap.l.modeOrder[0]) === 'value',
+                    onValueClick: () => toggleSourceModeSelection('l', 'value'),
+                    delta: signed(ind.l_delta, 2),
+                    deltaActive: selectedSourceIds.includes('l') && (selectedSourceModes.l ?? sourceConfigMap.l.modeOrder[0]) === 'trend',
+                    onDeltaClick: () => toggleSourceModeSelection('l', 'trend'),
+                    context: `%ile ${pctD(ind.l_pct)}`,
+                    contextActive: selectedSourceIds.includes('l') && (selectedSourceModes.l ?? sourceConfigMap.l.modeOrder[0]) === 'percentile',
+                    onContextClick: () => toggleSourceModeSelection('l', 'percentile'),
+                  })}
+                  {isBasket && renderOverviewRow({
+                    label: 'Breadth',
+                    value: `${num(ind.breadth, 1)}%`,
+                    valueActive: selectedSourceIds.includes('breadth') && (selectedSourceModes.breadth ?? sourceConfigMap.breadth.modeOrder[0]) === 'value',
+                    onValueClick: () => toggleSourceModeSelection('breadth', 'value'),
+                    delta: signed(ind.breadth_delta, 1),
+                    deltaActive: selectedSourceIds.includes('breadth') && (selectedSourceModes.breadth ?? sourceConfigMap.breadth.modeOrder[0]) === 'trend',
+                    onDeltaClick: () => toggleSourceModeSelection('breadth', 'trend'),
+                    context: '--',
+                  })}
+                  {isBasket && renderOverviewRow({
+                    label: 'Breakout %',
+                    value: `${num(ind.breakout_pct, 1)}%`,
+                    valueActive: selectedSourceIds.includes('breakout_pct') && (selectedSourceModes.breakout_pct ?? sourceConfigMap.breakout_pct.modeOrder[0]) === 'value',
+                    onValueClick: () => toggleSourceModeSelection('breakout_pct', 'value'),
+                    delta: signed(ind.breakout_delta, 1),
+                    deltaActive: selectedSourceIds.includes('breakout_pct') && (selectedSourceModes.breakout_pct ?? sourceConfigMap.breakout_pct.modeOrder[0]) === 'trend',
+                    onDeltaClick: () => toggleSourceModeSelection('breakout_pct', 'trend'),
+                    context: '--',
+                  })}
+                  {isBasket && renderOverviewRow({
+                    label: 'Corr %',
+                    value: `${num(ind.corr_pct, 1)}%`,
+                    valueActive: selectedSourceIds.includes('corr') && (selectedSourceModes.corr ?? sourceConfigMap.corr.modeOrder[0]) === 'value',
+                    onValueClick: () => toggleSourceModeSelection('corr', 'value'),
+                    delta: signed(ind.corr_delta, 1),
+                    deltaActive: selectedSourceIds.includes('corr') && (selectedSourceModes.corr ?? sourceConfigMap.corr.modeOrder[0]) === 'trend',
+                    onDeltaClick: () => toggleSourceModeSelection('corr', 'trend'),
+                    context: '--',
+                  })}
+                </tbody>
+              </table>
+            </div>
+            {renderRotationHistory('UP ROTATION', 'UpRot')}
+            {renderRotationHistory('DOWN ROTATION', 'DownRot')}
+          </SectionCard>
+        )
+      })()}
+      <div style={{ display: 'none' }}>
       {/* CURRENT CONTEXT card (Phase 5) */}
       {data?.current_context && (() => {
         const cc = data.current_context!
@@ -1087,7 +2458,11 @@ export const DistributionsPanel: React.FC<DistributionsPanelProps> = ({
         const pctD = (v: number | null | undefined) => v == null ? '--' : (v * 100).toFixed(1) + '%'
         const types: Array<keyof typeof cc.rotations> = ['UpRot', 'DownRot', 'Breakout', 'Breakdown']
         const patternColor = (p: string | null) =>
-          p === 'HH' || p === 'HL' ? GREEN : p === 'LH' || p === 'LL' ? RED : SOLAR_MUTED
+          p === 'HH' || p === 'HL' || p === 'HH/HL'
+            ? GREEN
+            : p === 'LH' || p === 'LL' || p === 'LH/LL'
+              ? RED
+              : SOLAR_MUTED
         const positionLabel = cc.position === 'above_upper' ? 'ABOVE UPPER TARGET'
           : cc.position === 'below_lower' ? 'BELOW LOWER TARGET'
           : cc.position === 'between' ? 'BETWEEN TARGETS' : '--'
@@ -1103,47 +2478,49 @@ export const DistributionsPanel: React.FC<DistributionsPanelProps> = ({
         const isBasket = mode === 'basket'
         const ind = cc.indicators
 
-        const KV: React.FC<{ label: string; value: string; sub?: string; color?: string }> = ({ label, value, sub, color }) => (
-          <div style={{ padding: '4px 10px', borderRight: `1px solid ${SOLAR_BORDER}`, minWidth: 0 }}>
-            <div style={{ fontSize: 9, color: SOLAR_MUTED }}>{label}</div>
-            <div style={{ fontSize: 12, fontFamily: 'monospace', fontWeight: 700, color: color ?? SOLAR_TEXT, whiteSpace: 'nowrap' }}>{value}</div>
-            {sub != null && <div style={{ fontSize: 9, color: SOLAR_MUTED, fontFamily: 'monospace' }}>{sub}</div>}
-          </div>
-        )
-
         return (
-          <div style={{ border: `1px solid ${SOLAR_BORDER}`, background: SOLAR_BG }}>
+          <div style={CARD_STYLE}>
             {/* Header */}
-            <div style={{ padding: '6px 10px', borderBottom: `1px solid ${SOLAR_BORDER}`, display: 'flex', alignItems: 'baseline', gap: 12, fontSize: 11, fontFamily: 'monospace' }}>
-              <span style={{ color: SOLAR_MUTED, fontSize: 10 }}>CURRENT CONTEXT</span>
+            <div style={{ padding: '5px 8px', borderBottom: `1px solid ${SOLAR_BORDER}`, display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', gap: '4px 10px', fontSize: 10, fontFamily: 'monospace' }}>
+              <span style={{ color: SOLAR_MUTED, fontSize: 9 }}>CURRENT CONTEXT</span>
               <span style={{ color: SOLAR_TEXT, fontWeight: 700 }}>{data.ticker}</span>
               <span style={{ color: SOLAR_MUTED }}>{cc.date ?? '--'}</span>
               <span style={{ color: SOLAR_TEXT }}>Close {num(cc.close)}</span>
-              <span style={{ marginLeft: 'auto', color: SOLAR_MUTED, fontSize: 10 }}>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 8px', color: SOLAR_MUTED, fontSize: 9 }}>
                 <span style={{ color: BLUE, fontWeight: 700 }}>{rotLabel}</span>
                 {activeBar != null && <span style={{ color: SOLAR_TEXT }}> · bar {activeBar}</span>}
                 {' · '}
                 <span style={{ color: BLUE, fontWeight: 700 }}>{regLabel}</span>
                 {' · '}
                 <span style={{ color: positionColor, fontWeight: 700 }}>{positionLabel}</span>
-              </span>
+              </div>
             </div>
 
             {/* Indicators strip */}
-            <div style={{ display: 'flex', flexWrap: 'wrap', borderBottom: `1px solid ${SOLAR_BORDER}` }}>
-              <KV label="RV (ANN)"    value={num(ind.rv_ann, 1) + '%'} sub={'%ile ' + pctD(ind.rv_pct)} />
-              <KV label="H REACT"     value={num(ind.h_react, 2)}      sub={'%ile ' + pctD(ind.h_pct)} />
-              <KV label="L REACT"     value={num(ind.l_react, 2)}      sub={'%ile ' + pctD(ind.l_pct)} />
-              <KV label="PRICE CHG"   value={num(ind.p_react, 2)}      sub={'%ile ' + pctD(ind.p_pct)} />
-              <KV label="UPPER TGT"   value={num(cc.upper_target)} />
-              <KV label="LOWER TGT"   value={num(cc.lower_target)} />
-              {isBasket && ind.breadth      != null && <KV label="BREADTH"     value={num(ind.breadth, 1) + '%'} />}
-              {isBasket && ind.breakout_pct != null && <KV label="BREAKOUT %"  value={num(ind.breakout_pct, 1) + '%'} />}
-              {isBasket && ind.corr_pct     != null && <KV label="CORR %"      value={num(ind.corr_pct, 1) + '%'} />}
+            <div style={{ borderBottom: `1px solid ${SOLAR_BORDER}` }}>
+              <div style={{ padding: '4px 6px', color: SOLAR_MUTED, fontSize: 8, borderBottom: `1px solid ${SOLAR_BORDER}`, letterSpacing: 0.3 }}>
+                CLICK A CELL TO ADD OR REMOVE A FILTER BASED ON THE CURRENT SETUP
+              </div>
+              <div style={CONTEXT_GRID_STYLE}>
+                <ContextMetricCell label="LT REGIME" value={formatSourceSnapshot('regime').value} active={selectedSourceIds.includes('regime')} onClick={() => toggleSourceSelection('regime')} />
+                <ContextMetricCell label="ROTATION" value={formatSourceSnapshot('rotation').value} active={selectedSourceIds.includes('rotation')} onClick={() => toggleSourceSelection('rotation')} />
+                <ContextMetricCell label="VS UPPER" value={formatSourceSnapshot('loc_upper').value} sub={formatSourceSnapshot('loc_upper').sub} active={selectedSourceIds.includes('loc_upper')} onClick={() => toggleSourceSelection('loc_upper')} />
+                <ContextMetricCell label="VS LOWER" value={formatSourceSnapshot('loc_lower').value} sub={formatSourceSnapshot('loc_lower').sub} active={selectedSourceIds.includes('loc_lower')} onClick={() => toggleSourceSelection('loc_lower')} />
+                <ContextMetricCell label="RV (ANN)" value={num(ind.rv_ann, 1) + '%'} sub={'%ile ' + pctD(ind.rv_pct)} active={selectedSourceIds.includes('rv')} onClick={() => toggleSourceSelection('rv')} />
+                <ContextMetricCell label="H REACT" value={num(ind.h_react, 2)} sub={'%ile ' + pctD(ind.h_pct)} active={selectedSourceIds.includes('h')} onClick={() => toggleSourceSelection('h')} />
+                <ContextMetricCell label="PRICE CHG" value={num(ind.p_react, 2)} sub={'%ile ' + pctD(ind.p_pct)} active={selectedSourceIds.includes('p')} onClick={() => toggleSourceSelection('p')} />
+                <ContextMetricCell label="L REACT" value={num(ind.l_react, 2)} sub={'%ile ' + pctD(ind.l_pct)} active={selectedSourceIds.includes('l')} onClick={() => toggleSourceSelection('l')} />
+                <ContextMetricCell label="UPPER TGT" value={num(cc.upper_target)} />
+                <ContextMetricCell label="LOWER TGT" value={num(cc.lower_target)} />
+                {isBasket && <ContextMetricCell label="BREADTH" value={num(ind.breadth, 1) + '%'} active={selectedSourceIds.includes('breadth')} onClick={() => toggleSourceSelection('breadth')} />}
+                {isBasket && <ContextMetricCell label="BREAKOUT %" value={num(ind.breakout_pct, 1) + '%'} active={selectedSourceIds.includes('breakout_pct')} onClick={() => toggleSourceSelection('breakout_pct')} />}
+                {isBasket && <ContextMetricCell label="CORR %" value={num(ind.corr_pct, 1) + '%'} active={selectedSourceIds.includes('corr')} onClick={() => toggleSourceSelection('corr')} />}
+              </div>
             </div>
 
             {/* Rotation context table */}
-            <table style={{ width: '100%', borderCollapse: 'collapse', color: SOLAR_TEXT, fontSize: 11, fontFamily: 'monospace' }}>
+            <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', minWidth: 720, borderCollapse: 'collapse', color: SOLAR_TEXT, fontSize: 10, fontFamily: 'monospace' }}>
               <thead>
                 <tr style={{ color: SOLAR_MUTED }}>
                   <th rowSpan={2} style={{ textAlign: 'left', padding: '2px 6px', verticalAlign: 'bottom', borderRight: `1px solid ${SOLAR_BORDER}` }}>Type</th>
@@ -1182,7 +2559,7 @@ export const DistributionsPanel: React.FC<DistributionsPanelProps> = ({
                   return (
                     <tr key={t} style={{ borderTop: `1px solid ${SOLAR_BORDER}`, background: rowBg, fontWeight: weight }}>
                       <td style={{ padding: '2px 6px', borderRight: `1px solid ${SOLAR_BORDER}` }}>{t}</td>
-                      <td style={{ padding: '2px 6px', textAlign: 'center', borderRight: `1px solid ${SOLAR_BORDER}`, color: patternColor(c.pattern), fontWeight: 700 }}>{c.pattern ?? '—'}</td>
+                      <td style={{ padding: '2px 6px', textAlign: 'center', borderRight: `1px solid ${SOLAR_BORDER}`, color: patternColor(c.pattern_display ?? c.pattern), fontWeight: 700 }}>{c.pattern_display ?? c.pattern ?? '—'}</td>
                       {cell(num(c.Time_0, 0))}
                       {cell(pctD(c.Range_0))}
                       {cell(pctD(c.Change_0), true)}
@@ -1203,41 +2580,46 @@ export const DistributionsPanel: React.FC<DistributionsPanelProps> = ({
                 })}
               </tbody>
             </table>
+            </div>
           </div>
         )
       })()}
+      </div>
 
       {/* Chart */}
-      <div ref={wrapRef} style={{ width: '100%', border: `1px solid ${SOLAR_BORDER}`, background: SOLAR_BG }}>
-        <canvas ref={canvasRef} style={{ width: dims.w, height: dims.h, display: 'block' }} />
-      </div>
+      <SectionCard title="RETURN DISTRIBUTION" bodyStyle={{ padding: 0 }}>
+        <div ref={wrapRef} style={{ width: '100%' }}>
+          <canvas ref={canvasRef} style={{ width: dims.w, height: dims.h, display: 'block' }} />
+        </div>
+      </SectionCard>
 
       {/* Stats table */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(9, 1fr)', gap: 0, fontSize: 12, fontFamily: 'monospace',
-                    border: `1px solid ${SOLAR_BORDER}`, background: SOLAR_BG }}>
-        {['Sample','N','Mean','Median','Stddev','Win%','p5','p25 / p75','p95'].map(h =>
-          <div key={h} style={{ padding: '6px 8px', color: SOLAR_MUTED, borderBottom: `1px solid ${SOLAR_BORDER}` }}>{h}</div>
-        )}
-        <div style={{ padding: '6px 8px', color: PINK }}>Baseline</div>
-        <div style={{ padding: '6px 8px' }}>{baseSt?.n ?? '--'}</div>
-        <div style={{ padding: '6px 8px' }}>{pct(baseSt?.mean ?? null)}</div>
-        <div style={{ padding: '6px 8px' }}>{pct(baseSt?.median ?? null)}</div>
-        <div style={{ padding: '6px 8px' }}>{pct(baseSt?.stddev ?? null)}</div>
-        <div style={{ padding: '6px 8px' }}>{pct(baseSt?.win_rate ?? null, 1)}</div>
-        <div style={{ padding: '6px 8px' }}>{pct(baseSt?.p5 ?? null)}</div>
-        <div style={{ padding: '6px 8px' }}>{pct(baseSt?.p25 ?? null)} / {pct(baseSt?.p75 ?? null)}</div>
-        <div style={{ padding: '6px 8px' }}>{pct(baseSt?.p95 ?? null)}</div>
+      <SectionCard title="DISTRIBUTION STATS" bodyStyle={{ padding: 0 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(9, 1fr)', gap: 0, fontSize: 11, fontFamily: 'monospace' }}>
+          {['Sample','N','Mean','Median','Stddev','Win%','p5','p25 / p75','p95'].map(h =>
+            <div key={h} style={{ padding: '4px 6px', color: SOLAR_MUTED, borderBottom: `1px solid ${SOLAR_BORDER}` }}>{h}</div>
+          )}
+          <div style={{ padding: '4px 6px', color: PINK }}>Baseline</div>
+          <div style={{ padding: '4px 6px' }}>{baseSt?.n ?? '--'}</div>
+          <div style={{ padding: '4px 6px' }}>{pct(baseSt?.mean ?? null)}</div>
+          <div style={{ padding: '4px 6px' }}>{pct(baseSt?.median ?? null)}</div>
+          <div style={{ padding: '4px 6px' }}>{pct(baseSt?.stddev ?? null)}</div>
+          <div style={{ padding: '4px 6px' }}>{pct(baseSt?.win_rate ?? null, 1)}</div>
+          <div style={{ padding: '4px 6px' }}>{pct(baseSt?.p5 ?? null)}</div>
+          <div style={{ padding: '4px 6px' }}>{pct(baseSt?.p25 ?? null)} / {pct(baseSt?.p75 ?? null)}</div>
+          <div style={{ padding: '4px 6px' }}>{pct(baseSt?.p95 ?? null)}</div>
 
-        <div style={{ padding: '6px 8px', color: BLUE, borderTop: `1px solid ${SOLAR_BORDER}` }}>Filtered</div>
-        <div style={{ padding: '6px 8px', borderTop: `1px solid ${SOLAR_BORDER}`, fontWeight: stats && stats.n > 0 && stats.n < 30 ? 'bold' : 'normal', color: stats && stats.n > 0 && stats.n < 30 ? PINK : undefined }}>{stats?.n ?? '--'}</div>
-        <div style={{ padding: '6px 8px', borderTop: `1px solid ${SOLAR_BORDER}` }}>{pct(stats?.mean ?? null)}</div>
-        <div style={{ padding: '6px 8px', borderTop: `1px solid ${SOLAR_BORDER}` }}>{pct(stats?.median ?? null)}</div>
-        <div style={{ padding: '6px 8px', borderTop: `1px solid ${SOLAR_BORDER}` }}>{pct(stats?.stddev ?? null)}</div>
-        <div style={{ padding: '6px 8px', borderTop: `1px solid ${SOLAR_BORDER}` }}>{pct(stats?.win_rate ?? null, 1)}</div>
-        <div style={{ padding: '6px 8px', borderTop: `1px solid ${SOLAR_BORDER}` }}>{pct(stats?.p5 ?? null)}</div>
-        <div style={{ padding: '6px 8px', borderTop: `1px solid ${SOLAR_BORDER}` }}>{pct(stats?.p25 ?? null)} / {pct(stats?.p75 ?? null)}</div>
-        <div style={{ padding: '6px 8px', borderTop: `1px solid ${SOLAR_BORDER}` }}>{pct(stats?.p95 ?? null)}</div>
-      </div>
+          <div style={{ padding: '4px 6px', color: BLUE, borderTop: `1px solid ${SOLAR_BORDER}` }}>Filtered</div>
+          <div style={{ padding: '4px 6px', borderTop: `1px solid ${SOLAR_BORDER}`, fontWeight: stats && stats.n > 0 && stats.n < 30 ? 'bold' : 'normal', color: stats && stats.n > 0 && stats.n < 30 ? PINK : undefined }}>{stats?.n ?? '--'}</div>
+          <div style={{ padding: '4px 6px', borderTop: `1px solid ${SOLAR_BORDER}` }}>{pct(stats?.mean ?? null)}</div>
+          <div style={{ padding: '4px 6px', borderTop: `1px solid ${SOLAR_BORDER}` }}>{pct(stats?.median ?? null)}</div>
+          <div style={{ padding: '4px 6px', borderTop: `1px solid ${SOLAR_BORDER}` }}>{pct(stats?.stddev ?? null)}</div>
+          <div style={{ padding: '4px 6px', borderTop: `1px solid ${SOLAR_BORDER}` }}>{pct(stats?.win_rate ?? null, 1)}</div>
+          <div style={{ padding: '4px 6px', borderTop: `1px solid ${SOLAR_BORDER}` }}>{pct(stats?.p5 ?? null)}</div>
+          <div style={{ padding: '4px 6px', borderTop: `1px solid ${SOLAR_BORDER}` }}>{pct(stats?.p25 ?? null)} / {pct(stats?.p75 ?? null)}</div>
+          <div style={{ padding: '4px 6px', borderTop: `1px solid ${SOLAR_BORDER}` }}>{pct(stats?.p95 ?? null)}</div>
+        </div>
+      </SectionCard>
 
       {stats && stats.n > 0 && stats.n < 30 && (
         <div style={{ fontSize: 11, color: PINK }}>Small sample — filtered N &lt; 30. Treat with caution.</div>
@@ -1272,19 +2654,12 @@ export const DistributionsPanel: React.FC<DistributionsPanelProps> = ({
             </div>
             <div style={{ overflowY: 'auto', fontFamily: 'monospace', fontSize: 11 }}>
               {(() => {
-                if (!forwardTerciles || !data?.forward_paths) {
+                if (!forwardTerciles || sortedForwardEntries.length === 0) {
                   return <div style={{ padding: 8, color: SOLAR_MUTED, fontSize: 10 }}>No matches</div>
                 }
-                const entries = data.forward_paths.map((p, i) => ({ p, i }))
-                entries.sort((a, b) => {
-                  const dir = fwdSortDir === 'asc' ? 1 : -1
-                  if (fwdSortBy === 'return') return (a.p.final_return - b.p.final_return) * dir
-                  const ad = a.p.date ?? '', bd = b.p.date ?? ''
-                  return (ad < bd ? -1 : ad > bd ? 1 : 0) * dir
-                })
-                return entries.map(({ p, i }) => {
-                  const ter = forwardTerciles.tercileOfOriginal.get(i)
-                  const color = ter === 'top' ? GREEN : ter === 'bottom' ? RED : GRAY_T
+                return sortedForwardEntries.map(({ p, i }) => {
+                  const tercile = forwardTerciles.tercileOfOriginal.get(i)
+                  const color = tercile === 'top' ? GREEN : tercile === 'bottom' ? RED : GRAY_T
                   const isHover = hoveredMatchIdx === i
                   return (
                     <div key={i}

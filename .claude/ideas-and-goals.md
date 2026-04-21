@@ -105,10 +105,10 @@ Completed sub-goals:
 - Signals: CSV with full filter description (universe, period, signal types, status, count)
 - Remaining: Intrabasket tab exports (signals tables, correlation heatmap, returns chart, contribution chart) need implementation
 
-### 20. Sidebar universe filter parity (2026-04-08)
+### ~~20. Sidebar universe filter parity~~ — COMPLETED (2026-04-21)
 `list_baskets` (`/api/baskets`) always shows current-quarter industries via `_is_valid_basket()`. When the top-right universe filter is active, the sidebar should show industries that qualified in any quarter of the selected window — matching the behavior now implemented in `/api/baskets/returns` via `universe_start`/`universe_end` params. Add the same param pattern to `list_baskets` and thread `universeQuarters` into the sidebar fetch.
 
-### 21. `_valid_industries_cache` invalidation (2026-04-08)
+### ~~21. `_valid_industries_cache` invalidation~~ — COMPLETED (2026-04-21)
 `main.py:_get_valid_industry_slugs` caches the current-quarter set to a process-lifetime global. This won't auto-refresh across quarter boundaries without a backend restart. Add mtime-based invalidation keyed to `gics_mappings_500.json` so the cache rebuilds when `build_universes.py` writes a new file.
 
 ### 22. Biotechnology Q3 2026 anomaly in industry_u (2026-04-08)

@@ -90,34 +90,74 @@ THEMATIC_CONFIG = {
     "Volume_Losers": ("volume_universes_500.json", "losers"),
 }
 
-_valid_industries_cache = None
+THEMATIC_NAMES = set(THEMATIC_CONFIG.keys())
+SECTOR_NAMES = {
+    "Communication_Services",
+    "Consumer_Discretionary",
+    "Consumer_Staples",
+    "Energy",
+    "Financials",
+    "Health_Care",
+    "Industrials",
+    "Information_Technology",
+    "Materials",
+    "Real_Estate",
+    "Utilities",
+}
+MARKET_TZ = ZoneInfo("America/New_York")
+_valid_industries_cache = {"quarter_key": None, "gics_mtime_ns": None, "slugs": set()}
+
+
+def _current_quarter_key(now=None):
+    current = now.astimezone(MARKET_TZ) if now is not None else datetime.now(MARKET_TZ)
+    return f"{current.year} Q{(current.month - 1) // 3 + 1}"
+
+
+def _load_gics_mappings():
+    if not GICS_MAPPINGS_FILE.exists():
+        return None
+    try:
+        with open(GICS_MAPPINGS_FILE, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _industry_name_to_slug(name):
+    return name.replace(" ", "_").replace("&", "and")
 
 def _get_valid_industry_slugs():
     """Return set of industry slugs in the GICS file for the current quarter.
     Industries are pre-filtered by dollar volume (top 25%) during universe build."""
     global _valid_industries_cache
-    if _valid_industries_cache is not None:
-        return _valid_industries_cache
-    result = set()
-    if GICS_MAPPINGS_FILE.exists():
-        from datetime import datetime
-        now = datetime.today()
-        current_key = f"{now.year} Q{(now.month - 1) // 3 + 1}"
-        with open(GICS_MAPPINGS_FILE, 'r') as f:
-            gics = json.load(f)
-        for name, qmap in gics.get('industry_u', {}).items():
-            if current_key in qmap and len(qmap[current_key]) > 0:
-                result.add(name.replace(" ", "_").replace("&", "and"))
-    _valid_industries_cache = result
+    if not GICS_MAPPINGS_FILE.exists():
+        _valid_industries_cache = {"quarter_key": None, "gics_mtime_ns": None, "slugs": set()}
+        return set()
+    current_key = _current_quarter_key()
+    gics_mtime_ns = GICS_MAPPINGS_FILE.stat().st_mtime_ns
+    if (
+        _valid_industries_cache["quarter_key"] == current_key
+        and _valid_industries_cache["gics_mtime_ns"] == gics_mtime_ns
+    ):
+        return _valid_industries_cache["slugs"]
+    gics = _load_gics_mappings()
+    if not gics:
+        return set()
+    result = {
+        _industry_name_to_slug(name)
+        for name, qmap in gics.get('industry_u', {}).items()
+        if current_key in qmap and len(qmap[current_key]) > 0
+    }
+    _valid_industries_cache = {
+        "quarter_key": current_key,
+        "gics_mtime_ns": gics_mtime_ns,
+        "slugs": result,
+    }
     return result
 
 def _is_valid_basket(slug):
     """Return False for industry baskets not in the current quarter's dollar-volume universe."""
-    t_names = set(THEMATIC_CONFIG.keys())
-    s_names = {"Communication_Services", "Consumer_Discretionary", "Consumer_Staples", "Energy",
-               "Financials", "Health_Care", "Industrials", "Information_Technology",
-               "Materials", "Real_Estate", "Utilities"}
-    if slug in t_names or slug in s_names:
+    if slug in THEMATIC_NAMES or slug in SECTOR_NAMES:
         return True
     return slug in _get_valid_industry_slugs()
 
@@ -132,16 +172,12 @@ def _industries_for_quarter_range(start_qkey=None, end_qkey=None):
     """
     if not start_qkey and not end_qkey:
         return _get_valid_industry_slugs()
-    if not GICS_MAPPINGS_FILE.exists():
-        return set()
-    try:
-        with open(GICS_MAPPINGS_FILE, 'r') as f:
-            gics = json.load(f)
-    except Exception:
+    gics = _load_gics_mappings()
+    if not gics:
         return set()
     result = set()
     for name, qmap in gics.get('industry_u', {}).items():
-        slug = name.replace(" ", "_").replace("&", "and")
+        slug = _industry_name_to_slug(name)
         for q, tickers in qmap.items():
             if not tickers:
                 continue
@@ -256,10 +292,22 @@ def _read_ticker_parquet(ticker, columns=None, filters=None):
 def clean_data_for_json(df):
     return json.loads(df.to_json(orient="records", date_format="iso"))
 
-def _current_quarter_key():
-    from datetime import datetime
-    now = datetime.today()
-    return f"{now.year} Q{(now.month - 1) // 3 + 1}"
+def _dedupe_chart_dates(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize chart rows to one record per trading day.
+
+    Live merges can introduce an intraday timestamp for the same calendar day as
+    the cached daily bar. Keep the latest row for each normalized date so the
+    frontend chart always receives strictly ascending, unique times.
+    """
+    if df.empty or 'Date' not in df.columns:
+        return df
+    out = df.copy()
+    out['Date'] = pd.to_datetime(out['Date'])
+    out = out.sort_values('Date').reset_index(drop=True)
+    out['_ChartDate'] = out['Date'].dt.normalize()
+    out = out.drop_duplicates(subset=['_ChartDate'], keep='last').copy()
+    out['Date'] = out['_ChartDate']
+    return out.drop(columns=['_ChartDate']).sort_values('Date').reset_index(drop=True)
 
 def _pick_quarter(quarter_dict):
     """Return tickers for the current quarter, falling back to the most recent available."""
@@ -602,20 +650,22 @@ def _compute_live_breadth(basket_name):
 def read_root(): return {"status": "ok", "data_path": str(BASE_DIR)}
 
 @app.get("/api/baskets")
-def list_baskets():
+def list_baskets(universe_start: str = None, universe_end: str = None):
     if not DATA_STORAGE.exists(): return {"Themes": [], "Sectors": [], "Industries": []}
-    t_names = list(THEMATIC_CONFIG.keys())
-    s_names = ["Communication_Services", "Consumer_Discretionary", "Consumer_Staples", "Energy", "Financials", "Health_Care", "Industrials", "Information_Technology", "Materials", "Real_Estate", "Utilities"]
     cats = {"Themes": [], "Sectors": [], "Industries": []}
+    valid_industry_slugs = _industries_for_quarter_range(universe_start, universe_end)
     for folder in BASKET_CACHE_FOLDERS:
         if not folder.exists():
             continue
         for f in folder.glob("*_of_*_signals.parquet"):
             name = f.stem.rsplit("_signals", 1)[0]
             slug = re.sub(r'(_\d+)?_of_\d+$', '', name)
-            if slug in t_names: cats["Themes"].append(slug)
-            elif slug in s_names: cats["Sectors"].append(slug)
-            elif _is_valid_basket(slug): cats["Industries"].append(slug)
+            if slug in THEMATIC_NAMES:
+                cats["Themes"].append(slug)
+            elif slug in SECTOR_NAMES:
+                cats["Sectors"].append(slug)
+            elif slug in valid_industry_slugs:
+                cats["Industries"].append(slug)
     for k in cats: cats[k] = sorted(set(cats[k]))
     return cats
 
@@ -801,9 +851,6 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
     ``'2026 Q1'``) to include industries that were active in any quarter
     within that range — used when the frontend's universe filter is active.
     """
-    t_names = list(THEMATIC_CONFIG.keys())
-    s_names = ["Communication_Services", "Consumer_Discretionary", "Consumer_Staples", "Energy", "Financials", "Health_Care", "Industrials", "Information_Technology", "Materials", "Real_Estate", "Utilities"]
-
     # Resolve the valid industry set for the requested universe window. Themes
     # and sectors are always included (not filtered by dollar volume).
     _valid_industry_slugs = _industries_for_quarter_range(universe_start, universe_end)
@@ -813,13 +860,13 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
             continue
         for f in folder.glob("*_of_*_signals.parquet"):
             slug = re.sub(r'(_\d+)?_of_\d+_signals$', '', f.stem)
-            if slug in t_names or slug in s_names or slug in _valid_industry_slugs:
+            if slug in THEMATIC_NAMES or slug in SECTOR_NAMES or slug in _valid_industry_slugs:
                 all_slugs.add(slug)
 
     def _categorize(slug):
-        if slug in t_names:
+        if slug in THEMATIC_NAMES:
             return "theme"
-        elif slug in s_names:
+        elif slug in SECTOR_NAMES:
             return "sector"
         else:
             return "industry"
@@ -882,6 +929,28 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
         "max": global_max.strftime('%Y-%m-%d') if global_max else None,
     }
 
+    def _slice_with_anchor(df: pd.DataFrame, start_ts: Optional[pd.Timestamp], end_ts: Optional[pd.Timestamp]) -> pd.DataFrame:
+        """Keep one anchor row before the requested window.
+
+        For single-day windows (`start_ts == end_ts`), use the latest available
+        row on or before `end_ts` plus its prior row. This keeps the 1D basket
+        returns view populated even when a basket has not yet received a live
+        row for the selected max date.
+        """
+        if end_ts is not None:
+            df = df[df['Date'] <= end_ts]
+        if start_ts is None:
+            return df
+        if end_ts is not None and start_ts == end_ts:
+            if len(df) >= 2:
+                return df.iloc[-2:]
+            return df.iloc[0:0]
+        before_start = df[df['Date'] < start_ts]
+        in_range = df[df['Date'] >= start_ts]
+        if not before_start.empty:
+            return pd.concat([before_start.iloc[[-1]], in_range])
+        return in_range
+
     if mode == "daily":
         # Single basket returns (daily or aggregated by bar_period)
         if not basket:
@@ -900,18 +969,9 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
             if live_date not in df['Date'].values:
                 live_row = pd.DataFrame({'Date': [live_date], 'Close': [live_close]})
                 df = pd.concat([df, live_row], ignore_index=True).sort_values('Date')
-        # Filter end date first
-        if end:
-            df = df[df['Date'] <= pd.Timestamp(end)]
-        # For start: keep one anchor row before start for pct_change, then filter output
         start_ts = pd.Timestamp(start) if start else None
-        if start_ts is not None:
-            before_start = df[df['Date'] < start_ts]
-            in_range = df[df['Date'] >= start_ts]
-            if not before_start.empty:
-                df = pd.concat([before_start.iloc[[-1]], in_range])
-            else:
-                df = in_range
+        end_ts = pd.Timestamp(end) if end else None
+        df = _slice_with_anchor(df, start_ts, end_ts)
 
         if bar_period == "1D":
             df['return'] = df['Close'].pct_change()
@@ -1885,17 +1945,9 @@ def get_basket_returns(start: str = None, end: str = None, mode: str = "period",
                         if live_corr is not None:
                             live_row = pd.DataFrame({'Date': [live_date], 'Correlation_Pct': [live_corr]})
                             df = pd.concat([df, live_row], ignore_index=True).sort_values('Date')
-            if end:
-                df = df[df['Date'] <= pd.Timestamp(end)]
-            # Grab anchor row before start for % change calculation
-            if start:
-                start_ts = pd.Timestamp(start)
-                before = df[df['Date'] < start_ts]
-                in_range = df[df['Date'] >= start_ts]
-                if not before.empty:
-                    df = pd.concat([before.iloc[[-1]], in_range])
-                else:
-                    df = in_range
+            start_ts = pd.Timestamp(start) if start else None
+            end_ts = pd.Timestamp(end) if end else None
+            df = _slice_with_anchor(df, start_ts, end_ts)
             if len(df) < 2:
                 continue
             first_val = float(df.iloc[0][data_col_p])
@@ -2002,6 +2054,7 @@ def get_basket_data(basket_name: str):
             df = df.sort_values('Date').reset_index(drop=True)
             df = signals_engine.add_hl_reaction_norm(df)
 
+        df = _dedupe_chart_dates(df)
         return {"chart_data": clean_data_for_json(df), "tickers": tickers}
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
@@ -2475,6 +2528,7 @@ def get_ticker_data(ticker: str):
             df = df.sort_values('Date').reset_index(drop=True)
             df = signals_engine.add_hl_reaction_norm(df)
 
+        df = _dedupe_chart_dates(df)
         df['Date'] = df['Date'].dt.strftime('%Y-%m-%d')
         return {"chart_data": clean_data_for_json(df.sort_values('Date')), "tickers": []}
     except Exception: raise HTTPException(status_code=500)
@@ -2607,27 +2661,37 @@ def _label_rotation_context(df: pd.DataFrame) -> pd.DataFrame:
         # completed run is _0. Either way, _1/_2/_3 walk back from that run id.
         run_id_for_zero = np.where(in_state, run_id_active, last_completed_prior).astype(int)
 
+        # Per-rotation absolute highs/lows.
+        # These feed the display-side high/low relationship labels, while the
+        # single "Extreme" track below preserves the existing binary filter
+        # semantics (HH/HL for bullish types, HL/LL for bearish types).
+        high_0 = np.full(n, np.nan)
+        low_0 = np.full(n, np.nan)
+        high_0[in_idx] = max_high_so_far
+        low_0[in_idx] = min_low_so_far
+        if oos_mask.any():
+            runs_oos = last_completed_prior[oos_mask]
+            high_0[oos_mask] = run_finals['max_high'].reindex(runs_oos).to_numpy()
+            low_0[oos_mask] = run_finals['min_low'].reindex(runs_oos).to_numpy()
+        df[f'{prefix}_High_0'] = high_0
+        df[f'{prefix}_Low_0'] = low_0
+
         # Absolute extreme (peak high for bullish types, trough low for bearish).
         # Compared bar-by-bar against the prior completed rotation's extreme to
         # power HH / LH / HL / LL filters.
-        extreme_0 = np.full(n, np.nan)
-        extreme_1 = np.full(n, np.nan)
         extreme_src_col = 'max_high' if is_bullish else 'min_low'
-        if is_bullish:
-            extreme_0[in_idx] = max_high_so_far
-        else:
-            extreme_0[in_idx] = min_low_so_far
-        if oos_mask.any():
-            runs_oos = last_completed_prior[oos_mask]
-            extreme_0[oos_mask] = run_finals[extreme_src_col].reindex(runs_oos).to_numpy()
-        df[f'{prefix}_Extreme_0'] = extreme_0
+        df[f'{prefix}_Extreme_0'] = high_0 if is_bullish else low_0
         for back_n in (1, 2, 3):
             tgt = run_id_for_zero - back_n
             v = tgt > 0
-            arr = np.full(n, np.nan)
+            high_arr = np.full(n, np.nan)
+            low_arr = np.full(n, np.nan)
             if v.any():
-                arr[v] = run_finals[extreme_src_col].reindex(tgt[v]).to_numpy()
-            df[f'{prefix}_Extreme_{back_n}'] = arr
+                high_arr[v] = run_finals['max_high'].reindex(tgt[v]).to_numpy()
+                low_arr[v] = run_finals['min_low'].reindex(tgt[v]).to_numpy()
+            df[f'{prefix}_High_{back_n}'] = high_arr
+            df[f'{prefix}_Low_{back_n}'] = low_arr
+            df[f'{prefix}_Extreme_{back_n}'] = high_arr if is_bullish else low_arr
 
         for back_n in (1, 2, 3):
             target_runs = run_id_for_zero - back_n
@@ -2784,19 +2848,23 @@ def get_next_bar_distribution(
     if 'EMA_High' in df.columns:
         df['EMA_High_Norm'] = signals_engine.hl_normalize(df['EMA_High'], signals_engine.HL_NORM_LEN)
         df['EMA_High_Prev'] = df['EMA_High'].shift(lookback)
+        df['EMA_High_Norm_Prev'] = df['EMA_High_Norm'].shift(lookback)
         df['EMA_High_Pct']  = _expanding_pct_rank(df['EMA_High'].to_numpy(dtype=float))
     if 'EMA_Low' in df.columns:
         df['EMA_Low_Norm'] = signals_engine.hl_normalize(df['EMA_Low'], signals_engine.HL_NORM_LEN)
         df['EMA_Low_Prev'] = df['EMA_Low'].shift(lookback)
+        df['EMA_Low_Norm_Prev'] = df['EMA_Low_Norm'].shift(lookback)
         df['EMA_Low_Pct']  = _expanding_pct_rank(df['EMA_Low'].to_numpy(dtype=float))
     if 'EMA_PriceChg' in df.columns:
         df['EMA_PriceChg_Norm'] = signals_engine.hl_normalize(df['EMA_PriceChg'], signals_engine.HL_NORM_LEN)
         df['EMA_PriceChg_Prev'] = df['EMA_PriceChg'].shift(lookback)
+        df['EMA_PriceChg_Norm_Prev'] = df['EMA_PriceChg_Norm'].shift(lookback)
         df['EMA_PriceChg_Pct']  = _expanding_pct_rank(df['EMA_PriceChg'].to_numpy(dtype=float))
     if 'RV_EMA' in df.columns:
         df['RV_EMA_Prev'] = df['RV_EMA'].shift(lookback)
         # Annualized RV (% per year), matches the TVChart pane display
         df['RV_Annualized'] = df['RV_EMA'] * np.sqrt(252) * 100
+        df['RV_Annualized_Prev'] = df['RV_EMA_Prev'] * np.sqrt(252) * 100
         df['RV_EMA_Pct']    = _expanding_pct_rank(df['RV_EMA'].to_numpy(dtype=float))
     for bcol in basket_extra:
         if bcol in df.columns:
@@ -3060,6 +3128,19 @@ def get_next_bar_distribution(
         v = float(s.iloc[-1])
         return v if np.isfinite(v) else None
 
+    def _last_delta(col, prev_col):
+        if col not in df.columns or prev_col not in df.columns or len(df) == 0:
+            return None
+        cur = df[col].iloc[-1]
+        prev = df[prev_col].iloc[-1]
+        if pd.isna(cur) or pd.isna(prev):
+            return None
+        cur_v = float(cur)
+        prev_v = float(prev)
+        if not np.isfinite(cur_v) or not np.isfinite(prev_v):
+            return None
+        return cur_v - prev_v
+
     # Latest bar state flags
     last_trend = df['Trend'].iloc[-1] if 'Trend' in df.columns and len(df) else None
     last_bseq = df['Is_Breakout_Sequence'].iloc[-1] if 'Is_Breakout_Sequence' in df.columns and len(df) else None
@@ -3070,19 +3151,52 @@ def get_next_bar_distribution(
         'Breakdown': bool(last_bseq == False),
     }
 
-    # Per-rotation context with pattern flag (HH/LH for bullish, HL/LL for bearish)
+    # Per-rotation context with pattern comparisons.
+    # `patterns` keeps the existing binary filter semantics.
+    # `patterns_display` carries the full high/low relationship text for UI.
     rotation_context = {}
     for prefix in ('UpRot', 'DownRot', 'Breakout', 'Breakdown'):
         is_bullish = prefix in ('UpRot', 'Breakout')
-        e0 = _last_finite(f'{prefix}_Extreme_0')
-        e1 = _last_finite(f'{prefix}_Extreme_1')
-        pattern = None
-        if e0 is not None and e1 is not None:
-            if e0 > e1:   pattern = 'HH' if is_bullish else 'HL'
-            elif e0 < e1: pattern = 'LH' if is_bullish else 'LL'
+        patterns = {}
+        patterns_display = {}
+        for a_idx, b_idx in ((0, 1), (1, 2), (2, 3)):
+            ea = _last_finite(f'{prefix}_Extreme_{a_idx}')
+            eb = _last_finite(f'{prefix}_Extreme_{b_idx}')
+            ha = _last_finite(f'{prefix}_High_{a_idx}')
+            hb = _last_finite(f'{prefix}_High_{b_idx}')
+            la = _last_finite(f'{prefix}_Low_{a_idx}')
+            lb = _last_finite(f'{prefix}_Low_{b_idx}')
+            label = None
+            if ea is not None and eb is not None:
+                if ea > eb:
+                    label = 'HH' if is_bullish else 'HL'
+                elif ea < eb:
+                    label = 'HL' if is_bullish else 'LL'
+            display_label = None
+            high_label = None
+            low_label = None
+            if ha is not None and hb is not None:
+                if ha > hb:
+                    high_label = 'HH'
+                elif ha < hb:
+                    high_label = 'LH'
+            if la is not None and lb is not None:
+                if la > lb:
+                    low_label = 'HL'
+                elif la < lb:
+                    low_label = 'LL'
+            if high_label and low_label:
+                display_label = f'{high_label}/{low_label}'
+            else:
+                display_label = high_label or low_label
+            patterns[f'{a_idx}_{b_idx}'] = label
+            patterns_display[f'{a_idx}_{b_idx}'] = display_label
         rotation_context[prefix] = {
             'active':       active_map[prefix],
-            'pattern':      pattern,
+            'pattern':      patterns.get('0_1'),
+            'patterns':     patterns,
+            'pattern_display': patterns_display.get('0_1'),
+            'patterns_display': patterns_display,
             'Time_0':       _last_finite(f'{prefix}_Time_0'),
             'Range_0':      _last_finite(f'{prefix}_Range_0'),
             'Change_0':     _last_finite(f'{prefix}_Change_0'),
@@ -3092,12 +3206,21 @@ def get_next_bar_distribution(
             'Time_1':       _last_finite(f'{prefix}_Time_1'),
             'Range_1':      _last_finite(f'{prefix}_Range_1'),
             'Change_1':     _last_finite(f'{prefix}_Change_1'),
+            'Time_1_Pct':   _last_finite(f'{prefix}_Time_1_Pct'),
+            'Range_1_Pct':  _last_finite(f'{prefix}_Range_1_Pct'),
+            'Change_1_Pct': _last_finite(f'{prefix}_Change_1_Pct'),
             'Time_2':       _last_finite(f'{prefix}_Time_2'),
             'Range_2':      _last_finite(f'{prefix}_Range_2'),
             'Change_2':     _last_finite(f'{prefix}_Change_2'),
+            'Time_2_Pct':   _last_finite(f'{prefix}_Time_2_Pct'),
+            'Range_2_Pct':  _last_finite(f'{prefix}_Range_2_Pct'),
+            'Change_2_Pct': _last_finite(f'{prefix}_Change_2_Pct'),
             'Time_3':       _last_finite(f'{prefix}_Time_3'),
             'Range_3':      _last_finite(f'{prefix}_Range_3'),
             'Change_3':     _last_finite(f'{prefix}_Change_3'),
+            'Time_3_Pct':   _last_finite(f'{prefix}_Time_3_Pct'),
+            'Range_3_Pct':  _last_finite(f'{prefix}_Range_3_Pct'),
+            'Change_3_Pct': _last_finite(f'{prefix}_Change_3_Pct'),
         }
 
     # Latest bar date
@@ -3130,15 +3253,22 @@ def get_next_bar_distribution(
         'indicators': {
             'rv_ann':        _last_finite('RV_Annualized'),
             'rv_pct':        _last_finite('RV_EMA_Pct'),
+            'rv_delta':      _last_delta('RV_Annualized', 'RV_Annualized_Prev'),
             'h_react':       _last_finite('EMA_High_Norm'),
             'h_pct':         _last_finite('EMA_High_Pct'),
+            'h_delta':       _last_delta('EMA_High_Norm', 'EMA_High_Norm_Prev'),
             'l_react':       _last_finite('EMA_Low_Norm'),
             'l_pct':         _last_finite('EMA_Low_Pct'),
+            'l_delta':       _last_delta('EMA_Low_Norm', 'EMA_Low_Norm_Prev'),
             'p_react':       _last_finite('EMA_PriceChg_Norm'),
             'p_pct':         _last_finite('EMA_PriceChg_Pct'),
+            'p_delta':       _last_delta('EMA_PriceChg_Norm', 'EMA_PriceChg_Norm_Prev'),
             'breadth':       _last_finite('Uptrend_Pct'),
+            'breadth_delta': _last_delta('Uptrend_Pct', 'Uptrend_Pct_Prev'),
             'breakout_pct':  _last_finite('Breakout_Pct'),
+            'breakout_delta': _last_delta('Breakout_Pct', 'Breakout_Pct_Prev'),
             'corr_pct':      _last_finite('Correlation_Pct'),
+            'corr_delta':    _last_delta('Correlation_Pct', 'Correlation_Pct_Prev'),
         },
         'rotations': rotation_context,
     }
