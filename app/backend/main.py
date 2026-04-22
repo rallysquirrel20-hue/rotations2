@@ -2606,7 +2606,7 @@ def _label_rotation_context(df: pd.DataFrame) -> pd.DataFrame:
             'Low':   df['Low'].to_numpy()[in_idx],
             'Close': df['Close'].to_numpy()[in_idx],
             'run':   run_id_active[in_idx],
-        })
+        }, index=in_idx)
         g = temp.groupby('run', sort=True)
         entry_open      = g['Open'].transform('first').to_numpy()
         max_high_so_far = g['High'].cummax().to_numpy()
@@ -2628,10 +2628,15 @@ def _label_rotation_context(df: pd.DataFrame) -> pd.DataFrame:
                 .groupby('run', sort=True)
                 .agg(time=('_pos', 'max'),
                      entry_open=('_entry', 'first'),
+                     start_idx=('_pos', 'idxmin'),
+                     end_idx=('_pos', 'idxmax'),
                      max_high=('_mh', 'max'),
                      min_low=('_ml', 'min'),
                      final_close=('Close', 'last'))
         )
+        # Display end date should use the handoff bar, so the prior rotation's
+        # end matches the next rotation's start on transition days.
+        run_finals['display_end_idx'] = np.minimum(run_finals['end_idx'].to_numpy(dtype=int) + 1, n - 1)
         if is_bullish:
             run_finals['range_final'] = (run_finals['max_high'] - run_finals['entry_open']) / run_finals['entry_open']
         else:
@@ -2642,9 +2647,14 @@ def _label_rotation_context(df: pd.DataFrame) -> pd.DataFrame:
         time_0   = np.full(n, np.nan)
         range_0  = np.full(n, np.nan)
         change_0 = np.full(n, np.nan)
+        start_0 = np.full(n, None, dtype=object)
+        end_0 = np.full(n, None, dtype=object)
         time_0[in_idx]   = active_time
         range_0[in_idx]  = active_range
         change_0[in_idx] = active_change
+        date_values = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d').to_numpy(dtype=object)
+        start_0[in_idx] = date_values[run_finals['start_idx'].reindex(run_id_active[in_idx]).to_numpy(dtype=int)]
+        end_0[in_idx] = None
 
         oos_mask = ~in_state & (last_completed_prior > 0)
         if oos_mask.any():
@@ -2652,7 +2662,13 @@ def _label_rotation_context(df: pd.DataFrame) -> pd.DataFrame:
             time_0[oos_mask]   = run_finals['time'].reindex(runs_oos).to_numpy()
             range_0[oos_mask]  = run_finals['range_final'].reindex(runs_oos).to_numpy()
             change_0[oos_mask] = run_finals['change_final'].reindex(runs_oos).to_numpy()
+            start_idx_oos = run_finals['start_idx'].reindex(runs_oos).to_numpy(dtype=int)
+            end_idx_oos = run_finals['display_end_idx'].reindex(runs_oos).to_numpy(dtype=int)
+            start_0[oos_mask] = date_values[start_idx_oos]
+            end_0[oos_mask] = date_values[end_idx_oos]
 
+        df[f'{prefix}_Start_0'] = start_0
+        df[f'{prefix}_End_0'] = end_0
         df[f'{prefix}_Time_0']   = time_0
         df[f'{prefix}_Range_0']  = range_0
         df[f'{prefix}_Change_0'] = change_0
@@ -2681,14 +2697,23 @@ def _label_rotation_context(df: pd.DataFrame) -> pd.DataFrame:
         # power HH / LH / HL / LL filters.
         extreme_src_col = 'max_high' if is_bullish else 'min_low'
         df[f'{prefix}_Extreme_0'] = high_0 if is_bullish else low_0
-        for back_n in (1, 2, 3):
+        for back_n in (1, 2, 3, 4):
             tgt = run_id_for_zero - back_n
             v = tgt > 0
+            start_arr = np.full(n, None, dtype=object)
+            end_arr = np.full(n, None, dtype=object)
             high_arr = np.full(n, np.nan)
             low_arr = np.full(n, np.nan)
             if v.any():
+                start_idx = run_finals['start_idx'].reindex(tgt[v]).to_numpy(dtype=int)
+                end_idx = run_finals['display_end_idx'].reindex(tgt[v]).to_numpy(dtype=int)
+                start_arr[v] = date_values[start_idx]
+                end_arr[v] = date_values[end_idx]
                 high_arr[v] = run_finals['max_high'].reindex(tgt[v]).to_numpy()
                 low_arr[v] = run_finals['min_low'].reindex(tgt[v]).to_numpy()
+            if back_n <= 3:
+                df[f'{prefix}_Start_{back_n}'] = start_arr
+                df[f'{prefix}_End_{back_n}'] = end_arr
             df[f'{prefix}_High_{back_n}'] = high_arr
             df[f'{prefix}_Low_{back_n}'] = low_arr
             df[f'{prefix}_Extreme_{back_n}'] = high_arr if is_bullish else low_arr
@@ -2769,23 +2794,55 @@ def get_next_bar_distribution(
     basket: Optional[str] = None,
     breakout_state: Optional[str] = None,
     rotation_state: Optional[str] = None,
+    breakout_signal: Optional[str] = None,
+    rotation_signal: Optional[str] = None,
+    mr_signal: Optional[str] = None,
+    cross_uprot_high: Optional[str] = None,
+    cross_breakout_high: Optional[str] = None,
+    cross_prev_high: Optional[str] = None,
+    new_high_21: Optional[str] = None,
+    new_high_63: Optional[str] = None,
+    new_high_252: Optional[str] = None,
+    cross_downrot_low: Optional[str] = None,
+    cross_breakdown_low: Optional[str] = None,
+    cross_prev_low: Optional[str] = None,
+    new_low_21: Optional[str] = None,
+    new_low_63: Optional[str] = None,
+    new_low_252: Optional[str] = None,
     h_op: Optional[str] = None,  h_val: Optional[float] = None,
     l_op: Optional[str] = None,  l_val: Optional[float] = None,
     p_op: Optional[str] = None,  p_val: Optional[float] = None,
     h_pct_op: Optional[str] = None,  h_pct_val: Optional[float] = None,
     l_pct_op: Optional[str] = None,  l_pct_val: Optional[float] = None,
     p_pct_op: Optional[str] = None,  p_pct_val: Optional[float] = None,
+    h_delta_op: Optional[str] = None, h_delta_val: Optional[float] = None,
+    l_delta_op: Optional[str] = None, l_delta_val: Optional[float] = None,
+    p_delta_op: Optional[str] = None, p_delta_val: Optional[float] = None,
+    h_delta_pct_op: Optional[str] = None,  h_delta_pct_val: Optional[float] = None,
+    l_delta_pct_op: Optional[str] = None,  l_delta_pct_val: Optional[float] = None,
+    p_delta_pct_op: Optional[str] = None,  p_delta_pct_val: Optional[float] = None,
     rv_op: Optional[str] = None,     rv_val: Optional[float] = None,
     rv_pct_op: Optional[str] = None, rv_pct_val: Optional[float] = None,
+    rv_delta_op: Optional[str] = None, rv_delta_val: Optional[float] = None,
+    rv_delta_pct_op: Optional[str] = None, rv_delta_pct_val: Optional[float] = None,
     h_trend: Optional[str] = None,
     l_trend: Optional[str] = None,
     p_trend: Optional[str] = None,
     rv_trend: Optional[str] = None,
     breadth_op: Optional[str] = None,  breadth_val: Optional[float] = None,
+    breadth_pct_op: Optional[str] = None, breadth_pct_val: Optional[float] = None,
+    breadth_delta_op: Optional[str] = None, breadth_delta_val: Optional[float] = None,
+    breadth_delta_pct_op: Optional[str] = None, breadth_delta_pct_val: Optional[float] = None,
     breadth_trend: Optional[str] = None,
     breakout_op: Optional[str] = None, breakout_val: Optional[float] = None,
+    breakout_level_pct_op: Optional[str] = None, breakout_level_pct_val: Optional[float] = None,
+    breakout_delta_op: Optional[str] = None, breakout_delta_val: Optional[float] = None,
+    breakout_delta_pct_op: Optional[str] = None, breakout_delta_pct_val: Optional[float] = None,
     breakout_trend: Optional[str] = None,
     corr_op: Optional[str] = None,     corr_val: Optional[float] = None,
+    corr_level_pct_op: Optional[str] = None, corr_level_pct_val: Optional[float] = None,
+    corr_delta_op: Optional[str] = None, corr_delta_val: Optional[float] = None,
+    corr_delta_pct_op: Optional[str] = None, corr_delta_pct_val: Optional[float] = None,
     corr_trend: Optional[str] = None,
     lookback: int = 21,
     rot: Optional[str] = None,
@@ -2805,7 +2862,8 @@ def get_next_bar_distribution(
     if not ticker and not basket:
         raise HTTPException(status_code=400, detail="Either ticker or basket is required")
 
-    ticker_cols = ['Date', 'Open', 'High', 'Low', 'Close', 'Trend', 'Is_Breakout_Sequence',
+    ticker_cols = ['Date', 'Open', 'High', 'Low', 'Close', 'Trend',
+                   'Is_Up_Rotation', 'Is_Down_Rotation', 'Is_Breakout', 'Is_Breakdown', 'Is_BTFD', 'Is_STFR', 'Is_Breakout_Sequence',
                    'EMA_High', 'EMA_Low', 'EMA_PriceChg', 'RV_EMA',
                    'Upper_Target', 'Lower_Target']
     basket_extra = ['Uptrend_Pct', 'Breakout_Pct', 'Correlation_Pct']
@@ -2866,9 +2924,116 @@ def get_next_bar_distribution(
         df['RV_Annualized'] = df['RV_EMA'] * np.sqrt(252) * 100
         df['RV_Annualized_Prev'] = df['RV_EMA_Prev'] * np.sqrt(252) * 100
         df['RV_EMA_Pct']    = _expanding_pct_rank(df['RV_EMA'].to_numpy(dtype=float))
+        df['RV_Annualized_Delta'] = df['RV_Annualized'] - df['RV_Annualized_Prev']
+        df['RV_Annualized_Delta_Pct'] = _expanding_pct_rank(df['RV_Annualized_Delta'].to_numpy(dtype=float))
     for bcol in basket_extra:
         if bcol in df.columns:
             df[f'{bcol}_Prev'] = df[bcol].shift(lookback)
+            df[f'{bcol}_Pct'] = _expanding_pct_rank(df[bcol].to_numpy(dtype=float))
+            df[f'{bcol}_Delta'] = df[bcol] - df[f'{bcol}_Prev']
+            df[f'{bcol}_Delta_Pct'] = _expanding_pct_rank(df[f'{bcol}_Delta'].to_numpy(dtype=float))
+    if 'EMA_High_Norm' in df.columns and 'EMA_High_Norm_Prev' in df.columns:
+        df['EMA_High_Norm_Delta'] = df['EMA_High_Norm'] - df['EMA_High_Norm_Prev']
+        df['EMA_High_Norm_Delta_Pct'] = _expanding_pct_rank(df['EMA_High_Norm_Delta'].to_numpy(dtype=float))
+    if 'EMA_Low_Norm' in df.columns and 'EMA_Low_Norm_Prev' in df.columns:
+        df['EMA_Low_Norm_Delta'] = df['EMA_Low_Norm'] - df['EMA_Low_Norm_Prev']
+        df['EMA_Low_Norm_Delta_Pct'] = _expanding_pct_rank(df['EMA_Low_Norm_Delta'].to_numpy(dtype=float))
+    if 'EMA_PriceChg_Norm' in df.columns and 'EMA_PriceChg_Norm_Prev' in df.columns:
+        df['EMA_PriceChg_Norm_Delta'] = df['EMA_PriceChg_Norm'] - df['EMA_PriceChg_Norm_Prev']
+        df['EMA_PriceChg_Norm_Delta_Pct'] = _expanding_pct_rank(df['EMA_PriceChg_Norm_Delta'].to_numpy(dtype=float))
+
+    def _false_series() -> pd.Series:
+        return pd.Series(False, index=df.index, dtype=bool)
+
+    def _cross_above_level(level_col: str) -> pd.Series:
+        if level_col not in df.columns or 'High' not in df.columns:
+            return _false_series()
+        level = pd.to_numeric(df[level_col], errors='coerce')
+        prev_level = level.shift(1)
+        high = pd.to_numeric(df['High'], errors='coerce')
+        prev_high = high.shift(1)
+        return level.notna() & prev_level.notna() & prev_high.notna() & high.gt(level) & prev_high.le(prev_level)
+
+    def _cross_below_level(level_col: str) -> pd.Series:
+        if level_col not in df.columns or 'Low' not in df.columns:
+            return _false_series()
+        level = pd.to_numeric(df[level_col], errors='coerce')
+        prev_level = level.shift(1)
+        low = pd.to_numeric(df['Low'], errors='coerce')
+        prev_low = low.shift(1)
+        return level.notna() & prev_level.notna() & prev_low.notna() & low.lt(level) & prev_low.ge(prev_level)
+
+    def _new_high_series(window: int) -> pd.Series:
+        if 'High' not in df.columns:
+            return _false_series()
+        high = pd.to_numeric(df['High'], errors='coerce')
+        prior_high = high.shift(1).rolling(window=window, min_periods=window).max()
+        return high.notna() & prior_high.notna() & high.gt(prior_high)
+
+    def _new_low_series(window: int) -> pd.Series:
+        if 'Low' not in df.columns:
+            return _false_series()
+        low = pd.to_numeric(df['Low'], errors='coerce')
+        prior_low = low.shift(1).rolling(window=window, min_periods=window).min()
+        return low.notna() & prior_low.notna() & low.lt(prior_low)
+
+    price_event_series = {
+        'cross_uprot_high': _cross_above_level('UpRot_High_1'),
+        'cross_breakout_high': _cross_above_level('Breakout_High_1'),
+        'cross_downrot_low': _cross_below_level('DownRot_Low_1'),
+        'cross_breakdown_low': _cross_below_level('Breakdown_Low_1'),
+        'new_high_21': _new_high_series(21),
+        'new_high_63': _new_high_series(63),
+        'new_high_252': _new_high_series(252),
+        'new_low_21': _new_low_series(21),
+        'new_low_63': _new_low_series(63),
+        'new_low_252': _new_low_series(252),
+    }
+    if 'High' in df.columns:
+        high = pd.to_numeric(df['High'], errors='coerce')
+        prev_high = high.shift(1)
+        price_event_series['cross_prev_high'] = high.notna() & prev_high.notna() & high.gt(prev_high)
+    else:
+        price_event_series['cross_prev_high'] = _false_series()
+    if 'Low' in df.columns:
+        low = pd.to_numeric(df['Low'], errors='coerce')
+        prev_low = low.shift(1)
+        price_event_series['cross_prev_low'] = low.notna() & prev_low.notna() & low.lt(prev_low)
+    else:
+        price_event_series['cross_prev_low'] = _false_series()
+
+    def _bool_series(col: str) -> pd.Series:
+        if col in df.columns:
+            return df[col].fillna(False).astype(bool)
+        return _false_series()
+
+    def _signal_from_active(active: pd.Series) -> pd.Series:
+        active_bool = active.fillna(False).astype(bool)
+        if len(active_bool) == 0:
+            return pd.Series(False, index=df.index, dtype=bool)
+        prev = active_bool.shift(1)
+        prev = prev.fillna(bool(active_bool.iloc[0])).astype(bool)
+        return active_bool & ~prev
+
+    if 'Is_Breakout_Sequence' in df.columns:
+        breakout_state_series = _bool_series('Is_Breakout_Sequence')
+        breakdown_state_series = ~breakout_state_series
+    else:
+        breakout_state_series = pd.Series(False, index=df.index, dtype=bool)
+        breakdown_state_series = pd.Series(False, index=df.index, dtype=bool)
+    if 'Trend' in df.columns:
+        up_rotation_state_series = (df['Trend'] == 1.0)
+        down_rotation_state_series = (df['Trend'] == 0.0)
+    else:
+        up_rotation_state_series = pd.Series(False, index=df.index, dtype=bool)
+        down_rotation_state_series = pd.Series(False, index=df.index, dtype=bool)
+
+    breakout_signal_series = _bool_series('Is_Breakout') if 'Is_Breakout' in df.columns else _signal_from_active(breakout_state_series)
+    breakdown_signal_series = _bool_series('Is_Breakdown') if 'Is_Breakdown' in df.columns else _signal_from_active(breakdown_state_series)
+    up_rotation_signal_series = _bool_series('Is_Up_Rotation') if 'Is_Up_Rotation' in df.columns else _signal_from_active(up_rotation_state_series)
+    down_rotation_signal_series = _bool_series('Is_Down_Rotation') if 'Is_Down_Rotation' in df.columns else _signal_from_active(down_rotation_state_series)
+    btfd_signal_series = _bool_series('Is_BTFD')
+    stfr_signal_series = _bool_series('Is_STFR')
 
     # --- Horizon-based forward return ---
     # horizon is one of "1", "5", "21", "63", "rotation", or any positive int.
@@ -2934,13 +3099,49 @@ def get_next_bar_distribution(
 
     # --- Regime filters ---
     if breakout_state == 'breakout':
-        mask &= df['Is_Breakout_Sequence'].fillna(False).astype(bool)
+        mask &= breakout_state_series
     elif breakout_state == 'breakdown':
-        mask &= ~df['Is_Breakout_Sequence'].fillna(False).astype(bool)
+        mask &= breakdown_state_series
     if rotation_state == 'up':
-        mask &= (df['Trend'] == 1.0)
+        mask &= up_rotation_state_series
     elif rotation_state == 'down':
-        mask &= (df['Trend'] == 0.0)
+        mask &= down_rotation_state_series
+    if breakout_signal == 'breakout':
+        mask &= breakout_signal_series
+    elif breakout_signal == 'breakdown':
+        mask &= breakdown_signal_series
+    if rotation_signal == 'up':
+        mask &= up_rotation_signal_series
+    elif rotation_signal == 'down':
+        mask &= down_rotation_signal_series
+    if mr_signal == 'btfd':
+        mask &= btfd_signal_series
+    elif mr_signal == 'stfr':
+        mask &= stfr_signal_series
+
+    def _event_filter(series: pd.Series, state: Optional[str]):
+        nonlocal mask
+        if state == 'triggered':
+            mask &= series
+        elif state == 'not_triggered':
+            mask &= ~series
+
+    price_event_filters = {
+        'cross_uprot_high': cross_uprot_high,
+        'cross_breakout_high': cross_breakout_high,
+        'cross_prev_high': cross_prev_high,
+        'new_high_21': new_high_21,
+        'new_high_63': new_high_63,
+        'new_high_252': new_high_252,
+        'cross_downrot_low': cross_downrot_low,
+        'cross_breakdown_low': cross_breakdown_low,
+        'cross_prev_low': cross_prev_low,
+        'new_low_21': new_low_21,
+        'new_low_63': new_low_63,
+        'new_low_252': new_low_252,
+    }
+    for event_key, state in price_event_filters.items():
+        _event_filter(price_event_series[event_key], state)
 
     # --- Threshold filters (op + val) ---
     def _threshold_filter(col, op, val):
@@ -2964,11 +3165,28 @@ def get_next_bar_distribution(
     _threshold_filter('EMA_High_Pct',     h_pct_op, h_pct_val)
     _threshold_filter('EMA_Low_Pct',      l_pct_op, l_pct_val)
     _threshold_filter('EMA_PriceChg_Pct', p_pct_op, p_pct_val)
+    _threshold_filter('EMA_High_Norm_Delta', h_delta_op, h_delta_val)
+    _threshold_filter('EMA_Low_Norm_Delta', l_delta_op, l_delta_val)
+    _threshold_filter('EMA_PriceChg_Norm_Delta', p_delta_op, p_delta_val)
+    _threshold_filter('EMA_High_Norm_Delta_Pct', h_delta_pct_op, h_delta_pct_val)
+    _threshold_filter('EMA_Low_Norm_Delta_Pct', l_delta_pct_op, l_delta_pct_val)
+    _threshold_filter('EMA_PriceChg_Norm_Delta_Pct', p_delta_pct_op, p_delta_pct_val)
     _threshold_filter('RV_Annualized',    rv_op,     rv_val)
     _threshold_filter('RV_EMA_Pct',       rv_pct_op, rv_pct_val)
+    _threshold_filter('RV_Annualized_Delta', rv_delta_op, rv_delta_val)
+    _threshold_filter('RV_Annualized_Delta_Pct', rv_delta_pct_op, rv_delta_pct_val)
     _threshold_filter('Uptrend_Pct', breadth_op, breadth_val)
+    _threshold_filter('Uptrend_Pct_Pct', breadth_pct_op, breadth_pct_val)
+    _threshold_filter('Uptrend_Pct_Delta', breadth_delta_op, breadth_delta_val)
+    _threshold_filter('Uptrend_Pct_Delta_Pct', breadth_delta_pct_op, breadth_delta_pct_val)
     _threshold_filter('Breakout_Pct', breakout_op, breakout_val)
+    _threshold_filter('Breakout_Pct_Pct', breakout_level_pct_op, breakout_level_pct_val)
+    _threshold_filter('Breakout_Pct_Delta', breakout_delta_op, breakout_delta_val)
+    _threshold_filter('Breakout_Pct_Delta_Pct', breakout_delta_pct_op, breakout_delta_pct_val)
     _threshold_filter('Correlation_Pct', corr_op, corr_val)
+    _threshold_filter('Correlation_Pct_Pct', corr_level_pct_op, corr_level_pct_val)
+    _threshold_filter('Correlation_Pct_Delta', corr_delta_op, corr_delta_val)
+    _threshold_filter('Correlation_Pct_Delta_Pct', corr_delta_pct_op, corr_delta_pct_val)
 
     # --- Trend (increasing/decreasing) filters ---
     def _trend_filter(col, prev_col, val):
@@ -3128,6 +3346,15 @@ def get_next_bar_distribution(
         v = float(s.iloc[-1])
         return v if np.isfinite(v) else None
 
+    def _last_value(col):
+        if col not in df.columns:
+            return None
+        s = df[col].dropna()
+        if s.empty:
+            return None
+        v = s.iloc[-1]
+        return None if pd.isna(v) else v
+
     def _last_delta(col, prev_col):
         if col not in df.columns or prev_col not in df.columns or len(df) == 0:
             return None
@@ -3144,6 +3371,16 @@ def get_next_bar_distribution(
     # Latest bar state flags
     last_trend = df['Trend'].iloc[-1] if 'Trend' in df.columns and len(df) else None
     last_bseq = df['Is_Breakout_Sequence'].iloc[-1] if 'Is_Breakout_Sequence' in df.columns and len(df) else None
+    last_up_signal = bool(up_rotation_signal_series.iloc[-1]) if len(up_rotation_signal_series) else False
+    last_down_signal = bool(down_rotation_signal_series.iloc[-1]) if len(down_rotation_signal_series) else False
+    last_breakout_signal = bool(breakout_signal_series.iloc[-1]) if len(breakout_signal_series) else False
+    last_breakdown_signal = bool(breakdown_signal_series.iloc[-1]) if len(breakdown_signal_series) else False
+    last_btfd_signal = bool(btfd_signal_series.iloc[-1]) if len(btfd_signal_series) else False
+    last_stfr_signal = bool(stfr_signal_series.iloc[-1]) if len(stfr_signal_series) else False
+    last_price_events = {
+        key: bool(series.iloc[-1]) if len(series) else False
+        for key, series in price_event_series.items()
+    }
     active_map = {
         'UpRot':     bool(last_trend == 1.0),
         'DownRot':   bool(last_trend == 0.0),
@@ -3159,7 +3396,7 @@ def get_next_bar_distribution(
         is_bullish = prefix in ('UpRot', 'Breakout')
         patterns = {}
         patterns_display = {}
-        for a_idx, b_idx in ((0, 1), (1, 2), (2, 3)):
+        for a_idx, b_idx in ((0, 1), (1, 2), (2, 3), (3, 4)):
             ea = _last_finite(f'{prefix}_Extreme_{a_idx}')
             eb = _last_finite(f'{prefix}_Extreme_{b_idx}')
             ha = _last_finite(f'{prefix}_High_{a_idx}')
@@ -3171,7 +3408,7 @@ def get_next_bar_distribution(
                 if ea > eb:
                     label = 'HH' if is_bullish else 'HL'
                 elif ea < eb:
-                    label = 'HL' if is_bullish else 'LL'
+                    label = 'LH' if is_bullish else 'LL'
             display_label = None
             high_label = None
             low_label = None
@@ -3195,26 +3432,33 @@ def get_next_bar_distribution(
             'active':       active_map[prefix],
             'pattern':      patterns.get('0_1'),
             'patterns':     patterns,
-            'pattern_display': patterns_display.get('0_1'),
             'patterns_display': patterns_display,
+            'Start_0':      _last_value(f'{prefix}_Start_0'),
+            'End_0':        _last_value(f'{prefix}_End_0'),
             'Time_0':       _last_finite(f'{prefix}_Time_0'),
             'Range_0':      _last_finite(f'{prefix}_Range_0'),
             'Change_0':     _last_finite(f'{prefix}_Change_0'),
             'Time_0_Pct':   _last_finite(f'{prefix}_Time_0_Pct'),
             'Range_0_Pct':  _last_finite(f'{prefix}_Range_0_Pct'),
             'Change_0_Pct': _last_finite(f'{prefix}_Change_0_Pct'),
+            'Start_1':      _last_value(f'{prefix}_Start_1'),
+            'End_1':        _last_value(f'{prefix}_End_1'),
             'Time_1':       _last_finite(f'{prefix}_Time_1'),
             'Range_1':      _last_finite(f'{prefix}_Range_1'),
             'Change_1':     _last_finite(f'{prefix}_Change_1'),
             'Time_1_Pct':   _last_finite(f'{prefix}_Time_1_Pct'),
             'Range_1_Pct':  _last_finite(f'{prefix}_Range_1_Pct'),
             'Change_1_Pct': _last_finite(f'{prefix}_Change_1_Pct'),
+            'Start_2':      _last_value(f'{prefix}_Start_2'),
+            'End_2':        _last_value(f'{prefix}_End_2'),
             'Time_2':       _last_finite(f'{prefix}_Time_2'),
             'Range_2':      _last_finite(f'{prefix}_Range_2'),
             'Change_2':     _last_finite(f'{prefix}_Change_2'),
             'Time_2_Pct':   _last_finite(f'{prefix}_Time_2_Pct'),
             'Range_2_Pct':  _last_finite(f'{prefix}_Range_2_Pct'),
             'Change_2_Pct': _last_finite(f'{prefix}_Change_2_Pct'),
+            'Start_3':      _last_value(f'{prefix}_Start_3'),
+            'End_3':        _last_value(f'{prefix}_End_3'),
             'Time_3':       _last_finite(f'{prefix}_Time_3'),
             'Range_3':      _last_finite(f'{prefix}_Range_3'),
             'Change_3':     _last_finite(f'{prefix}_Change_3'),
@@ -3250,25 +3494,39 @@ def get_next_bar_distribution(
         'position':        position,
         'active_rotation': 'up' if active_map['UpRot'] else ('down' if active_map['DownRot'] else None),
         'active_regime':   'breakout' if active_map['Breakout'] else ('breakdown' if active_map['Breakdown'] else None),
+        'rotation_signal': 'up' if last_up_signal else ('down' if last_down_signal else None),
+        'regime_signal':   'breakout' if last_breakout_signal else ('breakdown' if last_breakdown_signal else None),
+        'mr_signal':       'btfd' if last_btfd_signal else ('stfr' if last_stfr_signal else None),
+        'price_events':    last_price_events,
         'indicators': {
             'rv_ann':        _last_finite('RV_Annualized'),
             'rv_pct':        _last_finite('RV_EMA_Pct'),
             'rv_delta':      _last_delta('RV_Annualized', 'RV_Annualized_Prev'),
+            'rv_delta_pct':  _last_finite('RV_Annualized_Delta_Pct'),
             'h_react':       _last_finite('EMA_High_Norm'),
             'h_pct':         _last_finite('EMA_High_Pct'),
             'h_delta':       _last_delta('EMA_High_Norm', 'EMA_High_Norm_Prev'),
+            'h_delta_pct':   _last_finite('EMA_High_Norm_Delta_Pct'),
             'l_react':       _last_finite('EMA_Low_Norm'),
             'l_pct':         _last_finite('EMA_Low_Pct'),
             'l_delta':       _last_delta('EMA_Low_Norm', 'EMA_Low_Norm_Prev'),
+            'l_delta_pct':   _last_finite('EMA_Low_Norm_Delta_Pct'),
             'p_react':       _last_finite('EMA_PriceChg_Norm'),
             'p_pct':         _last_finite('EMA_PriceChg_Pct'),
             'p_delta':       _last_delta('EMA_PriceChg_Norm', 'EMA_PriceChg_Norm_Prev'),
+            'p_delta_pct':   _last_finite('EMA_PriceChg_Norm_Delta_Pct'),
             'breadth':       _last_finite('Uptrend_Pct'),
+            'breadth_pct':   _last_finite('Uptrend_Pct_Pct'),
             'breadth_delta': _last_delta('Uptrend_Pct', 'Uptrend_Pct_Prev'),
+            'breadth_delta_pct': _last_finite('Uptrend_Pct_Delta_Pct'),
             'breakout_pct':  _last_finite('Breakout_Pct'),
+            'breakout_level_pct': _last_finite('Breakout_Pct_Pct'),
             'breakout_delta': _last_delta('Breakout_Pct', 'Breakout_Pct_Prev'),
+            'breakout_delta_pct': _last_finite('Breakout_Pct_Delta_Pct'),
             'corr_pct':      _last_finite('Correlation_Pct'),
+            'corr_level_pct': _last_finite('Correlation_Pct_Pct'),
             'corr_delta':    _last_delta('Correlation_Pct', 'Correlation_Pct_Prev'),
+            'corr_delta_pct': _last_finite('Correlation_Pct_Delta_Pct'),
         },
         'rotations': rotation_context,
     }
